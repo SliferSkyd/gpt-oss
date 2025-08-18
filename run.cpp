@@ -663,6 +663,28 @@ void apply_attention(Transformer *transformer, float *x, unsigned long long l, i
   }
 }
 
+void swiglu(float *x, float *gate, float *up, float *gate_up, int intermediate_dim, float swiglu_limit) {
+  // SwiGLU non-linearity
+  const float alpha = 1.702f;
+  for (int i = 0; i < intermediate_dim; i++) {
+    float val = gate[i];
+    float up_val = up[i];
+    // Clamping
+    if (val > swiglu_limit)
+      val = swiglu_limit;
+    if (up_val > swiglu_limit)
+      up_val = swiglu_limit;
+    if (up_val < -swiglu_limit)
+      up_val = -swiglu_limit;
+    // silu(x)=x*σ(x), where σ(x) is the logistic sigmoid
+    val *= (1.0f / (1.0f + expf(-alpha * val)));
+    // elementwise multiply with w_gate(x)
+    val *= (up_val +
+            1.0f); // gpt-oss adds an extra bias of 1 to the up layer
+    gate_up[i] = val;
+  }
+}
+
 void apply_MLP(Transformer *transformer, float *x, unsigned long long l, int pos) {
   Config *p = &transformer->config;
   TransformerWeights *w = &transformer->weights;
@@ -721,25 +743,7 @@ void apply_MLP(Transformer *transformer, float *x, unsigned long long l, int pos
         s->up[j] = s->mlp1_out[2 * j + 1];
       }
 
-      // SwiGLU non-linearity
-      const float alpha = 1.702f;
-      for (int i = 0; i < p->intermediate_dim; i++) {
-        float val = s->gate[i];
-        float up_val = s->up[i];
-        // Clamping
-        if (val > p->swiglu_limit)
-          val = p->swiglu_limit;
-        if (up_val > p->swiglu_limit)
-          up_val = p->swiglu_limit;
-        if (up_val < -p->swiglu_limit)
-          up_val = -p->swiglu_limit;
-        // silu(x)=x*σ(x), where σ(x) is the logistic sigmoid
-        val *= (1.0f / (1.0f + expf(-alpha * val)));
-        // elementwise multiply with w_gate(x)
-        val *= (up_val +
-                1.0f); // gpt-oss adds an extra bias of 1 to the up layer
-        s->gate_up[i] = val;
-      }
+      swiglu(x, s->gate, s->up, s->gate_up, p->intermediate_dim, p->swiglu_limit);
 
       // final matmul to get the output of the ffn
       float *w_mlp2 =
