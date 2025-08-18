@@ -586,7 +586,7 @@ void sdpa(Transformer *transformer, unsigned long long l, int pos) {
   }
 }
 
-void apply_attention(Transformer *transformer, float *x, unsigned long long l, int pos) {
+void attention(Transformer *transformer, float *x, unsigned long long l, int pos) {
   Config *p = &transformer->config;
   TransformerWeights *w = &transformer->weights;
   RunState *s = &transformer->state;
@@ -685,7 +685,42 @@ void swiglu(float *x, float *gate, float *up, float *gate_up, int intermediate_d
   }
 }
 
-void apply_MLP(Transformer *transformer, float *x, unsigned long long l, int pos) {
+void mlp(Transformer *transformer, float *x, float *w_mlp1, float *b_mlp1, float *w_mlp2, float *b_mlp2, float expert_w) {
+  Config *p = &transformer->config;
+  TransformerWeights *w = &transformer->weights;
+  RunState *s = &transformer->state;
+
+  int hidden_dim = p->hidden_dim;
+  int intermediate_dim = p->intermediate_dim;
+  int n_experts = p->n_experts;
+
+  matmul(s->mlp1_out, s->t, w_mlp1, hidden_dim,
+          2 * p->intermediate_dim); // (2 * intermediate_dim, )
+  for (int i = 0; i < 2 * p->intermediate_dim; i++) {
+    s->mlp1_out[i] += b_mlp1[i];
+  }
+  // Split mlp1_out into gate and up
+  for (int j = 0; j < p->intermediate_dim; j++) {
+    s->gate[j] = s->mlp1_out[2 * j];
+    s->up[j] = s->mlp1_out[2 * j + 1];
+  }
+
+  swiglu(x, s->gate, s->up, s->gate_up, p->intermediate_dim, p->swiglu_limit);
+
+  // final matmul to get the output of the ffn
+  matmul(s->tb2, s->gate_up, w_mlp2, p->intermediate_dim,
+          hidden_dim); // (hidden_dim, )
+  for (int i = 0; i < hidden_dim; i++) {
+    s->tb2[i] += b_mlp2[i];
+  }
+
+  // aggregate topk experts using weighted sum
+  for (int i = 0; i < hidden_dim; i++) {
+    s->e_agg[i] += s->tb2[i] * expert_w;
+  }
+}
+
+void moe(Transformer *transformer, float *x, unsigned long long l, int pos) {
   Config *p = &transformer->config;
   TransformerWeights *w = &transformer->weights;
   RunState *s = &transformer->state;
@@ -729,38 +764,17 @@ void apply_MLP(Transformer *transformer, float *x, unsigned long long l, int pos
 
     if (in_topk) {
       float *w_mlp1 = w->w_mlp1 + 1ll * (l * n_experts + e) *
-                                      (2 * p->intermediate_dim) * hidden_dim;
+                                  (2 * p->intermediate_dim) * hidden_dim;
       float *b_mlp1 =
           w->b_mlp1 + 1ll * (l * n_experts + e) * (2 * p->intermediate_dim);
-      matmul(s->mlp1_out, s->t, w_mlp1, hidden_dim,
-              2 * p->intermediate_dim); // (2 * intermediate_dim, )
-      for (int i = 0; i < 2 * p->intermediate_dim; i++) {
-        s->mlp1_out[i] += b_mlp1[i];
-      }
-      // Split mlp1_out into gate and up
-      for (int j = 0; j < p->intermediate_dim; j++) {
-        s->gate[j] = s->mlp1_out[2 * j];
-        s->up[j] = s->mlp1_out[2 * j + 1];
-      }
-
-      swiglu(x, s->gate, s->up, s->gate_up, p->intermediate_dim, p->swiglu_limit);
-
-      // final matmul to get the output of the ffn
+          
       float *w_mlp2 =
           w->w_mlp2 +
           1ll * (l * n_experts + e) * hidden_dim *
               p->intermediate_dim; // (out: hidden_dim, in: intermediate_dim)
-      float *b_mlp2 = w->b_mlp2 + 1ll * (l * n_experts + e) * hidden_dim;
-      matmul(s->tb2, s->gate_up, w_mlp2, p->intermediate_dim,
-              hidden_dim); // (hidden_dim, )
-      for (int i = 0; i < hidden_dim; i++) {
-        s->tb2[i] += b_mlp2[i];
-      }
+      float *b_mlp2 = w->b_mlp2 + 1ll * (l * n_experts + e) * hidden_dim;          
 
-      // aggregate topk experts using weighted sum
-      for (int i = 0; i < hidden_dim; i++) {
-        s->e_agg[i] += s->tb2[i] * expert_w;
-      }
+      mlp(transformer, x, w_mlp1, b_mlp1, w_mlp2, b_mlp2, expert_w);
     }
   }
 
@@ -784,8 +798,8 @@ float *forward(Transformer *transformer, int token, int pos) {
 
   // forward all the layers
   for (unsigned long long l = 0; l < p->n_layers; l++) {
-    apply_attention(transformer, x, l, pos); // attention block
-    apply_MLP(transformer, x, l, pos);
+    attention(transformer, x, l, pos); // attention block
+    moe(transformer, x, l, pos);
   }
   // final rmsnorm
   rmsnorm(x, x, w->rms_out_w, hidden_dim);
