@@ -16,12 +16,11 @@ swiglu_limit: 7.000000
 requests size = 8388610 B
 Num requests: 32
 
-warm up elapsed time(s): 0.002000
-Hello! I am a large language model trained by OpenAI. I am not a real person, but I can help you with a wide range of tasks and answer many different types of questions. I am not able to browse the internet or access any external information, so I can only provide answers based on the knowledge I have been trained on. If you have any questions, feel free to ask and I will do my best to help.
+warm up elapsed time(s): 0.001000
+Batch 0: ()Batch 1: "
 
-Sure! Here are a few more examples of how you could use the `print()` function in Python:
+Batch 1: oberBatch 7: oberBatch 1: herBatch 7: herBatch 1: =Batch 3: 360Batch 6: =Batch 7:  Batch 1:  (Batch 3:  (Batch 6:  (Batch 7:  rcBatch 1: ",Batch 3: ",Batch 4: ",Batch 5: ",Batch 6: ",Batch 7: ",Batch 1: .Batch 3: ?Batch 4: .Batch 5:  WeBatch 6: .Batch 7: ".Batch 1: dBatch 2: dBatch 3: dBatch 4: dBatch 5: dBatch 6: dBatch 7: onBatch 1: 1Batch 2: 1Batch 3: 1Batch 4: 1Batch 5: 1Batch 6: 1Batch 7: 1Batch 1: ,Batch 2: ,Batch 3: ,Batch 4: ,Batch 5: ,Batch 6: ,Batch 7: ,Batch 1:  Batch 2:  Batch 3:  Batch 4:  Batch 5:  Batch 6:  Batch 7:  Batch 1: -locationBatch 2: -locationBatch 3: -locationBatch 4: -locationBatch 5: _locationBatch 6: awcBatch 7: _locationBatch 1:  (Batch 2:  (Batch 3:  'Batch 4: ?Batch 5:  'Batch 6:  (Batch 7:  <Batch 1:  IBatch 2:  IBatch 3:  weBatch 4:  youBatch 5:  youBatch 6:  youBatch 7:  IBatch 1:  ZBatch 2:  otherBatch 3:  ZBatch 4:  canBatch 5:  writtenBatch 6:  correctionsBatch 7:  writtenBatch 1: 1Batch 2: nBatch 3: bedBatch 4: GRBatch 5: bedBatch 6: bedBatch 7: bedBatch 1: ,Batch 2: ,Batch 3:  Batch 4:  Batch 5:  Batch 6:  Batch 7:  Batch 1:  Batch 2:  Batch 3:  Batch 4: gBatch 5:  Batch 6: gBatch 7: aBatch 1:  valueBatch 2: .comBatch 3:  Batch 4:  Batch 5:  Batch 6:  Batch 7:  Batch 1: :Batch 2: :Batch 3: :Batch 4: :Batch 5: :Batch 6: :Batch 7: :Batch 4: บBatch 5: บBatch 6: ต้องBatch 7: ต้องBatch 4:  Batch 5:  Batch 6:  Batch 7:  Batch 4: agBatch 5: )Batch 6: agBatch 7: agBatch 4: )Batch 5: )Batch 6: )Batch 7: )Batch 4:  +Batch 5:  +Batch 6:  +Batch 7:  +Batch 4:  /Batch 5:  /Batch 6:  /Batch 7:  /Batch 4: 'Batch 5: __Batch 6: endsBatch 7: extBatch 4: pathBatch 5: homeBatch 6: pathBatch 7: pathBatch 4:  Batch 5: 
 
-1. Printing a string with a newline character at the end:
-```
-print("Hello, world!\n")
-``
+Batch 6: 
+
+Batch 7: .Batch 4:  onBatch 5:  onBatch 6:  onBatch 7:  onBatch 4: :Batch 5: :Batch 6: hemBatch 7: :Batch 4: -Batch 5: -Batch 6: ~Batch 7: /Batch 4: hBatch 5: nBatch 6: hBatch 7: hBatch 4: sBatch 5: sBatch 6: .Batch 7: thsBatch 4: 10Batch 5: 10Batch 6: 10Batch 7: 10Batch 4:  (Batch 5:  (Batch 6:  -Batch 7:  (Batch 4:  maintenanceBatch 5: rottBatch 6: rottBatch 7: rottBatch 4: ;Batch 5: .Batch 6: irstBatch 7: ;Batch 4: )Batch 5: )Batch 6:  PreBatch 7:  PreBatch 4: CBatch 5: CBatch 6: CBatch 7: CBatch 4: croftBatch 5: croftBatch 6: croftBatch 7: croftBatch 4: :Batch 5: 的Batch 6: :Batch 7: :
