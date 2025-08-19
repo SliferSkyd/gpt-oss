@@ -4,81 +4,10 @@
 #include "../tokenizer.hpp"
 #include "getp_eval.cpp"
 
-
 #ifndef GETP_RUN
 #define GETP_RUN
 
-void warm_up(Transformer *transformer, Tokenizer *tokenizer) {
-  // Do not inference here
-  // You should handle the warm-up process
-  // TODO:
-  // - Memory allocation
-  // - Load model
-  // - ...
-}
-
-void finish(Transformer *transformer, Tokenizer *tokenizer) {
-  // Do not inference here
-  // You should handle the finish process
-  // TODO:
-  // - Memory deallocation
-  // - Unload model
-  // - ...
-}
-
-
-// ----------------------------------------------------------------------------
-// neural net blocks; the dynamics of the Transformer
-
-void rmsnorm_getp(float *o, float *x, float *weight, int size) {
-  // calculate sum of squares
-  double ss = 0.0f;
-  for (int j = 0; j < size; j++) {
-    ss += x[j] * x[j];
-  }
-  ss /= size;
-  ss += 1e-5f;
-  ss = 1.0f / sqrtf(ss);
-  // normalize and scale
-  for (int j = 0; j < size; j++) {
-    o[j] = weight[j] * (ss * x[j]);
-  }
-}
-
-void softmax_getp(float *x, int size) {
-  // find max value (for numerical stability)
-  double max_val = x[0];
-  for (int i = 1; i < size; i++) {
-    if (x[i] > max_val) {
-      max_val = x[i];
-    }
-  }
-  // exp and sum
-  double sum = 0.0f;
-  for (int i = 0; i < size; i++) {
-    x[i] = expf(x[i] - max_val);
-    sum += x[i];
-  }
-  // normalize
-  for (int i = 0; i < size; i++) {
-    x[i] /= sum;
-  }
-}
-
-void matmul_getp(float *xout, float *x, float *w, int n, int d) {
-  // n := in_features, d := out_features
-  // W (out,in) @ x (in,) -> xout (out,)
-  // by far the most amount of time is spent inside this little function
-  int i;
-#pragma omp parallel for private(i)
-  for (i = 0; i < d; i++) {
-    double val = 0.0f;
-    for (int j = 0; j < n; j++) {
-      val += w[1ll * i * n + j] * x[j];
-    }
-    xout[i] = val;
-  }
-}
+float *cos_vals, *sin_vals;
 
 void compute_concentration_and_inv_freq_getp(float base, int head_dim,
                                         float scaling_factor,
@@ -163,6 +92,98 @@ void compute_cos_sin_getp(int pos, // position index
 
   free(inv_freq);
 }
+
+void warm_up(Transformer *transformer, Tokenizer *tokenizer) {
+  // Do not inference here
+  // You should handle the warm-up process
+  // TODO:
+  // - Memory allocation
+  // - Load model
+  // - ...
+
+  
+  // RoPE relative positional encoding: complex-valued rotate q and k in each
+  // head Adapted from
+  // https://github.com/openai/gpt-oss/blob/main/gpt_oss/torch/model.py#L85
+  // RoPE with YaRN scaling adapted from Python code
+
+  Config *p = &transformer->config;
+
+  float ntk_beta = 32.0f;
+  float ntk_alpha = 1.0f;
+  float *cos_vals =
+      reinterpret_cast<float *>(malloc((p->head_dim / 2) * p->seq_len * sizeof(float)));
+  float *sin_vals =
+      reinterpret_cast<float *>(malloc((p->head_dim / 2) * p->seq_len * sizeof(float)));
+  for (int pos = 0; pos < p->seq_len; ++pos)
+    compute_cos_sin(pos, p->rope_theta, p->head_dim, p->rope_scaling_factor,
+                    p->initial_context_length, ntk_beta, ntk_alpha, cos_vals + (pos * p->head_dim / 2),
+                    sin_vals + (pos * p->head_dim / 2));
+}
+
+void finish(Transformer *transformer, Tokenizer *tokenizer) {
+  // Do not inference here
+  // You should handle the finish process
+  // TODO:
+  // - Memory deallocation
+  // - Unload model
+  // - ...
+}
+
+
+// ----------------------------------------------------------------------------
+// neural net blocks; the dynamics of the Transformer
+
+void rmsnorm_getp(float *o, float *x, float *weight, int size) {
+  // calculate sum of squares
+  double ss = 0.0f;
+  for (int j = 0; j < size; j++) {
+    ss += x[j] * x[j];
+  }
+  ss /= size;
+  ss += 1e-5f;
+  ss = 1.0f / sqrtf(ss);
+  // normalize and scale
+  for (int j = 0; j < size; j++) {
+    o[j] = weight[j] * (ss * x[j]);
+  }
+}
+
+void softmax_getp(float *x, int size) {
+  // find max value (for numerical stability)
+  double max_val = x[0];
+  for (int i = 1; i < size; i++) {
+    if (x[i] > max_val) {
+      max_val = x[i];
+    }
+  }
+  // exp and sum
+  double sum = 0.0f;
+  for (int i = 0; i < size; i++) {
+    x[i] = expf(x[i] - max_val);
+    sum += x[i];
+  }
+  // normalize
+  for (int i = 0; i < size; i++) {
+    x[i] /= sum;
+  }
+}
+
+void matmul_getp(float *xout, float *x, float *w, int n, int d) {
+  // n := in_features, d := out_features
+  // W (out,in) @ x (in,) -> xout (out,)
+  // by far the most amount of time is spent inside this little function
+  int i;
+#pragma omp parallel for private(i)
+  for (i = 0; i < d; i++) {
+    double val = 0.0f;
+    for (int j = 0; j < n; j++) {
+      val += w[1ll * i * n + j] * x[j];
+    }
+    xout[i] = val;
+  }
+}
+
 
 void apply_rotary_emb_getp(float *x, float *cos, float *sin, int n_heads,
                       int head_dim) {
@@ -288,24 +309,8 @@ void attention_getp(Transformer *transformer, float *x, unsigned long long l, in
   memcpy(s->v, s->qkv + head_dim * p->n_attn_heads + head_dim * p->n_kv_heads,
           head_dim * p->n_kv_heads * sizeof(float)); // gate
 
-  // RoPE relative positional encoding: complex-valued rotate q and k in each
-  // head Adapted from
-  // https://github.com/openai/gpt-oss/blob/main/gpt_oss/torch/model.py#L85
-  // RoPE with YaRN scaling adapted from Python code
-  float ntk_beta = 32.0f;
-  float ntk_alpha = 1.0f;
-  float *cos_vals =
-      reinterpret_cast<float *>(malloc((head_dim / 2) * sizeof(float)));
-  float *sin_vals =
-      reinterpret_cast<float *>(malloc((head_dim / 2) * sizeof(float)));
-  compute_cos_sin(pos, p->rope_theta, head_dim, p->rope_scaling_factor,
-                  p->initial_context_length, ntk_beta, ntk_alpha, cos_vals,
-                  sin_vals);
-  apply_rotary_emb_getp(s->q, cos_vals, sin_vals, p->n_attn_heads, head_dim);
-  apply_rotary_emb_getp(s->k, cos_vals, sin_vals, p->n_kv_heads, head_dim);
-
-  free(cos_vals);
-  free(sin_vals);
+  apply_rotary_emb_getp(s->q, cos_vals + pos * (head_dim / 2), sin_vals + pos * (head_dim / 2), p->n_attn_heads, head_dim);
+  apply_rotary_emb_getp(s->k, cos_vals + pos * (head_dim / 2), sin_vals + pos * (head_dim / 2), p->n_kv_heads, head_dim);
 
   sdpa_getp(transformer, l, pos);
   
