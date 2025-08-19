@@ -39,7 +39,7 @@ decode: decode.cpp tokenizer.cpp tokenizer-bin
 # Generate tokenizer.bin using the Python exporter.
 .PHONY: tokenizer-bin
 tokenizer-bin: export_tokenizer_bin.py
-	python3 export_tokenizer_bin.py -o tokenizer.bin
+	python3.11 export_tokenizer_bin.py -o tokenizer.bin
 
 # Build the tokenizer test binary (defines TESTING).
 .PHONY: tokenizer-test
