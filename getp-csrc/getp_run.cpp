@@ -185,6 +185,12 @@ void matmul_getp(float *xout, float *x, float *w, int n, int d) {
 }
 
 
+void accumulate(float *a, float *b, float factor, int size) {
+  for (int i = 0; i < size; ++i) {
+    a[i] += b[i] * factor;
+  }
+}
+
 void apply_rotary_emb_getp(float *x, float *cos, float *sin, int n_heads,
                       int head_dim) {
   int half = head_dim / 2;
@@ -261,9 +267,7 @@ void sdpa_getp(Transformer *transformer, unsigned long long l, int pos) {
       // get the attention_getp weight for this timestep
       float a = att[t];
       // accumulate the weighted value into xb
-      for (int i = 0; i < head_dim; i++) {
-        tb[i] += a * v[i];
-      }
+      accumulate(tb, v, a, head_dim);
     }
   }
 }
@@ -299,9 +303,7 @@ void attention_getp(Transformer *transformer, float *x, unsigned long long l, in
   matmul_getp(s->qkv, s->t, w_qkv, hidden_dim,
           (p->n_attn_heads + 2 * p->n_kv_heads) * head_dim);
   // add bias
-  for (int i = 0; i < (p->n_attn_heads + 2 * p->n_kv_heads) * head_dim; ++i) {
-    s->qkv[i] += b_qkv[i];
-  }
+  accumulate(s->qkv, b_qkv, 1.0f, (p->n_attn_heads + 2 * p->n_kv_heads) * head_dim);
   // Separate q, k, v
   memcpy(s->q, s->qkv, head_dim * p->n_attn_heads * sizeof(float)); // gate
   memcpy(s->k, s->qkv + head_dim * p->n_attn_heads,
@@ -319,14 +321,10 @@ void attention_getp(Transformer *transformer, float *x, unsigned long long l, in
   float *b_o = w->b_o + 1ll * l * hidden_dim;
   matmul_getp(s->tb2, s->tb, w_o, head_dim * p->n_attn_heads, hidden_dim);
   // add bias b_o
-  for (int i = 0; i < hidden_dim; i++) {
-    s->tb2[i] += b_o[i];
-  }
+  accumulate(s->tb2, b_o, 1.0f, hidden_dim);
 
   // residual connection back into x
-  for (int i = 0; i < hidden_dim; i++) {
-    x[i] += s->tb2[i];
-  }
+  accumulate(x, s->tb2, 1.0f, hidden_dim);
 }
 
 void swiglu_getp(float *x, float *gate, float *up, float *gate_up, int intermediate_dim, float swiglu_getp_limit) {
@@ -362,9 +360,7 @@ void mlp_getp(Transformer *transformer, float *x, float *w_mlp1, float *b_mlp1, 
 
   matmul_getp(s->mlp1_out, s->t, w_mlp1, hidden_dim,
           2 * p->intermediate_dim); // (2 * intermediate_dim, )
-  for (int i = 0; i < 2 * p->intermediate_dim; i++) {
-    s->mlp1_out[i] += b_mlp1[i];
-  }
+  accumulate(s->mlp1_out, b_mlp1, 1.0f, 2 * p->intermediate_dim);
   // Split mlp1_out into gate and up
   for (int j = 0; j < p->intermediate_dim; j++) {
     s->gate[j] = s->mlp1_out[2 * j];
@@ -376,14 +372,10 @@ void mlp_getp(Transformer *transformer, float *x, float *w_mlp1, float *b_mlp1, 
   // final matmul to get the output of the ffn
   matmul_getp(s->tb2, s->gate_up, w_mlp2, p->intermediate_dim,
           hidden_dim); // (hidden_dim, )
-  for (int i = 0; i < hidden_dim; i++) {
-    s->tb2[i] += b_mlp2[i];
-  }
+  accumulate(s->tb2, b_mlp2, 1.0f, hidden_dim); // add bias b_mlp2
 
   // aggregate topk experts using weighted sum
-  for (int i = 0; i < hidden_dim; i++) {
-    s->e_agg[i] += s->tb2[i] * expert_w;
-  }
+  accumulate(s->e_agg, s->tb2, expert_w, hidden_dim);
 }
 
 void moe_getp(Transformer *transformer, float *x, unsigned long long l, int pos) {
@@ -445,9 +437,7 @@ void moe_getp(Transformer *transformer, float *x, unsigned long long l, int pos)
   }
 
   // residual connection
-  for (int i = 0; i < hidden_dim; i++) {
-    x[i] += s->e_agg[i];
-  }
+  accumulate(x, s->e_agg, 1.0f, hidden_dim);
 }
 
 float *forward_getp(Transformer *transformer, int token, int pos) {
