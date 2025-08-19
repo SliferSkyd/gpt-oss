@@ -1,0 +1,27 @@
+vocab_size: 201088
+hidden_dim: 2880
+n_experts: 32
+experts_per_token: 4
+intermediate_dim: 2880
+n_layers: 24
+head_dim: 64
+n_attn_heads: 64
+n_kv_heads: 8
+max_seq_len: 2048
+init context len: 4096
+rope theta: 150000.000000
+rope_scaling_factor: 32.000000
+sliding window: 128
+swiglu_limit: 7.000000
+requests size = 8388610 B
+Num requests: 32
+
+warm up elapsed time(s): 0.002000
+Hello! I am a large language model trained by OpenAI. I am not a real person, but I can help you with a wide range of tasks and answer many different types of questions. I am not able to browse the internet or access any external information, so I can only provide answers based on the knowledge I have been trained on. If you have any questions, feel free to ask and I will do my best to help.
+
+Sure! Here are a few more examples of how you could use the `print()` function in Python:
+
+1. Printing a string with a newline character at the end:
+```
+print("Hello, world!\n")
+``

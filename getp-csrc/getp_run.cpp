@@ -3,6 +3,7 @@
 
 #include "../tokenizer.hpp"
 #include "getp_eval.cpp"
+#include <cassert>
 
 #ifndef GETP_RUN
 #define GETP_RUN
@@ -111,9 +112,9 @@ void warm_up(Transformer *transformer, Tokenizer *tokenizer) {
 
   float ntk_beta = 32.0f;
   float ntk_alpha = 1.0f;
-  float *cos_vals =
+  cos_vals =
       reinterpret_cast<float *>(malloc((p->head_dim / 2) * p->seq_len * sizeof(float)));
-  float *sin_vals =
+  sin_vals =
       reinterpret_cast<float *>(malloc((p->head_dim / 2) * p->seq_len * sizeof(float)));
   for (int pos = 0; pos < p->seq_len; ++pos)
     compute_cos_sin(pos, p->rope_theta, p->head_dim, p->rope_scaling_factor,
