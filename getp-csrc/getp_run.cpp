@@ -264,10 +264,9 @@ void sdpa_getp(Transformer *transformer, unsigned long long l, int pos) {
       // get the value vector for this head and at this timestep
       // GQA
       float *v = s->value_cache + loff + t * kv_dim + (h / kv_mul) * head_dim;
-      // get the attention_getp weight for this timestep
-      float a = att[t];
+      
       // accumulate the weighted value into xb
-      accumulate(tb, v, a, head_dim);
+      accumulate(tb, v, att[t], head_dim);
     }
   }
 }
@@ -408,32 +407,23 @@ void moe_getp(Transformer *transformer, float *x, unsigned long long l, int pos)
 
   // Route the tokens to their corresponding top-k experts
   memset(s->e_agg, 0, hidden_dim * sizeof(float));
-  for (int e = 0; e < n_experts; e++) {
-    float expert_w = 0;
-    int in_topk = 0;
-    // Check if expert i is in top-k experts
-    for (int idx = 0; idx < p->experts_per_token; idx++) {
-      if (s->topk_i[idx] == e) {
-        in_topk = 1;
-        expert_w = s->topk_v[idx];
-        break;
-      }
-    }
+  
+  for (int idx = 0; idx < p->experts_per_token; idx++) {
+    int e = s->topk_i[idx];
+    float expert_w = s->topk_v[idx];
+    
+    float *w_mlp1 = w->w_mlp1 + 1ll * (l * n_experts + e) *
+                                (2 * p->intermediate_dim) * hidden_dim;
+    float *b_mlp1 =
+        w->b_mlp1 + 1ll * (l * n_experts + e) * (2 * p->intermediate_dim);
+        
+    float *w_mlp2 =
+        w->w_mlp2 +
+        1ll * (l * n_experts + e) * hidden_dim *
+            p->intermediate_dim; // (out: hidden_dim, in: intermediate_dim)
+    float *b_mlp2 = w->b_mlp2 + 1ll * (l * n_experts + e) * hidden_dim;          
 
-    if (in_topk) {
-      float *w_mlp1 = w->w_mlp1 + 1ll * (l * n_experts + e) *
-                                  (2 * p->intermediate_dim) * hidden_dim;
-      float *b_mlp1 =
-          w->b_mlp1 + 1ll * (l * n_experts + e) * (2 * p->intermediate_dim);
-          
-      float *w_mlp2 =
-          w->w_mlp2 +
-          1ll * (l * n_experts + e) * hidden_dim *
-              p->intermediate_dim; // (out: hidden_dim, in: intermediate_dim)
-      float *b_mlp2 = w->b_mlp2 + 1ll * (l * n_experts + e) * hidden_dim;          
-
-      mlp_getp(transformer, x, w_mlp1, b_mlp1, w_mlp2, b_mlp2, expert_w);
-    }
+    mlp_getp(transformer, x, w_mlp1, b_mlp1, w_mlp2, b_mlp2, expert_w);
   }
 
   // residual connection
