@@ -124,7 +124,7 @@ void getp(Transformer *transformer, Tokenizer *tokenizer, Sampler *sampler,
   end = time_in_ms();
   printf("\nwarm up elapsed time(s): %f\n", (double)(end - start) / 1000);
   fflush(stdout);
-
+  
   start = time_in_ms();
   long long num_gen_tokens =
       inference(transformer, tokenizer, sampler, &requests);
