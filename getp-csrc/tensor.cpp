@@ -12,7 +12,8 @@
 #define TENSOR_HIP
 
 #include <hip/hip_runtime.h>
-#include <hip/hip_bfloat16.h>
+#include <hip/hip_bf16.h>
+#include <hip/hip_fp16.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -78,14 +79,13 @@ typedef struct {
  * bfloat16 is a 16-bit floating point format commonly used in machine learning.
  * It has 1 sign bit, 8 exponent bits, and 7 mantissa bits.
  */
-typedef union {
-    uint16_t bits;           // Raw 16-bit representation
-    struct {
-        uint16_t mantissa : 7;   // 7-bit mantissa (fractional part)
-        uint16_t exponent : 8;   // 8-bit exponent
-        uint16_t sign : 1;       // 1-bit sign
-    };
-} bfloat16_t;
+typedef __hip_bfloat16 bfloat16_t;  // or just use __hip_bfloat16 directly
+
+// Forward declarations of GPU kernels
+__global__ void fill_kernel_f32(float* data, float value, size_t size);
+__global__ void fill_kernel_bf16(__hip_bfloat16* data, __hip_bfloat16 value, size_t size);
+__global__ void convert_f32_to_bf16_kernel(__hip_bfloat16* dst, float* src, size_t size);
+__global__ void convert_bf16_to_f32_kernel(float* dst, __hip_bfloat16* src, size_t size);
 
 /**
  * Get the size in bytes for a given data type
@@ -95,11 +95,11 @@ typedef union {
  */
 size_t dtype_size(TensorDType dtype) {
     switch (dtype) {
-        case TENSOR_DTYPE_FLOAT32: return sizeof(float);      // 4 bytes
-        case TENSOR_DTYPE_FLOAT16: return sizeof(uint16_t);   // 2 bytes
-        case TENSOR_DTYPE_BFLOAT16: return sizeof(uint16_t);  // 2 bytes
-        case TENSOR_DTYPE_INT32: return sizeof(int);          // 4 bytes
-        default: return sizeof(float);                        // Default to float32
+        case TENSOR_DTYPE_FLOAT32: return sizeof(float);
+        case TENSOR_DTYPE_FLOAT16: return sizeof(__half);           // Also native in HIP
+        case TENSOR_DTYPE_BFLOAT16: return sizeof(__hip_bfloat16);  // Native HIP type
+        case TENSOR_DTYPE_INT32: return sizeof(int);
+        default: return sizeof(float);
     }
 }
 
@@ -109,15 +109,12 @@ size_t dtype_size(TensorDType dtype) {
  * @param bf16 The bfloat16 value to convert
  * @return The equivalent float32 value
  */
-float bfloat16_to_float(bfloat16_t bf16) {
-    union {
-        float f;
-        uint32_t i;
-    } u;
-    // bfloat16 to float32: shift left by 16 bits to expand mantissa
-    u.i = ((uint32_t)bf16.bits) << 16;
-    return u.f;
+// Replace custom conversions with:
+__device__ __host__ float bfloat16_to_float(__hip_bfloat16 bf16) {
+    return __bfloat162float(bf16);
 }
+
+
 
 /**
  * Convert float32 to bfloat16
@@ -125,18 +122,8 @@ float bfloat16_to_float(bfloat16_t bf16) {
  * @param f The float32 value to convert
  * @return The equivalent bfloat16 value
  */
-bfloat16_t float_to_bfloat16(float f) {
-    union {
-        float f;
-        uint32_t i;
-    } u;
-    u.f = f;
-    bfloat16_t result;
-    
-    // Round to nearest even for better numerical stability
-    uint32_t rounding_bias = 0x7FFF + ((u.i >> 16) & 1);
-    result.bits = (u.i + rounding_bias) >> 16;
-    return result;
+__device__ __host__ __hip_bfloat16 float_to_bfloat16(float f) {
+    return __float2bfloat16(f);
 }
 
 /**
@@ -306,13 +293,13 @@ Tensor* tensor_from_float_data(const float* data, const size_t* shape, size_t nd
                 size_t blocks = (tensor->size + threads_per_block - 1) / threads_per_block;
                 hipLaunchKernelGGL(convert_f32_to_bf16_kernel,
                                   dim3(blocks), dim3(threads_per_block), 0, 0,
-                                  (uint16_t*)tensor->data, temp_gpu_f32, tensor->size);
+                                  (__hip_bfloat16*)tensor->data, temp_gpu_f32, tensor->size);
                 HIP_CHECK(hipDeviceSynchronize());
                 
-                hipFree(temp_gpu_f32);
+                HIP_CHECK(hipFree(temp_gpu_f32));
             } else {
                 // Unsupported dtype for GPU
-                hipFree(tensor->data);
+                HIP_CHECK(hipFree(tensor->data));
                 free(tensor->shape);
                 free(tensor->strides);
                 free(tensor);
@@ -333,10 +320,9 @@ Tensor* tensor_from_float_data(const float* data, const size_t* shape, size_t nd
                 memcpy(tensor->data, data, tensor->size * sizeof(float));
             } else if (dtype == TENSOR_DTYPE_BFLOAT16) {
                 // Convert float32 to bfloat16 on CPU
-                uint16_t* dst = (uint16_t*)tensor->data;
+                __hip_bfloat16* dst = (__hip_bfloat16*)tensor->data;
                 for (size_t i = 0; i < tensor->size; i++) {
-                    bfloat16_t bf16 = float_to_bfloat16(data[i]);
-                    dst[i] = bf16.bits;
+                    dst[i] = float_to_bfloat16(data[i]);
                 }
             } else {
                 // Unsupported dtype for CPU
@@ -413,7 +399,7 @@ void tensor_free(Tensor* tensor) {
     // Free data only if this tensor owns it
     if (tensor->owns_data && tensor->data) {
         if (tensor->device == TENSOR_DEVICE_GPU) {
-            hipFree(tensor->data);  // Free GPU memory
+            HIP_CHECK(hipFree(tensor->data));  // Free GPU memory
         } else {
             free(tensor->data);     // Free CPU memory
         }
@@ -455,7 +441,7 @@ int tensor_to_device(Tensor* tensor, TensorDevice target_device) {
             if (tensor->device == TENSOR_DEVICE_CPU) {
                 free(tensor->data);
             } else {
-                hipFree(tensor->data);
+                HIP_CHECK(hipFree(tensor->data));
             }
         }
     } else {
@@ -468,7 +454,7 @@ int tensor_to_device(Tensor* tensor, TensorDevice target_device) {
         
         // Free old GPU data if owned
         if (tensor->owns_data) {
-            hipFree(tensor->data);
+            HIP_CHECK(hipFree(tensor->data));
         }
     }
     
@@ -534,7 +520,7 @@ __global__ void fill_kernel_f32(float* data, float value, size_t size) {
  * @param value Value to fill the tensor with (as uint16_t bits)
  * @param size Total number of elements
  */
-__global__ void fill_kernel_bf16(uint16_t* data, uint16_t value, size_t size) {
+__global__ void fill_kernel_bf16(__hip_bfloat16* data, __hip_bfloat16 value, size_t size) {
     size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx < size) {
         data[idx] = value;
@@ -548,17 +534,10 @@ __global__ void fill_kernel_bf16(uint16_t* data, uint16_t value, size_t size) {
  * @param src Source buffer (float32)
  * @param size Number of elements to convert
  */
-__global__ void convert_f32_to_bf16_kernel(uint16_t* dst, float* src, size_t size) {
+__global__ void convert_f32_to_bf16_kernel(__hip_bfloat16* dst, float* src, size_t size) {
     size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx < size) {
-        union {
-            float f;
-            uint32_t i;
-        } u;
-        u.f = src[idx];
-        // Round to nearest even for better numerical stability
-        uint32_t rounding_bias = 0x7FFF + ((u.i >> 16) & 1);
-        dst[idx] = (u.i + rounding_bias) >> 16;
+        dst[idx] = __float2bfloat16(src[idx]);  // Native HIP conversion
     }
 }
 
@@ -569,16 +548,10 @@ __global__ void convert_f32_to_bf16_kernel(uint16_t* dst, float* src, size_t siz
  * @param src Source buffer (bfloat16 as uint16_t)
  * @param size Number of elements to convert
  */
-__global__ void convert_bf16_to_f32_kernel(float* dst, uint16_t* src, size_t size) {
+__global__ void convert_bf16_to_f32_kernel(float* dst, __hip_bfloat16* src, size_t size) {
     size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx < size) {
-        union {
-            float f;
-            uint32_t i;
-        } u;
-        // Convert bfloat16 to float32 by shifting left 16 bits
-        u.i = ((uint32_t)src[idx]) << 16;
-        dst[idx] = u.f;
+        dst[idx] = __bfloat162float(src[idx]);  // Native HIP conversion
     }
 }
 
@@ -604,10 +577,10 @@ void tensor_fill(Tensor* tensor, float value) {
                                   (float*)tensor->data, value, tensor->size);
                 break;
             case TENSOR_DTYPE_BFLOAT16: {
-                bfloat16_t bf16_value = float_to_bfloat16(value);
-                hipLaunchKernelGGL(fill_kernel_bf16, 
-                                  dim3(blocks), dim3(threads_per_block), 0, 0,
-                                  (uint16_t*)tensor->data, bf16_value.bits, tensor->size);
+            __hip_bfloat16 bf16_value = __float2bfloat16(value);
+            hipLaunchKernelGGL(fill_kernel_bf16, 
+                            blocks, threads_per_block, 0, 0,
+                            (__hip_bfloat16*)tensor->data, bf16_value, tensor->size);
                 break;
             }
             default:
@@ -625,10 +598,10 @@ void tensor_fill(Tensor* tensor, float value) {
                 break;
             }
             case TENSOR_DTYPE_BFLOAT16: {
-                uint16_t* data = (uint16_t*)tensor->data;
-                bfloat16_t bf16_value = float_to_bfloat16(value);
+                __hip_bfloat16* data = (__hip_bfloat16*)tensor->data;
+                __hip_bfloat16 bf16_value = __float2bfloat16(value);
                 for (size_t i = 0; i < tensor->size; i++) {
-                    data[i] = bf16_value.bits;
+                    data[i] = bf16_value;
                 }
                 break;
             }
@@ -830,22 +803,22 @@ int tensor_convert_dtype(Tensor* tensor, TensorDType target_dtype) {
             // Float32 to bfloat16 conversion
             hipLaunchKernelGGL(convert_f32_to_bf16_kernel,
                               dim3(blocks), dim3(threads_per_block), 0, 0,
-                              (uint16_t*)new_data, (float*)tensor->data, tensor->size);
+                              (__hip_bfloat16*)new_data, (float*)tensor->data, tensor->size);
         } else if (tensor->dtype == TENSOR_DTYPE_BFLOAT16 && target_dtype == TENSOR_DTYPE_FLOAT32) {
             // Bfloat16 to float32 conversion
             hipLaunchKernelGGL(convert_bf16_to_f32_kernel,
                               dim3(blocks), dim3(threads_per_block), 0, 0,
-                              (float*)new_data, (uint16_t*)tensor->data, tensor->size);
+                              (float*)new_data, (__hip_bfloat16*)tensor->data, tensor->size);
         } else {
             // Unsupported conversion
-            hipFree(new_data);
+            HIP_CHECK(hipFree(new_data));
             return -1;
         }
         HIP_CHECK(hipDeviceSynchronize());
         
         // Free old data if owned
         if (tensor->owns_data) {
-            hipFree(tensor->data);
+            HIP_CHECK(hipFree(tensor->data));
         }
     } else {
         // CPU conversion using loops
@@ -855,19 +828,16 @@ int tensor_convert_dtype(Tensor* tensor, TensorDType target_dtype) {
         if (tensor->dtype == TENSOR_DTYPE_FLOAT32 && target_dtype == TENSOR_DTYPE_BFLOAT16) {
             // Float32 to bfloat16 conversion
             float* src = (float*)tensor->data;
-            uint16_t* dst = (uint16_t*)new_data;
+            __hip_bfloat16* dst = (__hip_bfloat16*)new_data;
             for (size_t i = 0; i < tensor->size; i++) {
-                bfloat16_t bf16 = float_to_bfloat16(src[i]);
-                dst[i] = bf16.bits;
+                dst[i] = float_to_bfloat16(src[i]);
             }
         } else if (tensor->dtype == TENSOR_DTYPE_BFLOAT16 && target_dtype == TENSOR_DTYPE_FLOAT32) {
             // Bfloat16 to float32 conversion
-            uint16_t* src = (uint16_t*)tensor->data;
+            __hip_bfloat16* src = (__hip_bfloat16*)tensor->data;
             float* dst = (float*)new_data;
             for (size_t i = 0; i < tensor->size; i++) {
-                bfloat16_t bf16;
-                bf16.bits = src[i];
-                dst[i] = bfloat16_to_float(bf16);
+                dst[i] = bfloat16_to_float(src[i]);
             }
         } else {
             // Unsupported conversion

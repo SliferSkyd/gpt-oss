@@ -127,11 +127,9 @@ private:
         assert(cpu_bf16->element_size == 2);
         
         // Verify BF16 data by converting back to float
-        uint16_t* bf16_data = (uint16_t*)cpu_bf16->data;
+        __hip_bfloat16* bf16_data = (__hip_bfloat16*)cpu_bf16->data;
         for (size_t i = 0; i < 12; i++) {
-            bfloat16_t bf16;
-            bf16.bits = bf16_data[i];
-            float converted = bfloat16_to_float(bf16);
+            float converted = bfloat16_to_float(bf16_data[i]);
             float relative_error = std::abs(test_data[i] - converted) / (std::abs(test_data[i]) + 1e-8f);
             assert(relative_error < 0.01f || std::abs(test_data[i] - converted) < 1e-4f);
         }
@@ -163,13 +161,11 @@ private:
         assert(gpu_bf16->device == TENSOR_DEVICE_GPU);
         
         // Copy back to CPU and verify
-        uint16_t* host_bf16_verify = (uint16_t*)malloc(12 * sizeof(uint16_t));
-        HIP_CHECK(hipMemcpy(host_bf16_verify, gpu_bf16->data, 12 * sizeof(uint16_t), hipMemcpyDeviceToHost));
+        __hip_bfloat16* host_bf16_verify = (__hip_bfloat16*)malloc(12 * sizeof(__hip_bfloat16));
+        HIP_CHECK(hipMemcpy(host_bf16_verify, gpu_bf16->data, 12 * sizeof(__hip_bfloat16), hipMemcpyDeviceToHost));
         
         for (size_t i = 0; i < 12; i++) {
-            bfloat16_t bf16;
-            bf16.bits = host_bf16_verify[i];
-            float converted = bfloat16_to_float(bf16);
+            float converted = bfloat16_to_float(host_bf16_verify[i]);
             float relative_error = std::abs(test_data[i] - converted) / (std::abs(test_data[i]) + 1e-8f);
             assert(relative_error < 0.01f || std::abs(test_data[i] - converted) < 1e-4f);
         }
@@ -259,10 +255,10 @@ private:
         Tensor* cpu_bf16 = tensor_create(shape, 2, TENSOR_DTYPE_BFLOAT16, TENSOR_DEVICE_CPU);
         tensor_fill(cpu_bf16, 2.718f);
         
-        uint16_t* cpu_bf16_data = (uint16_t*)cpu_bf16->data;
-        bfloat16_t expected_bf16 = float_to_bfloat16(2.718f);
+        __hip_bfloat16* cpu_bf16_data = (__hip_bfloat16*)cpu_bf16->data;
+        __hip_bfloat16 expected_bf16 = float_to_bfloat16(2.718f);
         for (size_t i = 0; i < cpu_bf16->size; i++) {
-            assert(cpu_bf16_data[i] == expected_bf16.bits);
+            assert(cpu_bf16_data[i] == expected_bf16);  // Compare bfloat16 values directly
         }
         tensor_free(cpu_bf16);
         
