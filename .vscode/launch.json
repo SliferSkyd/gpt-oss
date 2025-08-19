@@ -1,0 +1,13 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "C/C++ Runner: Debug Session",
+      "type": "lldb",
+      "request": "launch",
+      "args": [],
+      "cwd": "/Users/thanh/code/moreh/gpt-oss",
+      "program": "/Users/thanh/code/moreh/gpt-oss/build/Debug/outDebug"
+    }
+  ]
+}
