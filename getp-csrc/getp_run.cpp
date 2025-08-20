@@ -4,6 +4,9 @@
 #include "../tokenizer.hpp"
 #include "getp_eval.cpp"
 #include <cassert>
+#include "../include/utils.hpp"
+
+
 
 #ifndef GETP_RUN
 #define GETP_RUN
