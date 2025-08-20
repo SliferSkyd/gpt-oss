@@ -4,6 +4,9 @@
 #include "../tokenizer.hpp"
 #include "getp_eval.cpp"
 #include <cassert>
+#include "../include/utils.hpp"
+
+
 
 #ifndef GETP_RUN
 #define GETP_RUN
@@ -527,6 +530,7 @@ long long simple_getp_generate(Transformer *transformer, Tokenizer *tokenizer,
 
 long long inference(Transformer *transformer, Tokenizer *tokenizer,
                     Sampler *sampler, Requests *requests) {
+print_hello();
   long long num_token_out = 0;
   for (int idx = 0; idx < requests->num_reqs; ++idx) {
     const char *input_seq = get_str_req_ptr(requests, idx);
