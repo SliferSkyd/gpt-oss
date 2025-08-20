@@ -1,2 +1,2 @@
 #pragma once
-#define BATCH_SIZE 8
+#define BATCH_SIZE 2

@@ -4,64 +4,11 @@
 #include "../tokenizer.hpp"
 #include "getp_eval.cpp"
 #include <cassert>
-
-#include "../model.hpp"
+#include "../include/model.hpp"
 
 
 #ifndef GETP_RUN
 #define GETP_RUN
-
-float *cos_vals, *sin_vals;
-int **prompt_tokens;
-int *current_tokens;
-bool *finished;
-int *positions;
-int *prompt_lens;
-float *expert_input_buffer; // Buffer for MoE expert inputs
-
-void warm_up(Transformer *transformer, Tokenizer *tokenizer) {
-    // RoPE relative positional encoding: complex-valued rotate q and k in each
-    // head Adapted from
-    // https://github.com/openai/gpt-oss/blob/main/gpt_oss/torch/model.py#L85
-    // RoPE with YaRN scaling adapted from Python code
-
-    Config *p = &transformer->config;
-    RunState *s = &transformer->state;
-
-    float ntk_beta = 32.0f;
-    float ntk_alpha = 1.0f;
-    cos_vals =
-        reinterpret_cast<float *>(malloc((p->head_dim / 2) * p->seq_len * sizeof(float)));
-    sin_vals =
-        reinterpret_cast<float *>(malloc((p->head_dim / 2) * p->seq_len * sizeof(float)));
-    for (int pos = 0; pos < p->seq_len; ++pos)
-        compute_cos_sin_getp(pos, p->rope_theta, p->head_dim, p->rope_scaling_factor,
-                           p->initial_context_length, ntk_beta, ntk_alpha, cos_vals + (pos * p->head_dim / 2),
-                           sin_vals + (pos * p->head_dim / 2));
-
-    // re-allocate run state (more space for batching)
-    malloc_batch_run_state(s, p);
-
-    prompt_tokens = (int**)malloc(BATCH_SIZE * sizeof(int*));
-    current_tokens = (int*)malloc(BATCH_SIZE * sizeof(int));
-
-    for (int b = 0; b < BATCH_SIZE; b++) {
-        prompt_tokens[b] = (int*)malloc((p->seq_len + 3) * sizeof(int));
-    }
-
-    finished = (bool*)malloc(BATCH_SIZE * sizeof(bool));
-    positions = (int*)malloc(BATCH_SIZE * sizeof(int));
-    prompt_lens = (int*)malloc(BATCH_SIZE * sizeof(int));
-}
-
-void finish(Transformer *transformer, Tokenizer *tokenizer) {
-    // Do not inference here
-    // You should handle the finish process
-    // TODO:
-    // - Memory deallocation
-    // - Unload model
-    // - ...
-}
 
 
 
@@ -93,76 +40,6 @@ float *forward_batch_getp(Transformer *transformer, RunState *s,
     matmul_batch_getp(s->logits, s->x, w->out, batch_size, hidden_dim, p->vocab_size);
 
     return s->logits;
-}
-
-long long simple_getp_generate(Transformer *transformer, Tokenizer *tokenizer,
-                               Sampler *sampler, const char *input_seq,
-                               int *output_tokens, int steps) {
-    // Inference here
-
-    const char *empty_prompt = "";
-    if (input_seq == NULL) {
-        input_seq = empty_prompt;
-    }
-
-    // encode the (string) prompt into tokens sequence
-    int num_prompt_tokens = 0;
-    int *prompt_tokens = (int *)malloc((strlen(input_seq) + 3) *
-                                       sizeof(int)); // +3 for '\0', ?BOS, ?EOS
-    encode(tokenizer, input_seq, 1, 0, prompt_tokens, &num_prompt_tokens,
-           transformer->config.initial_context_length);
-    if (num_prompt_tokens < 1) {
-        fprintf(stderr, "something is wrong, expected at least 1 prompt token\n");
-        exit(EXIT_FAILURE);
-    }
-
-    // start the main loop
-    int next;                   // will store the next token in the sequence
-    int token = prompt_tokens[0]; // kick off with the first token in the prompt
-    int pos = 0;                   // position in the sequence
-    while (pos < steps) {
-
-        // forward_getp the transformer to get logits for the next token
-        float *logits = forward_getp(transformer, token, pos);
-
-        // advance the state machine
-        if (pos < num_prompt_tokens - 1) {
-            // if we are still processing the input prompt, force the next prompt
-            // token
-            next = prompt_tokens[pos + 1];
-        } else {
-            // otherwise sample the next token from the logits
-            next = sample(sampler, logits);
-            // save the output token, it will be printed to file
-            if(pos >= num_prompt_tokens)
-                output_tokens[pos - num_prompt_tokens] = next;
-        }
-        pos++;
-
-        // data-dependent terminating condition: the BOS (=1) token delimits
-        // sequences
-        if (next == 1) {
-            break;
-        }
-
-        // print the token as string, decode it with the Tokenizer object
-        // should be removed
-        const char *piece = decode_piece(tokenizer, token, next);
-        safe_printf(piece); // same as printf("%s", piece), but skips "unsafe" bytes
-        fflush(stdout);
-
-        token = next;
-    }
-
-    // should be removed
-    printf("\n");
-
-    // Marker for end of sequence
-    output_tokens[pos - num_prompt_tokens] = -1;
-
-    free(prompt_tokens);
-
-    return pos - num_prompt_tokens;
 }
 
 long long batched_generate(Transformer *transformer, Tokenizer *tokenizer,
@@ -270,6 +147,7 @@ long long batched_generate(Transformer *transformer, Tokenizer *tokenizer,
                 prev_token = token;
             }
             printf("\n");
+            printf("[DEBUG] Request %d: Generated %d tokens\n", req_idx, positions[b] - prompt_lens[b] + 1);
         }
         // Flush stdout once after printing all results for the batch
         fflush(stdout);
