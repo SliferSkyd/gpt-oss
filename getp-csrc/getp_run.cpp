@@ -10,7 +10,7 @@
 #define GETP_RUN
 
 // BATCH_SIZE can be increased for higher throughput
-#define BATCH_SIZE 32
+#define BATCH_SIZE 8
 #define THREADS_PER_BLOCK 256
 #define WARP_SIZE 64
 
@@ -23,6 +23,7 @@ int *positions;
 int *prompt_lens;
 
 // GPU variables
+float *d_attn_sinks;
 float *d_cos_vals, *d_sin_vals;
 float *d_x, *d_t, *d_tb, *d_tb2, *d_qkv, *d_q, *d_k, *d_v;
 float *d_key_cache, *d_value_cache, *d_att, *d_logits;
@@ -39,6 +40,12 @@ float *d_w_router, *d_b_router;
 float *d_w_mlp1, *d_b_mlp1, *d_w_mlp2, *d_b_mlp2;
 float *d_out_w;
 
+// Add to list of GPU variables
+int *d_expert_indices;
+float *d_expert_weights;
+int *d_batch_count; // A single integer on the GPU
+float *d_expert_output_buffer;
+
 // HIP error checking macro
 #define HIP_CHECK(call) \
     do { \
@@ -48,6 +55,18 @@ float *d_out_w;
             exit(EXIT_FAILURE); \
         } \
     } while(0)
+
+
+void debug(float *d_val, int size = 1) {
+    float *h_val = (float *)malloc(size * sizeof(float));
+    HIP_CHECK(hipDeviceSynchronize());
+    HIP_CHECK(hipMemcpy(h_val, d_val, size * sizeof(float), hipMemcpyDeviceToHost));
+    for (int i = 0; i < size; i++) {
+        fprintf(stderr, "Debug value %d: %f\n", i, h_val[i]);
+    }
+    free(h_val);
+    exit(0);
+}
 
 // CPU warmup functions (same as before)
 void compute_concentration_and_inv_freq_getp(float base, int head_dim,
@@ -327,8 +346,8 @@ __global__ void attention_scores_kernel(float *att, const float *q, const float 
     int pos = positions[batch_idx];
     if (t > pos) return;
     
-    int kv_dim = head_dim * (n_heads / 4); // Assuming GQA with 4:1 ratio
-    int kv_head = head_idx / 4;
+    int kv_dim = head_dim * (n_heads / 2); // Assuming GQA with 4:1 ratio
+    int kv_head = head_idx / 2;
     
     const float *q_head = q + batch_idx * n_heads * head_dim + head_idx * head_dim;
     const float *k_head = key_cache + batch_idx * n_layers * seq_len * kv_dim +
@@ -341,7 +360,7 @@ __global__ void attention_scores_kernel(float *att, const float *q, const float 
     score /= sqrtf((float)head_dim);
     
     // Apply sliding window mask if enabled
-    if (use_sliding_window && mask) {
+    if (use_sliding_window && (layer_idx % 2 == 0)) {
         score += mask[pos * seq_len + t];
     }
     
@@ -359,8 +378,8 @@ __global__ void attention_weighted_sum_kernel(float *output, const float *att,
     if (batch_idx >= batch_size || head_idx >= n_heads || dim_idx >= head_dim) return;
     
     int pos = positions[batch_idx];
-    int kv_dim = head_dim * (n_heads / 4);
-    int kv_head = head_idx / 4;
+    int kv_dim = head_dim * (n_heads / 2);
+    int kv_head = head_idx / 2;
     
     const float *att_head = att + batch_idx * n_heads * seq_len + head_idx * seq_len;
     float *out_head = output + batch_idx * n_heads * head_dim + head_idx * head_dim;
@@ -494,6 +513,39 @@ __global__ void matmul_kernel_safe(float *output, const float *input, const floa
     }
 }
 
+__global__ void matmul_kernel_simple(float *output, const float *input, const float *weight,
+                                     int batch_size, int input_dim, int output_dim) {
+    // Each thread will compute one element in the output matrix.
+    // blockIdx.x maps to the batch dimension.
+    // The combination of blockIdx.y, blockDim.y, and threadIdx.y maps to the output dimension.
+    int batch_idx = blockIdx.x;
+    int out_idx = blockIdx.y * blockDim.y + threadIdx.y;
+
+    // Bounds check: Ensure we are not writing out of bounds.
+    if (batch_idx >= batch_size || out_idx >= output_dim) {
+        return;
+    }
+
+    // Initialize accumulator for this thread's output value.
+    float sum = 0.0f;
+
+    // Get a pointer to the start of the correct input vector for this batch.
+    const float *x_b = input + batch_idx * input_dim;
+    
+    // Get a pointer to the start of the correct weight matrix row for this output.
+    const float *w_row = weight + out_idx * input_dim;
+
+    // --- Core Logic (Same as CPU) ---
+    // This single thread performs the entire dot product.
+    for (int j = 0; j < input_dim; j++) {
+        sum += w_row[j] * x_b[j];
+    }
+    // ---------------------------------
+
+    // Write the final result to the correct position in the output matrix.
+    output[batch_idx * output_dim + out_idx] = sum;
+}
+
 // Memory allocation functions
 void malloc_gpu_run_state(RunState *s, Config *p) {
     int kv_dim = p->head_dim * p->n_kv_heads;
@@ -521,6 +573,14 @@ void malloc_gpu_run_state(RunState *s, Config *p) {
     HIP_CHECK(hipMalloc((void**)&d_k, BATCH_SIZE * kv_dim * sizeof(float)));
     HIP_CHECK(hipMalloc((void**)&d_v, BATCH_SIZE * kv_dim * sizeof(float)));
     
+    // NEW: Buffers for GPU scatter-gather MoE
+    // Max possible items for one expert is the entire batch
+    HIP_CHECK(hipMalloc((void**)&d_expert_indices, BATCH_SIZE * p->experts_per_token * sizeof(int)));
+    HIP_CHECK(hipMalloc((void**)&d_expert_weights, BATCH_SIZE * p->experts_per_token * sizeof(float)));
+    HIP_CHECK(hipMalloc((void**)&d_batch_count, sizeof(int)));
+    // This buffer holds the expert's final output before scattering
+    HIP_CHECK(hipMalloc((void**)&d_expert_output_buffer, BATCH_SIZE * p->hidden_dim * sizeof(float)));
+
     // KV cache allocation - this is usually the largest allocation
     HIP_CHECK(hipMalloc((void**)&d_key_cache, kv_cache_size));
     HIP_CHECK(hipMalloc((void**)&d_value_cache, kv_cache_size));
@@ -568,7 +628,8 @@ void malloc_gpu_run_state(RunState *s, Config *p) {
     HIP_CHECK(hipMalloc((void**)&d_b_mlp2, p->n_layers * p->n_experts * p->hidden_dim * sizeof(float)));
     
     HIP_CHECK(hipMalloc((void**)&d_out_w, p->hidden_dim * p->vocab_size * sizeof(float)));
-    
+    HIP_CHECK(hipMalloc((void**)&d_attn_sinks, p->n_layers * p->n_attn_heads * sizeof(float)));
+ 
     // Initialize all allocated memory to zero
     HIP_CHECK(hipMemset(d_x, 0, batch_hidden));
     HIP_CHECK(hipMemset(d_t, 0, batch_hidden));
@@ -602,8 +663,6 @@ void malloc_gpu_run_state(RunState *s, Config *p) {
         HIP_CHECK(hipMemcpy(d_mask, h_mask, mask_size, hipMemcpyHostToDevice));
         free(h_mask);
     }
-    
-    printf("GPU memory allocation completed successfully\n");
 }
 
 void copy_weights_to_gpu(Transformer *transformer) {
@@ -625,7 +684,8 @@ void copy_weights_to_gpu(Transformer *transformer) {
     int attn_out_size = p->n_layers * (p->n_attn_heads * p->head_dim) * p->hidden_dim;
     HIP_CHECK(hipMemcpy(d_w_o, w->w_o, attn_out_size * sizeof(float), hipMemcpyHostToDevice));
     HIP_CHECK(hipMemcpy(d_b_o, w->b_o, p->n_layers * p->hidden_dim * sizeof(float), hipMemcpyHostToDevice));
-    
+    HIP_CHECK(hipMemcpy(d_attn_sinks, w->attn_sinks, p->n_layers * p->n_attn_heads * sizeof(float), hipMemcpyHostToDevice));
+
     // Copy MoE weights
     HIP_CHECK(hipMemcpy(d_w_router, w->w_router, p->n_layers * p->hidden_dim * p->n_experts * sizeof(float), hipMemcpyHostToDevice));
     HIP_CHECK(hipMemcpy(d_b_router, w->b_router, p->n_layers * p->n_experts * sizeof(float), hipMemcpyHostToDevice));
@@ -743,6 +803,136 @@ void finish(Transformer *transformer, Tokenizer *tokenizer) {
     free(prompt_lens);
 }
 
+// "Gather" kernel: Finds tokens for an expert and creates a compact list.
+__global__ void gather_expert_inputs_kernel(const float* d_t, const int* topk_i, const float* topk_v,
+                                            int expert_id, int batch_size, int hidden_dim, int experts_per_token,
+                                            float* expert_input_buffer, int* expert_indices, float* expert_weights,
+                                            int* d_batch_count) {
+    int b = blockIdx.x * blockDim.x + threadIdx.x;
+    if (b >= batch_size) return;
+
+    // Check if this token 'b' selected the current 'expert_id'
+    for (int k = 0; k < experts_per_token; ++k) {
+        int topk_idx = b * experts_per_token + k;
+        if (topk_i[topk_idx] == expert_id) {
+            // This token is routed to this expert.
+            // Atomically get a unique index for this token in the compact buffer.
+            int compact_idx = atomicAdd(d_batch_count, 1);
+
+            // Store the original batch index and weight for the scatter step.
+            expert_indices[compact_idx] = b;
+            expert_weights[compact_idx] = topk_v[topk_idx];
+
+            // Copy the hidden state from d_t into the compact input buffer.
+            // This is a strided copy, which is slow. For max performance,
+            // a second kernel could re-format this into a dense matrix.
+            // For logic matching, this is correct.
+            const float* src = d_t + b * hidden_dim;
+            float* dst = expert_input_buffer + compact_idx * hidden_dim;
+            for (int i = 0; i < hidden_dim; ++i) {
+                dst[i] = src[i];
+            }
+            // break; // Token found its expert, move to next token
+        }
+    }
+}
+
+// "Scatter" kernel: Adds the expert outputs back to the final aggregation buffer.
+__global__ void scatter_expert_outputs_kernel(float* d_e_agg, const float* expert_output_buffer,
+                                              const int* expert_indices, const float* expert_weights,
+                                              int batch_count, int hidden_dim) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= batch_count * hidden_dim) return;
+
+    int compact_idx = idx / hidden_dim;
+    int dim = idx % hidden_dim;
+
+    // Get the original batch index and the expert's router weight
+    int original_batch_idx = expert_indices[compact_idx];
+    float weight = expert_weights[compact_idx];
+
+    // Calculate the destination address in the main aggregation buffer
+    float* dst = d_e_agg + original_batch_idx * hidden_dim + dim;
+    float value = expert_output_buffer[idx];
+
+    // Atomically add the weighted result. This is crucial because multiple
+    // experts (if experts_per_token > 1) write to the same d_e_agg location.
+    atomicAdd(dst, value * weight);
+}
+
+__global__ void add_sinks_kernel(float *att, const float *sinks, const int *positions, 
+                                 int seq_len, int n_heads) {
+    int batch_idx = blockIdx.x;
+    int head_idx = blockIdx.y;
+
+    int pos = positions[batch_idx];
+    if (pos + 1 < seq_len) {
+        // Index for the sink is at pos + 1
+        int sink_att_idx = batch_idx * n_heads * seq_len + head_idx * seq_len + (pos + 1);
+        att[sink_att_idx] = sinks[head_idx];
+    }
+}
+
+__global__ void softmax_kernel_variable_len(float *x, const int *positions, 
+                                            int batch_size, int n_heads, int max_seq_len) {
+    // Each block processes one head for one batch item
+    int batch_idx = blockIdx.x / n_heads;
+    int head_idx = blockIdx.x % n_heads;
+    int tid = threadIdx.x;
+
+    if (batch_idx >= batch_size) return;
+
+    int pos = positions[batch_idx];
+    int size = pos + 2; // Real size including the attention sink
+
+    float *batch_head_x = x + (batch_idx * n_heads + head_idx) * max_seq_len;
+    
+    __shared__ float shared_max[THREADS_PER_BLOCK];
+    __shared__ float shared_sum[THREADS_PER_BLOCK];
+
+    // Find max value in the valid range
+    float max_val = -INFINITY;
+    for (int i = tid; i < size; i += blockDim.x) {
+        max_val = fmaxf(max_val, batch_head_x[i]);
+    }
+    shared_max[tid] = max_val;
+    __syncthreads();
+    
+    // Reduction for max
+    for (int stride = blockDim.x / 2; stride > 0; stride /= 2) {
+        if (tid < stride) {
+            shared_max[tid] = fmaxf(shared_max[tid], shared_max[tid + stride]);
+        }
+        __syncthreads();
+    }
+    max_val = shared_max[0];
+    __syncthreads();
+
+    // Compute exp and sum over the valid range
+    float sum = 0.0f;
+    for (int i = tid; i < size; i += blockDim.x) {
+        batch_head_x[i] = expf(batch_head_x[i] - max_val);
+        sum += batch_head_x[i];
+    }
+    shared_sum[tid] = sum;
+    __syncthreads();
+
+    // Reduction for sum
+    for (int stride = blockDim.x / 2; stride > 0; stride /= 2) {
+        if (tid < stride) {
+            shared_sum[tid] += shared_sum[tid + stride];
+        }
+        __syncthreads();
+    }
+    sum = shared_sum[0];
+    __syncthreads();
+    
+    // Normalize over the valid range
+    for (int i = tid; i < size; i += blockDim.x) {
+        batch_head_x[i] /= sum;
+    }
+}
+
 // GPU-accelerated neural network functions
 void attention_gpu(Transformer *transformer, int layer_idx, int batch_size) {
     Config *p = &transformer->config;
@@ -762,17 +952,34 @@ void attention_gpu(Transformer *transformer, int layer_idx, int batch_size) {
     dim3 matmul_grid(batch_size, ((p->n_attn_heads + 2 * p->n_kv_heads) * head_dim + 31) / 32);
     dim3 matmul_block(32, min(32, THREADS_PER_BLOCK / 32));
     int qkv_weight_offset = layer_idx * hidden_dim * (head_dim * p->n_attn_heads + 2 * head_dim * p->n_kv_heads);
-    matmul_kernel_safe<<<matmul_grid, matmul_block>>>(
-        d_qkv, d_t, d_w_qkv + qkv_weight_offset, batch_size, hidden_dim, (p->n_attn_heads + 2 * p->n_kv_heads) * head_dim);
-    HIP_CHECK(hipGetLastError());
     
+    // Your existing variables: d_qkv, d_t, d_w_qkv, etc.
+    // ...
+
+    // Define block and grid dimensions
+    dim3 block_dim(32, 32); // A 2D block, e.g., 32x32 = 1024 threads.
+    dim3 grid_dim;
+    grid_dim.x = batch_size;
+    grid_dim.y = ((p->n_attn_heads + 2 * p->n_kv_heads) * head_dim + block_dim.y - 1) / block_dim.y; // Ceiling division
+
+    // Launch the simple kernel
+    matmul_kernel_simple<<<grid_dim, block_dim>>>(
+        d_qkv, 
+        d_t, 
+        d_w_qkv + qkv_weight_offset, 
+        batch_size, 
+        hidden_dim, 
+        (p->n_attn_heads + 2 * p->n_kv_heads) * head_dim
+    );
+
+    HIP_CHECK(hipGetLastError());
     // Add bias - FIXED: Use GPU bias pointer and proper kernel
     int qkv_bias_offset = layer_idx * (head_dim * p->n_attn_heads + 2 * head_dim * p->n_kv_heads);
     dim3 bias_grid((batch_size * (p->n_attn_heads + 2 * p->n_kv_heads) * head_dim + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK);
     add_bias_kernel<<<bias_grid, THREADS_PER_BLOCK>>>(
         d_qkv, d_b_qkv + qkv_bias_offset, batch_size, (p->n_attn_heads + 2 * p->n_kv_heads) * head_dim);
     HIP_CHECK(hipGetLastError());
-    
+
     // Copy Q, K, V from qkv buffer - SIMPLIFIED AND FIXED
     int q_size = p->n_attn_heads * head_dim;
     int k_size = p->n_kv_heads * head_dim;
@@ -807,7 +1014,7 @@ void attention_gpu(Transformer *transformer, int layer_idx, int batch_size) {
     apply_rotary_emb_kernel<<<rope_grid, rope_block>>>(
         d_q, d_cos_vals, d_sin_vals, d_positions, batch_size, p->n_attn_heads, head_dim);
     HIP_CHECK(hipGetLastError());
-    
+
     rope_grid.y = p->n_kv_heads;
     apply_rotary_emb_kernel<<<rope_grid, rope_block>>>(
         d_k, d_cos_vals, d_sin_vals, d_positions, batch_size, p->n_kv_heads, head_dim);
@@ -828,11 +1035,20 @@ void attention_gpu(Transformer *transformer, int layer_idx, int batch_size) {
         d_att, d_q, d_key_cache, d_mask, d_positions, batch_size, p->n_attn_heads,
         head_dim, p->seq_len, p->n_layers, layer_idx, p->sliding_window > 0);
     HIP_CHECK(hipGetLastError());
+    dim3 sink_grid(batch_size, p->n_attn_heads);
+    dim3 sink_block(1);
+    add_sinks_kernel<<<sink_grid, sink_block>>>(
+        d_att, d_attn_sinks + layer_idx * p->n_attn_heads, d_positions,
+        p->seq_len, p->n_attn_heads);
+    HIP_CHECK(hipGetLastError());
     
     // Softmax attention weights
     dim3 soft_grid(batch_size * p->n_attn_heads);
-    softmax_kernel<<<soft_grid, norm_block>>>(d_att, batch_size * p->n_attn_heads, p->seq_len);
+    dim3 soft_block(THREADS_PER_BLOCK);
+    softmax_kernel_variable_len<<<soft_grid, soft_block>>>(
+        d_att, d_positions, batch_size, p->n_attn_heads, p->seq_len);
     HIP_CHECK(hipGetLastError());
+
     
     // Weighted sum of values
     dim3 wsum_grid(batch_size, p->n_attn_heads);
@@ -843,10 +1059,15 @@ void attention_gpu(Transformer *transformer, int layer_idx, int batch_size) {
     HIP_CHECK(hipGetLastError());
     
     // Output projection - FIXED: Use GPU weight pointer
-    dim3 out_grid(batch_size, (hidden_dim + 31) / 32);
+
+    grid_dim.y = (hidden_dim + block_dim.y - 1) / block_dim.y; // Ceiling division
+
     int attn_out_offset = layer_idx * (head_dim * p->n_attn_heads) * hidden_dim;
-    matmul_kernel<<<out_grid, matmul_block>>>(
-        d_tb2, d_tb, d_w_o + attn_out_offset, batch_size, head_dim * p->n_attn_heads, hidden_dim);
+
+    // Launch the simple kernel
+    matmul_kernel_simple<<<grid_dim, block_dim>>>(
+        d_tb2, d_tb, d_w_o + attn_out_offset, batch_size, head_dim * p->n_attn_heads, hidden_dim
+    );
     HIP_CHECK(hipGetLastError());
     
     // Add bias and residual connection - FIXED: Use GPU bias pointer
@@ -906,7 +1127,6 @@ void moe_gpu(Transformer *transformer, int layer_idx, int batch_size) {
     int hidden_dim = p->hidden_dim;
     int intermediate_dim = p->intermediate_dim;
     int n_experts = p->n_experts;
-    
     // FFN RMSNorm - CORRECT
     dim3 norm_grid(batch_size);
     dim3 norm_block(THREADS_PER_BLOCK);
@@ -918,15 +1138,24 @@ void moe_gpu(Transformer *transformer, int layer_idx, int batch_size) {
     int router_weight_offset = layer_idx * hidden_dim * n_experts;
     dim3 router_grid(batch_size, (n_experts + 31) / 32);
     dim3 router_block(32, 32);
-    matmul_kernel<<<router_grid, router_block>>>(
-        d_router_score, d_t, d_w_router + router_weight_offset, batch_size, hidden_dim, n_experts);
+
+    dim3 block_dim(32, 32); // A 2D block, e.g., 32x32 = 1024 threads.
+    dim3 grid_dim;
+    grid_dim.x = batch_size;
+    grid_dim.y = (n_experts + block_dim.y - 1) / block_dim.y; // Ceiling division
+
+    // Launch the simple kernel
+    matmul_kernel_simple<<<grid_dim, block_dim>>>(
+        d_router_score, d_t, d_w_router + router_weight_offset, batch_size, hidden_dim, n_experts
+    );    
     HIP_CHECK(hipGetLastError());
-    
+
     int router_bias_offset = layer_idx * n_experts;
     dim3 bias_grid((batch_size * n_experts + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK);
     add_bias_kernel<<<bias_grid, THREADS_PER_BLOCK>>>(
         d_router_score, d_b_router + router_bias_offset, batch_size, n_experts);
     HIP_CHECK(hipGetLastError());
+
     
     // Top-k expert selection - CORRECT
     dim3 topk_grid(batch_size);
@@ -937,55 +1166,74 @@ void moe_gpu(Transformer *transformer, int layer_idx, int batch_size) {
     dim3 topk_soft_grid(batch_size);
     softmax_kernel<<<topk_soft_grid, norm_block>>>(d_topk_v, batch_size, p->experts_per_token);
     HIP_CHECK(hipGetLastError());
-    
     // Initialize expert aggregation buffer - CORRECT
     HIP_CHECK(hipMemset(d_e_agg, 0, batch_size * hidden_dim * sizeof(float)));
     
     // --- REWRITTEN EXPERT PROCESSING AND AGGREGATION ---
     dim3 expert_agg_grid((batch_size * hidden_dim + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK);
 
-    // Process each expert and aggregate its output correctly
+    int h_batch_count = 0;
+    // Loop through each expert to process its dedicated mini-batch
     for (int expert_id = 0; expert_id < n_experts; expert_id++) {
-        // Calculate weight and bias offsets for this specific expert
+        // --- 1. GATHER STEP ---
+        
+        // Reset the GPU-side counter for this expert
+        HIP_CHECK(hipMemset(d_batch_count, 0, sizeof(int)));
+
+        // Launch kernel to find all tokens for this expert and copy their inputs
+        dim3 gather_grid((batch_size + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK);
+        gather_expert_inputs_kernel<<<gather_grid, THREADS_PER_BLOCK>>>(
+            d_t, d_topk_i, d_topk_v, expert_id, batch_size, hidden_dim, p->experts_per_token,
+            d_expert_input_buffer, d_expert_indices, d_expert_weights, d_batch_count);
+        HIP_CHECK(hipGetLastError());
+
+
+        // Get the number of tokens routed to this expert
+        HIP_CHECK(hipMemcpy(&h_batch_count, d_batch_count, sizeof(int), hipMemcpyDeviceToHost));
+        if (h_batch_count == 0) {
+            continue; // No tokens for this expert, skip to the next one
+        }
+
+
+        // --- 2. COMPUTE STEP ---
+        // Run the expert MLP only on the `h_batch_count` gathered tokens.
+        // NOTE: All subsequent kernels now use `h_batch_count` as their batch size.
+        
+        // MLP1 (Gate/Up projections) using d_expert_input_buffer
         int mlp1_weight_offset = (layer_idx * n_experts + expert_id) * (2 * intermediate_dim) * hidden_dim;
+        dim3 mlp1_grid(h_batch_count, (2 * intermediate_dim + 31) / 32);
+        dim3 router_block(32, 32);
+        matmul_kernel_simple<<<mlp1_grid, router_block>>>(d_mlp1_out, d_expert_input_buffer,
+            d_w_mlp1 + mlp1_weight_offset, h_batch_count, hidden_dim, 2 * intermediate_dim);
+        
+        // Split, add bias, and apply SwiGLU activation
         int mlp1_bias_offset = (layer_idx * n_experts + expert_id) * (2 * intermediate_dim);
+        dim3 split_grid((h_batch_count * intermediate_dim + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK);
+        split_gate_up_kernel<<<split_grid, THREADS_PER_BLOCK>>>(d_gate, d_up, d_mlp1_out,
+            d_b_mlp1 + mlp1_bias_offset, h_batch_count, intermediate_dim);
+        swiglu_kernel<<<split_grid, THREADS_PER_BLOCK>>>(d_gate, d_up, d_gate_up,
+            h_batch_count, intermediate_dim, p->swiglu_limit);
+
+        // MLP2 (Down projection) -> output stored in d_expert_output_buffer
         int mlp2_weight_offset = (layer_idx * n_experts + expert_id) * hidden_dim * intermediate_dim;
+        dim3 mlp2_grid(h_batch_count, (hidden_dim + 31) / 32);
+        matmul_kernel_simple<<<mlp2_grid, router_block>>>(d_expert_output_buffer, d_gate_up,
+            d_w_mlp2 + mlp2_weight_offset, h_batch_count, intermediate_dim, hidden_dim);
+        // debug(d_expert_output_buffer);
+
+        // Add MLP2 bias
         int mlp2_bias_offset = (layer_idx * n_experts + expert_id) * hidden_dim;
-        
-        // --- Step 1: Calculate the output of the current expert for the ENTIRE batch ---
-        // First MLP layer (gate/up projections)
-        dim3 mlp1_grid(batch_size, (2 * intermediate_dim + 31) / 32);
-        matmul_kernel<<<mlp1_grid, router_block>>>(
-            d_mlp1_out, d_t, d_w_mlp1 + mlp1_weight_offset, batch_size, hidden_dim, 2 * intermediate_dim);
+        add_bias_kernel<<<(h_batch_count * hidden_dim + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK, THREADS_PER_BLOCK>>>(
+            d_expert_output_buffer, d_b_mlp2 + mlp2_bias_offset, h_batch_count, hidden_dim);
         HIP_CHECK(hipGetLastError());
         
-        // Split into gate and up, add bias
-        dim3 split_grid((batch_size * intermediate_dim + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK);
-        split_gate_up_kernel<<<split_grid, THREADS_PER_BLOCK>>>(
-            d_gate, d_up, d_mlp1_out, d_b_mlp1 + mlp1_bias_offset, batch_size, intermediate_dim);
-        HIP_CHECK(hipGetLastError());
+        // --- 3. SCATTER STEP ---
         
-        // SwiGLU activation
-        swiglu_kernel<<<split_grid, THREADS_PER_BLOCK>>>(
-            d_gate, d_up, d_gate_up, batch_size, intermediate_dim, p->swiglu_limit);
-        HIP_CHECK(hipGetLastError());
-        
-        // Second MLP layer (down projection) -> output stored in d_tb2
-        dim3 mlp2_grid(batch_size, (hidden_dim + 31) / 32);
-        matmul_kernel<<<mlp2_grid, router_block>>>(
-            d_tb2, d_gate_up, d_w_mlp2 + mlp2_weight_offset, batch_size, intermediate_dim, hidden_dim);
-        HIP_CHECK(hipGetLastError());
-        
-        // Add bias
-        add_bias_kernel<<<(batch_size * hidden_dim + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK, THREADS_PER_BLOCK>>>(
-            d_tb2, d_b_mlp2 + mlp2_bias_offset, batch_size, hidden_dim);
-        HIP_CHECK(hipGetLastError());
-        
-        // --- Step 2: CORRECTLY aggregate the expert's output using the new kernel ---
-        // This kernel selectively adds the expert's output (d_tb2) to the final buffer (d_e_agg)
-        // only for the tokens that chose this expert, scaled by the correct weight.
-        aggregate_expert_output_kernel<<<expert_agg_grid, norm_block>>>(
-            d_e_agg, d_tb2, d_topk_i, d_topk_v, expert_id, batch_size, hidden_dim, p->experts_per_token);
+        // Add the results from this expert back to the main aggregation buffer
+        dim3 scatter_grid((h_batch_count * hidden_dim + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK);
+        scatter_expert_outputs_kernel<<<scatter_grid, THREADS_PER_BLOCK>>>(
+            d_e_agg, d_expert_output_buffer, d_expert_indices, d_expert_weights,
+            h_batch_count, hidden_dim);
         HIP_CHECK(hipGetLastError());
     }
     
@@ -1015,7 +1263,6 @@ float *forward_batch_gpu(Transformer *transformer, int *tokens, int batch_size) 
         attention_gpu(transformer, l, batch_size);
         moe_gpu(transformer, l, batch_size);
     }
-    
     // Final RMSNorm - UNCOMMENTED: Now enabled with GPU weight pointer
     dim3 final_norm_grid(batch_size);
     dim3 final_norm_block(THREADS_PER_BLOCK);
@@ -1023,12 +1270,15 @@ float *forward_batch_gpu(Transformer *transformer, int *tokens, int batch_size) 
         d_x, d_x, d_rms_out_w, batch_size, hidden_dim);
     HIP_CHECK(hipGetLastError());
     
-    // Classifier - UNCOMMENTED: Now enabled with GPU weight pointer
-    dim3 cls_grid(batch_size, (p->vocab_size + 31) / 32);
-    dim3 cls_block(32, 32);
-    matmul_kernel<<<cls_grid, cls_block>>>(
-        d_logits, d_x, d_out_w, batch_size, hidden_dim, p->vocab_size);
-    HIP_CHECK(hipGetLastError());
+    dim3 block_dim(32, 32); // A 2D block, e.g., 32x32 = 1024 threads.
+    dim3 grid_dim;
+    grid_dim.x = batch_size;
+    grid_dim.y = (p->vocab_size + block_dim.y - 1) / block_dim.y; // Ceiling division
+
+    // Launch the simple kernel
+    matmul_kernel_simple<<<grid_dim, block_dim>>>(
+        d_logits, d_x, d_out_w, batch_size, hidden_dim, p->vocab_size
+    );
     
     // Copy logits back to CPU (you might want to keep this on GPU for sampling)
     static float *h_logits = nullptr;
@@ -1036,7 +1286,6 @@ float *forward_batch_gpu(Transformer *transformer, int *tokens, int batch_size) 
         h_logits = (float*)malloc(batch_size * p->vocab_size * sizeof(float));
     }
     HIP_CHECK(hipMemcpy(h_logits, d_logits, batch_size * p->vocab_size * sizeof(float), hipMemcpyDeviceToHost));
-    
     return h_logits;
 }
 
