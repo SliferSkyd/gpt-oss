@@ -5,6 +5,7 @@
 #include <cassert>
 #include "../include/utils.hpp"
 #include <hip/hip_runtime.h>
+#include <hip/hip_bf16.h>
 
 #ifndef GETP_RUN
 #define GETP_RUN
@@ -23,7 +24,6 @@ int *positions;
 int *prompt_lens;
 
 // GPU variables
-float *d_attn_sinks;
 float *d_cos_vals, *d_sin_vals;
 float *d_x, *d_t, *d_tb, *d_tb2, *d_qkv, *d_q, *d_k, *d_v;
 float *d_key_cache, *d_value_cache, *d_att, *d_logits;
@@ -31,14 +31,15 @@ float *d_router_score, *d_topk_v, *d_mlp1_out, *d_gate, *d_up, *d_gate_up, *d_e_
 float *d_mask, *d_expert_input_buffer;
 int *d_topk_i, *d_current_tokens, *d_positions;
 float *d_temp_buffer;
-float *d_token_embedding_table;
 
 // GPU weight pointers - CRITICAL FIX: Copy all weights to GPU
-float *d_rms_attn_w, *d_rms_ffn_w, *d_rms_out_w;
-float *d_w_qkv, *d_b_qkv, *d_w_o, *d_b_o;
-float *d_w_router, *d_b_router;
-float *d_w_mlp1, *d_b_mlp1, *d_w_mlp2, *d_b_mlp2;
-float *d_out_w;
+__hip_bfloat16 *d_attn_sinks;
+__hip_bfloat16 *d_token_embedding_table;
+__hip_bfloat16 *d_rms_attn_w, *d_rms_ffn_w, *d_rms_out_w;
+__hip_bfloat16 *d_w_qkv, *d_b_qkv, *d_w_o, *d_b_o;
+__hip_bfloat16 *d_w_router, *d_b_router;
+__hip_bfloat16 *d_w_mlp1, *d_b_mlp1, *d_w_mlp2, *d_b_mlp2;
+__hip_bfloat16 *d_out_w;
 
 // Add to list of GPU variables
 int *d_expert_indices;
@@ -56,6 +57,12 @@ float *d_expert_output_buffer;
         } \
     } while(0)
 
+// Float to bfloat16 conversion functions using library function
+void convert_float_array_to_bfloat16(const float* src, __hip_bfloat16* dst, size_t count) {
+    for (size_t i = 0; i < count; i++) {
+        dst[i] = __float2bfloat16(src[i]);
+    }
+}
 
 void debug(float *d_val, int size = 1) {
     float *h_val = (float *)malloc(size * sizeof(float));
@@ -126,8 +133,8 @@ void compute_cos_sin_getp(int pos, float base, int head_dim, float scaling_facto
     free(inv_freq);
 }
 
-// GPU kernels
-__global__ void rmsnorm_kernel(float *output, const float *input, const float *weight,
+// GPU kernels with bfloat16 weights support
+__global__ void rmsnorm_kernel(float *output, const float *input, const __hip_bfloat16 *weight,
                               int batch_size, int size) {
     int batch_idx = blockIdx.x;
     int tid = threadIdx.x;
@@ -166,9 +173,10 @@ __global__ void rmsnorm_kernel(float *output, const float *input, const float *w
     
     ss = shared_ss[0];
     
-    // Normalize and scale
+    // Normalize and scale - convert bfloat16 weight to fp32 on-the-fly
     for (int i = tid; i < size; i += blockDim.x) {
-        o[i] = weight[i] * (ss * x[i]);
+        float weight_fp32 = __bfloat162float(weight[i]);
+        o[i] = weight_fp32 * (ss * x[i]);
     }
 }
 
@@ -228,7 +236,7 @@ __global__ void softmax_kernel(float *x, int batch_size, int size) {
     }
 }
 
-__global__ void matmul_kernel(float *output, const float *input, const float *weight,
+__global__ void matmul_kernel(float *output, const float *input, const __hip_bfloat16 *weight,
                              int batch_size, int input_dim, int output_dim) {
     int batch_idx = blockIdx.x;
     int out_idx = blockIdx.y * blockDim.y + threadIdx.y;
@@ -243,7 +251,9 @@ __global__ void matmul_kernel(float *output, const float *input, const float *we
     
     float val = 0.0f;
     for (int i = tid; i < input_dim; i += blockDim.x) {
-        val += weight[out_idx * input_dim + i] * x[i];
+        // Convert bfloat16 weight to fp32 on-the-fly
+        float weight_fp32 = __bfloat162float(weight[out_idx * input_dim + i]);
+        val += weight_fp32 * x[i];
     }
     shared_val[tid] = val;
     __syncthreads();
@@ -271,12 +281,14 @@ __global__ void accumulate_kernel(float *a, const float *b, float factor,
     }
 }
 
-// NEW: Kernel to add bias to matrix multiplication result
-__global__ void add_bias_kernel(float *output, const float *bias, int batch_size, int size) {
+// NEW: Kernel to add bias to matrix multiplication result with bfloat16 bias
+__global__ void add_bias_kernel(float *output, const __hip_bfloat16 *bias, int batch_size, int size) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx < batch_size * size) {
         int dim_idx = idx % size;
-        output[idx] += bias[dim_idx];
+        // Convert bfloat16 bias to fp32 on-the-fly
+        float bias_fp32 = __bfloat162float(bias[dim_idx]);
+        output[idx] += bias_fp32;
     }
 }
 
@@ -346,8 +358,8 @@ __global__ void attention_scores_kernel(float *att, const float *q, const float 
     int pos = positions[batch_idx];
     if (t > pos) return;
     
-    int kv_dim = head_dim * (n_heads / 2); // Assuming GQA with 4:1 ratio
-    int kv_head = head_idx / 2;
+    int kv_dim = head_dim * (n_heads / 8); // Assuming GQA with 4:1 ratio
+    int kv_head = head_idx / 8;
     
     const float *q_head = q + batch_idx * n_heads * head_dim + head_idx * head_dim;
     const float *k_head = key_cache + batch_idx * n_layers * seq_len * kv_dim +
@@ -378,8 +390,8 @@ __global__ void attention_weighted_sum_kernel(float *output, const float *att,
     if (batch_idx >= batch_size || head_idx >= n_heads || dim_idx >= head_dim) return;
     
     int pos = positions[batch_idx];
-    int kv_dim = head_dim * (n_heads / 2);
-    int kv_head = head_idx / 2;
+    int kv_dim = head_dim * (n_heads / 8);
+    int kv_head = head_idx / 8;
     
     const float *att_head = att + batch_idx * n_heads * seq_len + head_idx * seq_len;
     float *out_head = output + batch_idx * n_heads * head_dim + head_idx * head_dim;
@@ -417,7 +429,7 @@ __global__ void swiglu_kernel(float *gate, float *up, float *output,
 }
 
 __global__ void split_gate_up_kernel(float *gate, float *up, const float *mlp1_out,
-                                     const float *bias, int batch_size, int intermediate_dim) {
+                                     const __hip_bfloat16 *bias, int batch_size, int intermediate_dim) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     int batch_idx = idx / intermediate_dim;
     int dim_idx = idx % intermediate_dim;
@@ -425,9 +437,14 @@ __global__ void split_gate_up_kernel(float *gate, float *up, const float *mlp1_o
     if (batch_idx >= batch_size || dim_idx >= intermediate_dim) return;
     
     int mlp1_idx = batch_idx * 2 * intermediate_dim;
-    gate[idx] = mlp1_out[mlp1_idx + 2 * dim_idx] + bias[2 * dim_idx];
-    up[idx] = mlp1_out[mlp1_idx + 2 * dim_idx + 1] + bias[2 * dim_idx + 1];
+    // Convert bfloat16 bias to fp32 on-the-fly
+    float bias_gate_fp32 = __bfloat162float(bias[2 * dim_idx]);
+    float bias_up_fp32 = __bfloat162float(bias[2 * dim_idx + 1]);
+    
+    gate[idx] = mlp1_out[mlp1_idx + 2 * dim_idx] + bias_gate_fp32;
+    up[idx] = mlp1_out[mlp1_idx + 2 * dim_idx + 1] + bias_up_fp32;
 }
+
 
 __global__ void topk_kernel(float *topk_values, int *topk_indices, const float *scores,
                            int batch_size, int n_experts, int k) {
@@ -463,7 +480,7 @@ __global__ void topk_kernel(float *topk_values, int *topk_indices, const float *
     }
 }
 
-__global__ void copy_embeddings_kernel(float *output, const float *embeddings,
+__global__ void copy_embeddings_kernel(float *output, const __hip_bfloat16 *embeddings,
                                       const int *tokens, int batch_size, int hidden_dim) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     int batch_idx = idx / hidden_dim;
@@ -473,11 +490,13 @@ __global__ void copy_embeddings_kernel(float *output, const float *embeddings,
     int token = tokens[batch_idx];
     if (token < 0) return; // Safety check for invalid tokens
     
-    output[idx] = embeddings[token * hidden_dim + dim_idx];
+    // Convert bfloat16 embedding to fp32 on-the-fly
+    float embedding_fp32 = __bfloat162float(embeddings[token * hidden_dim + dim_idx]);
+    output[idx] = embedding_fp32;
 }
 
 // Add bounds checking to matmul kernel
-__global__ void matmul_kernel_safe(float *output, const float *input, const float *weight,
+__global__ void matmul_kernel_safe(float *output, const float *input, const __hip_bfloat16 *weight,
                                   int batch_size, int input_dim, int output_dim) {
     int batch_idx = blockIdx.x;
     int out_idx = blockIdx.y * blockDim.y + threadIdx.y;
@@ -492,7 +511,9 @@ __global__ void matmul_kernel_safe(float *output, const float *input, const floa
     
     float val = 0.0f;
     for (int i = tid; i < input_dim; i += blockDim.x) {
-        val += weight[out_idx * input_dim + i] * x[i];
+        // Convert bfloat16 weight to fp32 on-the-fly
+        float weight_fp32 = __bfloat162float(weight[out_idx * input_dim + i]);
+        val += weight_fp32 * x[i];
     }
     
     if (tid < THREADS_PER_BLOCK) {
@@ -513,7 +534,7 @@ __global__ void matmul_kernel_safe(float *output, const float *input, const floa
     }
 }
 
-__global__ void matmul_kernel_simple(float *output, const float *input, const float *weight,
+__global__ void matmul_kernel_simple(float *output, const float *input, const __hip_bfloat16 *weight,
                                      int batch_size, int input_dim, int output_dim) {
     // Each thread will compute one element in the output matrix.
     // blockIdx.x maps to the batch dimension.
@@ -533,12 +554,14 @@ __global__ void matmul_kernel_simple(float *output, const float *input, const fl
     const float *x_b = input + batch_idx * input_dim;
     
     // Get a pointer to the start of the correct weight matrix row for this output.
-    const float *w_row = weight + out_idx * input_dim;
+    const __hip_bfloat16 *w_row = weight + out_idx * input_dim;
 
     // --- Core Logic (Same as CPU) ---
     // This single thread performs the entire dot product.
     for (int j = 0; j < input_dim; j++) {
-        sum += w_row[j] * x_b[j];
+        // Convert bfloat16 weight to fp32 on-the-fly
+        float weight_fp32 = __bfloat162float(w_row[j]);
+        sum += weight_fp32 * x_b[j];
     }
     // ---------------------------------
 
@@ -601,35 +624,36 @@ void malloc_gpu_run_state(RunState *s, Config *p) {
     HIP_CHECK(hipMalloc((void**)&d_sin_vals, (p->head_dim / 2) * p->seq_len * sizeof(float)));
     HIP_CHECK(hipMalloc((void**)&d_expert_input_buffer, batch_hidden));
     HIP_CHECK(hipMalloc((void**)&d_temp_buffer, batch_hidden));
-    HIP_CHECK(hipMalloc((void**)&d_token_embedding_table, p->vocab_size * p->hidden_dim * sizeof(float)));
+    HIP_CHECK(hipMalloc((void**)&d_token_embedding_table, p->vocab_size * p->hidden_dim * sizeof(__hip_bfloat16)));
 
-    // CRITICAL FIX: Allocate GPU memory for all weights
-    HIP_CHECK(hipMalloc((void**)&d_rms_attn_w, p->n_layers * p->hidden_dim * sizeof(float)));
-    HIP_CHECK(hipMalloc((void**)&d_rms_ffn_w, p->n_layers * p->hidden_dim * sizeof(float)));
-    HIP_CHECK(hipMalloc((void**)&d_rms_out_w, p->hidden_dim * sizeof(float)));
+    // CRITICAL FIX: Allocate GPU memory for all weights in bfloat16 format
+    HIP_CHECK(hipMalloc((void**)&d_rms_attn_w, p->n_layers * p->hidden_dim * sizeof(__hip_bfloat16)));
+    HIP_CHECK(hipMalloc((void**)&d_rms_ffn_w, p->n_layers * p->hidden_dim * sizeof(__hip_bfloat16)));
+    HIP_CHECK(hipMalloc((void**)&d_rms_out_w, p->hidden_dim * sizeof(__hip_bfloat16)));
     
     int qkv_size = p->n_layers * p->hidden_dim * (p->n_attn_heads + 2 * p->n_kv_heads) * p->head_dim;
-    HIP_CHECK(hipMalloc((void**)&d_w_qkv, qkv_size * sizeof(float)));
-    HIP_CHECK(hipMalloc((void**)&d_b_qkv, p->n_layers * (p->n_attn_heads + 2 * p->n_kv_heads) * p->head_dim * sizeof(float)));
+    HIP_CHECK(hipMalloc((void**)&d_w_qkv, qkv_size * sizeof(__hip_bfloat16)));
+    HIP_CHECK(hipMalloc((void**)&d_b_qkv, p->n_layers * (p->n_attn_heads + 2 * p->n_kv_heads) * p->head_dim * sizeof(__hip_bfloat16)));
     
     int attn_out_size = p->n_layers * (p->n_attn_heads * p->head_dim) * p->hidden_dim;
-    HIP_CHECK(hipMalloc((void**)&d_w_o, attn_out_size * sizeof(float)));
-    HIP_CHECK(hipMalloc((void**)&d_b_o, p->n_layers * p->hidden_dim * sizeof(float)));
+    HIP_CHECK(hipMalloc((void**)&d_w_o, attn_out_size * sizeof(__hip_bfloat16)));
+    HIP_CHECK(hipMalloc((void**)&d_b_o, p->n_layers * p->hidden_dim * sizeof(__hip_bfloat16)));
     
-    HIP_CHECK(hipMalloc((void**)&d_w_router, p->n_layers * p->hidden_dim * p->n_experts * sizeof(float)));
-    HIP_CHECK(hipMalloc((void**)&d_b_router, p->n_layers * p->n_experts * sizeof(float)));
+    HIP_CHECK(hipMalloc((void**)&d_w_router, p->n_layers * p->hidden_dim * p->n_experts * sizeof(__hip_bfloat16)));
+    HIP_CHECK(hipMalloc((void**)&d_b_router, p->n_layers * p->n_experts * sizeof(__hip_bfloat16)));
     
     int mlp1_size = p->n_layers * p->n_experts * (2 * p->intermediate_dim) * p->hidden_dim;
-    HIP_CHECK(hipMalloc((void**)&d_w_mlp1, mlp1_size * sizeof(float)));
-    HIP_CHECK(hipMalloc((void**)&d_b_mlp1, p->n_layers * p->n_experts * (2 * p->intermediate_dim) * sizeof(float)));
+    HIP_CHECK(hipMalloc((void**)&d_w_mlp1, mlp1_size * sizeof(__hip_bfloat16)));
+    HIP_CHECK(hipMalloc((void**)&d_b_mlp1, p->n_layers * p->n_experts * (2 * p->intermediate_dim) * sizeof(__hip_bfloat16)));
     
     int mlp2_size = p->n_layers * p->n_experts * p->hidden_dim * p->intermediate_dim;
-    HIP_CHECK(hipMalloc((void**)&d_w_mlp2, mlp2_size * sizeof(float)));
-    HIP_CHECK(hipMalloc((void**)&d_b_mlp2, p->n_layers * p->n_experts * p->hidden_dim * sizeof(float)));
+    HIP_CHECK(hipMalloc((void**)&d_w_mlp2, mlp2_size * sizeof(__hip_bfloat16)));
+    HIP_CHECK(hipMalloc((void**)&d_b_mlp2, p->n_layers * p->n_experts * p->hidden_dim * sizeof(__hip_bfloat16)));
     
-    HIP_CHECK(hipMalloc((void**)&d_out_w, p->hidden_dim * p->vocab_size * sizeof(float)));
-    HIP_CHECK(hipMalloc((void**)&d_attn_sinks, p->n_layers * p->n_attn_heads * sizeof(float)));
- 
+    HIP_CHECK(hipMalloc((void**)&d_out_w, p->hidden_dim * p->vocab_size * sizeof(__hip_bfloat16)));
+    HIP_CHECK(hipMalloc((void**)&d_attn_sinks, p->n_layers * p->n_attn_heads * sizeof(__hip_bfloat16)));
+
+    
     // Initialize all allocated memory to zero
     HIP_CHECK(hipMemset(d_x, 0, batch_hidden));
     HIP_CHECK(hipMemset(d_t, 0, batch_hidden));
@@ -668,40 +692,103 @@ void malloc_gpu_run_state(RunState *s, Config *p) {
 void copy_weights_to_gpu(Transformer *transformer) {
     Config *p = &transformer->config;
     TransformerWeights *w = &transformer->weights;
+        
+    // Convert and copy normalization weights
+    size_t rms_attn_size = p->n_layers * p->hidden_dim;
+    __hip_bfloat16 *h_rms_attn_bf16 = (__hip_bfloat16*)malloc(rms_attn_size * sizeof(__hip_bfloat16));
+    convert_float_array_to_bfloat16(w->rms_attn_w, h_rms_attn_bf16, rms_attn_size);
+    HIP_CHECK(hipMemcpy(d_rms_attn_w, h_rms_attn_bf16, rms_attn_size * sizeof(__hip_bfloat16), hipMemcpyHostToDevice));
+    free(h_rms_attn_bf16);
     
-    printf("Copying weights to GPU...\n");
+    size_t rms_ffn_size = p->n_layers * p->hidden_dim;
+    __hip_bfloat16 *h_rms_ffn_bf16 = (__hip_bfloat16*)malloc(rms_ffn_size * sizeof(__hip_bfloat16));
+    convert_float_array_to_bfloat16(w->rms_ffn_w, h_rms_ffn_bf16, rms_ffn_size);
+    HIP_CHECK(hipMemcpy(d_rms_ffn_w, h_rms_ffn_bf16, rms_ffn_size * sizeof(__hip_bfloat16), hipMemcpyHostToDevice));
+    free(h_rms_ffn_bf16);
     
-    // Copy normalization weights
-    HIP_CHECK(hipMemcpy(d_rms_attn_w, w->rms_attn_w, p->n_layers * p->hidden_dim * sizeof(float), hipMemcpyHostToDevice));
-    HIP_CHECK(hipMemcpy(d_rms_ffn_w, w->rms_ffn_w, p->n_layers * p->hidden_dim * sizeof(float), hipMemcpyHostToDevice));
-    HIP_CHECK(hipMemcpy(d_rms_out_w, w->rms_out_w, p->hidden_dim * sizeof(float), hipMemcpyHostToDevice));
+    size_t rms_out_size = p->hidden_dim;
+    __hip_bfloat16 *h_rms_out_bf16 = (__hip_bfloat16*)malloc(rms_out_size * sizeof(__hip_bfloat16));
+    convert_float_array_to_bfloat16(w->rms_out_w, h_rms_out_bf16, rms_out_size);
+    HIP_CHECK(hipMemcpy(d_rms_out_w, h_rms_out_bf16, rms_out_size * sizeof(__hip_bfloat16), hipMemcpyHostToDevice));
+    free(h_rms_out_bf16);
     
-    // Copy attention weights
-    int qkv_size = p->n_layers * p->hidden_dim * (p->n_attn_heads + 2 * p->n_kv_heads) * p->head_dim;
-    HIP_CHECK(hipMemcpy(d_w_qkv, w->w_qkv, qkv_size * sizeof(float), hipMemcpyHostToDevice));
-    HIP_CHECK(hipMemcpy(d_b_qkv, w->b_qkv, p->n_layers * (p->n_attn_heads + 2 * p->n_kv_heads) * p->head_dim * sizeof(float), hipMemcpyHostToDevice));
+    // Convert and copy attention weights
+    size_t qkv_size = p->n_layers * p->hidden_dim * (p->n_attn_heads + 2 * p->n_kv_heads) * p->head_dim;
+    __hip_bfloat16 *h_w_qkv_bf16 = (__hip_bfloat16*)malloc(qkv_size * sizeof(__hip_bfloat16));
+    convert_float_array_to_bfloat16(w->w_qkv, h_w_qkv_bf16, qkv_size);
+    HIP_CHECK(hipMemcpy(d_w_qkv, h_w_qkv_bf16, qkv_size * sizeof(__hip_bfloat16), hipMemcpyHostToDevice));
+    free(h_w_qkv_bf16);
     
-    int attn_out_size = p->n_layers * (p->n_attn_heads * p->head_dim) * p->hidden_dim;
-    HIP_CHECK(hipMemcpy(d_w_o, w->w_o, attn_out_size * sizeof(float), hipMemcpyHostToDevice));
-    HIP_CHECK(hipMemcpy(d_b_o, w->b_o, p->n_layers * p->hidden_dim * sizeof(float), hipMemcpyHostToDevice));
-    HIP_CHECK(hipMemcpy(d_attn_sinks, w->attn_sinks, p->n_layers * p->n_attn_heads * sizeof(float), hipMemcpyHostToDevice));
+    size_t b_qkv_size = p->n_layers * (p->n_attn_heads + 2 * p->n_kv_heads) * p->head_dim;
+    __hip_bfloat16 *h_b_qkv_bf16 = (__hip_bfloat16*)malloc(b_qkv_size * sizeof(__hip_bfloat16));
+    convert_float_array_to_bfloat16(w->b_qkv, h_b_qkv_bf16, b_qkv_size);
+    HIP_CHECK(hipMemcpy(d_b_qkv, h_b_qkv_bf16, b_qkv_size * sizeof(__hip_bfloat16), hipMemcpyHostToDevice));
+    free(h_b_qkv_bf16);
+    
+    size_t attn_out_size = p->n_layers * (p->n_attn_heads * p->head_dim) * p->hidden_dim;
+    __hip_bfloat16 *h_w_o_bf16 = (__hip_bfloat16*)malloc(attn_out_size * sizeof(__hip_bfloat16));
+    convert_float_array_to_bfloat16(w->w_o, h_w_o_bf16, attn_out_size);
+    HIP_CHECK(hipMemcpy(d_w_o, h_w_o_bf16, attn_out_size * sizeof(__hip_bfloat16), hipMemcpyHostToDevice));
+    free(h_w_o_bf16);
+    
+    size_t b_o_size = p->n_layers * p->hidden_dim;
+    __hip_bfloat16 *h_b_o_bf16 = (__hip_bfloat16*)malloc(b_o_size * sizeof(__hip_bfloat16));
+    convert_float_array_to_bfloat16(w->b_o, h_b_o_bf16, b_o_size);
+    HIP_CHECK(hipMemcpy(d_b_o, h_b_o_bf16, b_o_size * sizeof(__hip_bfloat16), hipMemcpyHostToDevice));
+    free(h_b_o_bf16);
+    
+    // Convert and copy attention sinks
+    size_t attn_sinks_size = p->n_layers * p->n_attn_heads;
+    __hip_bfloat16 *h_attn_sinks_bf16 = (__hip_bfloat16*)malloc(attn_sinks_size * sizeof(__hip_bfloat16));
+    convert_float_array_to_bfloat16(w->attn_sinks, h_attn_sinks_bf16, attn_sinks_size);
+    HIP_CHECK(hipMemcpy(d_attn_sinks, h_attn_sinks_bf16, attn_sinks_size * sizeof(__hip_bfloat16), hipMemcpyHostToDevice));
+    free(h_attn_sinks_bf16);
 
-    // Copy MoE weights
-    HIP_CHECK(hipMemcpy(d_w_router, w->w_router, p->n_layers * p->hidden_dim * p->n_experts * sizeof(float), hipMemcpyHostToDevice));
-    HIP_CHECK(hipMemcpy(d_b_router, w->b_router, p->n_layers * p->n_experts * sizeof(float), hipMemcpyHostToDevice));
+    // Convert and copy MoE weights
+    size_t w_router_size = p->n_layers * p->hidden_dim * p->n_experts;
+    __hip_bfloat16 *h_w_router_bf16 = (__hip_bfloat16*)malloc(w_router_size * sizeof(__hip_bfloat16));
+    convert_float_array_to_bfloat16(w->w_router, h_w_router_bf16, w_router_size);
+    HIP_CHECK(hipMemcpy(d_w_router, h_w_router_bf16, w_router_size * sizeof(__hip_bfloat16), hipMemcpyHostToDevice));
+    free(h_w_router_bf16);
     
-    int mlp1_size = p->n_layers * p->n_experts * (2 * p->intermediate_dim) * p->hidden_dim;
-    HIP_CHECK(hipMemcpy(d_w_mlp1, w->w_mlp1, mlp1_size * sizeof(float), hipMemcpyHostToDevice));
-    HIP_CHECK(hipMemcpy(d_b_mlp1, w->b_mlp1, p->n_layers * p->n_experts * (2 * p->intermediate_dim) * sizeof(float), hipMemcpyHostToDevice));
+    size_t b_router_size = p->n_layers * p->n_experts;
+    __hip_bfloat16 *h_b_router_bf16 = (__hip_bfloat16*)malloc(b_router_size * sizeof(__hip_bfloat16));
+    convert_float_array_to_bfloat16(w->b_router, h_b_router_bf16, b_router_size);
+    HIP_CHECK(hipMemcpy(d_b_router, h_b_router_bf16, b_router_size * sizeof(__hip_bfloat16), hipMemcpyHostToDevice));
+    free(h_b_router_bf16);
     
-    int mlp2_size = p->n_layers * p->n_experts * p->hidden_dim * p->intermediate_dim;
-    HIP_CHECK(hipMemcpy(d_w_mlp2, w->w_mlp2, mlp2_size * sizeof(float), hipMemcpyHostToDevice));
-    HIP_CHECK(hipMemcpy(d_b_mlp2, w->b_mlp2, p->n_layers * p->n_experts * p->hidden_dim * sizeof(float), hipMemcpyHostToDevice));
+    size_t mlp1_size = p->n_layers * p->n_experts * (2 * p->intermediate_dim) * p->hidden_dim;
+    __hip_bfloat16 *h_w_mlp1_bf16 = (__hip_bfloat16*)malloc(mlp1_size * sizeof(__hip_bfloat16));
+    convert_float_array_to_bfloat16(w->w_mlp1, h_w_mlp1_bf16, mlp1_size);
+    HIP_CHECK(hipMemcpy(d_w_mlp1, h_w_mlp1_bf16, mlp1_size * sizeof(__hip_bfloat16), hipMemcpyHostToDevice));
+    free(h_w_mlp1_bf16);
     
-    // Copy output weights
-    HIP_CHECK(hipMemcpy(d_out_w, w->out, p->hidden_dim * p->vocab_size * sizeof(float), hipMemcpyHostToDevice));
+    size_t b_mlp1_size = p->n_layers * p->n_experts * (2 * p->intermediate_dim);
+    __hip_bfloat16 *h_b_mlp1_bf16 = (__hip_bfloat16*)malloc(b_mlp1_size * sizeof(__hip_bfloat16));
+    convert_float_array_to_bfloat16(w->b_mlp1, h_b_mlp1_bf16, b_mlp1_size);
+    HIP_CHECK(hipMemcpy(d_b_mlp1, h_b_mlp1_bf16, b_mlp1_size * sizeof(__hip_bfloat16), hipMemcpyHostToDevice));
+    free(h_b_mlp1_bf16);
     
-    printf("Weight copying completed successfully\n");
+    size_t mlp2_size = p->n_layers * p->n_experts * p->hidden_dim * p->intermediate_dim;
+    __hip_bfloat16 *h_w_mlp2_bf16 = (__hip_bfloat16*)malloc(mlp2_size * sizeof(__hip_bfloat16));
+    convert_float_array_to_bfloat16(w->w_mlp2, h_w_mlp2_bf16, mlp2_size);
+    HIP_CHECK(hipMemcpy(d_w_mlp2, h_w_mlp2_bf16, mlp2_size * sizeof(__hip_bfloat16), hipMemcpyHostToDevice));
+    free(h_w_mlp2_bf16);
+    
+    size_t b_mlp2_size = p->n_layers * p->n_experts * p->hidden_dim;
+    __hip_bfloat16 *h_b_mlp2_bf16 = (__hip_bfloat16*)malloc(b_mlp2_size * sizeof(__hip_bfloat16));
+    convert_float_array_to_bfloat16(w->b_mlp2, h_b_mlp2_bf16, b_mlp2_size);
+    HIP_CHECK(hipMemcpy(d_b_mlp2, h_b_mlp2_bf16, b_mlp2_size * sizeof(__hip_bfloat16), hipMemcpyHostToDevice));
+    free(h_b_mlp2_bf16);
+    
+    // Convert and copy output weights
+    size_t out_size = p->hidden_dim * p->vocab_size;
+    __hip_bfloat16 *h_out_bf16 = (__hip_bfloat16*)malloc(out_size * sizeof(__hip_bfloat16));
+    convert_float_array_to_bfloat16(w->out, h_out_bf16, out_size);
+    HIP_CHECK(hipMemcpy(d_out_w, h_out_bf16, out_size * sizeof(__hip_bfloat16), hipMemcpyHostToDevice));
+    free(h_out_bf16);
+    
+    printf("Weight conversion and copying completed successfully\n");
 }
 
 void warm_up(Transformer *transformer, Tokenizer *tokenizer) {
@@ -730,7 +817,13 @@ void warm_up(Transformer *transformer, Tokenizer *tokenizer) {
     // Copy RoPE values to GPU (now that GPU memory is allocated)
     HIP_CHECK(hipMemcpy(d_cos_vals, cos_vals_cpu, (p->head_dim / 2) * p->seq_len * sizeof(float), hipMemcpyHostToDevice));
     HIP_CHECK(hipMemcpy(d_sin_vals, sin_vals_cpu, (p->head_dim / 2) * p->seq_len * sizeof(float), hipMemcpyHostToDevice));
-    HIP_CHECK(hipMemcpy(d_token_embedding_table, transformer->weights.token_embedding_table, p->vocab_size * p->hidden_dim * sizeof(float), hipMemcpyHostToDevice));
+    
+    // Convert and copy token embedding table to bfloat16
+    size_t embedding_size = p->vocab_size * p->hidden_dim;
+    __hip_bfloat16 *h_embedding_bf16 = (__hip_bfloat16*)malloc(embedding_size * sizeof(__hip_bfloat16));
+    convert_float_array_to_bfloat16(transformer->weights.token_embedding_table, h_embedding_bf16, embedding_size);
+    HIP_CHECK(hipMemcpy(d_token_embedding_table, h_embedding_bf16, embedding_size * sizeof(__hip_bfloat16), hipMemcpyHostToDevice));
+    free(h_embedding_bf16);
 
     // CPU allocations for batch management
     prompt_tokens = (int**)malloc(BATCH_SIZE * sizeof(int*));
@@ -789,6 +882,7 @@ void finish(Transformer *transformer, Tokenizer *tokenizer) {
     HIP_CHECK(hipFree(d_w_mlp2));
     HIP_CHECK(hipFree(d_b_mlp2));
     HIP_CHECK(hipFree(d_out_w));
+    HIP_CHECK(hipFree(d_attn_sinks));
     
     // Free CPU memory
     free(cos_vals_cpu);
@@ -860,7 +954,7 @@ __global__ void scatter_expert_outputs_kernel(float* d_e_agg, const float* exper
     atomicAdd(dst, value * weight);
 }
 
-__global__ void add_sinks_kernel(float *att, const float *sinks, const int *positions, 
+__global__ void add_sinks_kernel(float *att, const __hip_bfloat16 *sinks, const int *positions, 
                                  int seq_len, int n_heads) {
     int batch_idx = blockIdx.x;
     int head_idx = blockIdx.y;
@@ -869,7 +963,9 @@ __global__ void add_sinks_kernel(float *att, const float *sinks, const int *posi
     if (pos + 1 < seq_len) {
         // Index for the sink is at pos + 1
         int sink_att_idx = batch_idx * n_heads * seq_len + head_idx * seq_len + (pos + 1);
-        att[sink_att_idx] = sinks[head_idx];
+        // Convert bfloat16 sink to fp32 on-the-fly
+        float sink_fp32 = __bfloat162float(sinks[head_idx]);
+        att[sink_att_idx] = sink_fp32;
     }
 }
 

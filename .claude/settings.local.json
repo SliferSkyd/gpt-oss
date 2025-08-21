@@ -1,0 +1,10 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(find getp-csrc/DNN -name \"*.cpp\" -exec wc -l {})",
+      "Bash(grep -r \"typedef struct\" *.cpp *.hpp)"
+    ],
+    "deny": [],
+    "ask": []
+  }
+}
