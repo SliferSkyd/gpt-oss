@@ -1451,7 +1451,7 @@ long long batched_generate_gpu(Transformer *transformer, Tokenizer *tokenizer,
                 }
 
                 // Check for termination
-                if (next_token == 1 || pos >= max_steps - 1) { // BOS token or max length
+                if (next_token == 199999 || next_token == 200002 || pos >= max_steps - 1) { 
                     --alive;
                     finished[b] = true;
                     int *output_tokens = get_tok_gen_ptr(requests, req_idx);

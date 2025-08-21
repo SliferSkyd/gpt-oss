@@ -19,11 +19,11 @@ void build_requests(Requests *reqs, int num_reqs, int max_token_len,
   reqs->num_reqs = num_reqs;
   reqs->max_token_len = max_token_len;
   reqs->max_seq_len = max_seq_len;
-  reqs->str_reqs =
-      (char *)calloc(num_reqs * max_token_len * max_seq_len + 1, sizeof(char));
-  reqs->tok_gens = (int *)calloc(num_reqs * max_seq_len + 1, sizeof(int));
+  reqs->str_reqs = (char *)calloc(num_reqs * max_token_len * (max_seq_len + 1),
+                                  sizeof(char));
+  reqs->tok_gens = (int *)calloc(num_reqs * (max_seq_len + 1), sizeof(int));
   printf("requests size = %lu B\n",
-         ((num_reqs * max_token_len * max_seq_len * sizeof(char) + 1) * 2));
+         ((num_reqs * max_token_len * (max_seq_len + 1) * sizeof(char)) * 2));
   fflush(stdout);
 }
 
@@ -33,11 +33,11 @@ void free_requests(Requests *reqs) {
 }
 
 char *get_str_req_ptr(Requests *reqs, int idx) {
-  return reqs->str_reqs + idx * reqs->max_token_len * reqs->max_seq_len;
+  return reqs->str_reqs + idx * reqs->max_token_len * (reqs->max_seq_len + 1);
 }
 
 int *get_tok_gen_ptr(Requests *reqs, int idx) {
-  return reqs->tok_gens + idx * reqs->max_seq_len;
+  return reqs->tok_gens + idx * (reqs->max_seq_len + 1);
 }
 
 int read_inputfile(const char *input_filename, int max_token_len,
@@ -86,7 +86,6 @@ int write_outputfile(const char *output_filename, Requests *reqs) {
       }
       writeFile << "\n";
     }
-    writeFile << "\n";
     writeFile.close();
   } else {
     fprintf(stderr, "cannot write the file: %s\n", output_filename);
@@ -124,7 +123,7 @@ void getp(Transformer *transformer, Tokenizer *tokenizer, Sampler *sampler,
   end = time_in_ms();
   printf("\nwarm up elapsed time(s): %f\n", (double)(end - start) / 1000);
   fflush(stdout);
-  
+
   start = time_in_ms();
   long long num_gen_tokens =
       inference(transformer, tokenizer, sampler, &requests);
