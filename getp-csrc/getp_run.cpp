@@ -17,7 +17,7 @@
 #define GETP_RUN
 
 // BATCH_SIZE can be increased for higher throughput
-#define BATCH_SIZE 8
+#define BATCH_SIZE 32
 #define THREADS_PER_BLOCK 256
 #define WARP_SIZE 64
 
@@ -742,6 +742,132 @@ __global__ void matmul_kernel_simple(float *output, const float *input, const __
     output[batch_idx * output_dim + out_idx] = sum;
 }
 
+// Kernel: batched GEMV (many rows) with tiling over K (=input_dim).
+// Layouts:
+//   input  : [batch_size, input_dim]        (row-major per batch)
+//   weight : [output_dim, input_dim]        (row-major, one row per output unit)
+//   output : [batch_size, output_dim]       (row-major per batch)
+//
+// Each block handles:
+//   - one batch vector (blockIdx.x)
+//   - a tile of output rows (blockIdx.y)
+// Tiling over K with TK; a block computes TM rows (per tile) using shared memory.
+//
+// Notes:
+// - Accumulate in float (FP32) for numerical stability.
+// - weight is bfloat16; convert on the fly.
+// - If you can afford a one-time change, storing W column-major (or a pretranspose)
+//   will improve memory coalescing further. This version stays with your row-major W.
+
+#ifndef ROWS_PER_THREAD
+#define ROWS_PER_THREAD 4      // each thread computes 4 output rows, strided by blockDim.y
+#endif
+#ifndef TK
+#define TK 32                  // K tile (must match blockDim.x)
+#endif
+
+__global__ void matmul_kernel_tiled(
+    float* __restrict__ output,                  // [B, O]
+    const float* __restrict__ input,             // [B, I]
+    const __hip_bfloat16* __restrict__ weight,   // [O, I] row-major
+    int batch_size, int input_dim, int output_dim)
+{
+    const int batch_idx = blockIdx.x;
+    if (batch_idx >= batch_size) return;
+
+    // Tile origin in output rows (M dimension)
+    constexpr int TM = ROWS_PER_THREAD; // rows per thread * blockDim.y below
+    const int rows_per_block = blockDim.y * ROWS_PER_THREAD;
+    const int m0 = blockIdx.y * rows_per_block;
+
+    // Thread identifiers
+    const int tx = threadIdx.x; // [0..TK-1], used along K tile dimension
+    const int ty = threadIdx.y; // groups output rows within the block
+
+    // Shared memory:
+    //  - sX: tile of input vector of length TK
+    //  - sW: tile of weights for 'rows_per_block' rows and TK columns
+    extern __shared__ float smem[];
+    float* sX = smem;                                  // TK
+    float* sW = sX + TK;                               // rows_per_block * TK
+
+    // Pointer to this batch's input slice
+    const float* __restrict__ x_b = input + (size_t)batch_idx * input_dim;
+
+    // Per-thread accumulators for the rows it owns
+    float acc[ROWS_PER_THREAD] = {0};
+
+    // Loop over K in tiles of TK
+    for (int k0 = 0; k0 < input_dim; k0 += TK) {
+        const int k = k0 + tx;
+
+        // Load input tile cooperatively (only ty==0 threads need to do it)
+        if (ty == 0) {
+            sX[tx] = (k < input_dim) ? x_b[k] : 0.0f;
+        }
+
+        // Load weight tile cooperatively:
+        // Pack rows_per_block x TK elements into shared memory.
+        // Each thread (ty, tx) loads ROWS_PER_THREAD rows for its column tx.
+        #pragma unroll
+        for (int r = 0; r < ROWS_PER_THREAD; ++r) {
+            const int out_row = m0 + ty + r * blockDim.y;   // global output row
+            float w_val = 0.0f;
+            if (out_row < output_dim && k < input_dim) {
+                const __hip_bfloat16 wb = weight[(size_t)out_row * input_dim + k];
+                w_val = __bfloat162float(wb);
+            }
+            sW[(ty + r * blockDim.y) * TK + tx] = w_val;
+        }
+
+        __syncthreads();
+
+        // Compute partial sums: for each of the ROWS_PER_THREAD rows owned by this thread,
+        // do a small dot against sX[0..TK).
+        #pragma unroll
+        for (int r = 0; r < ROWS_PER_THREAD; ++r) {
+            const int row_off = (ty + r * blockDim.y) * TK;
+            // Unroll the inner product over TK to help the scheduler.
+            #pragma unroll
+            for (int kk = 0; kk < TK; ++kk) {
+                acc[r] += sW[row_off + kk] * sX[kk];
+            }
+        }
+
+        __syncthreads();
+    }
+
+    // Write out results
+    #pragma unroll
+    for (int r = 0; r < ROWS_PER_THREAD; ++r) {
+        const int out_row = m0 + ty + r * blockDim.y;
+        if (out_row < output_dim) {
+            output[(size_t)batch_idx * output_dim + out_row] = acc[r];
+        }
+    }
+}
+
+void matmul(float* __restrict__ output,                  // [B, O]
+    const float* __restrict__ input,             // [B, I]
+    const __hip_bfloat16* __restrict__ weight,   // [O, I] row-major
+    int batch_size, int input_dim, int output_dim) {
+    // Choose a compact block that balances occupancy and smem usage.
+    dim3 block_dim(TK /*=32*/, 8);                 // 32 x 8 = 256 threads
+    const int rows_per_block = block_dim.y * ROWS_PER_THREAD; // 8 * 4 = 32 rows per block
+
+    dim3 grid_dim;
+    grid_dim.x = batch_size;
+    grid_dim.y = (output_dim + rows_per_block - 1) / rows_per_block;
+
+    // Shared memory size: TK floats for x, plus rows_per_block * TK floats for W tile.
+    size_t shmem_bytes = (TK + rows_per_block * TK) * sizeof(float);
+
+    // launch
+    hipLaunchKernelGGL(matmul_kernel_tiled,
+                    grid_dim, block_dim, shmem_bytes, 0,
+                    output, input, weight, batch_size, input_dim, output_dim);
+}
+
 // Memory allocation functions
 void malloc_gpu_run_state(RunState *s, Config *p)
 {
@@ -1277,6 +1403,7 @@ void attention_gpu(Transformer *transformer, int layer_idx, int batch_size)
         TIME_SCOPE(matmul_timer);
         // QKV projection using safer matmul kernel - FIXED: Use GPU weight pointer
         // Launch the simple kernel
+        /*
         matmul_kernel_simple<<<grid_dim, block_dim>>>(
             d_qkv,
             d_t,
@@ -1284,6 +1411,16 @@ void attention_gpu(Transformer *transformer, int layer_idx, int batch_size)
             batch_size,
             hidden_dim,
             (p->n_attn_heads + 2 * p->n_kv_heads) * head_dim);
+        */  
+        
+        matmul(
+            d_qkv,
+            d_t,
+            d_w_qkv + qkv_weight_offset,
+            batch_size,
+            hidden_dim,
+            (p->n_attn_heads + 2 * p->n_kv_heads) * head_dim);
+        HIP_CHECK(hipGetLastError());
     }
 
     HIP_CHECK(hipGetLastError());
@@ -1405,7 +1542,7 @@ void attention_gpu(Transformer *transformer, int layer_idx, int batch_size)
     {
         TIME_SCOPE(matmul_kernel_simple_timer);
         // Launch the simple kernel
-        matmul_kernel_simple<<<grid_dim, block_dim>>>(
+        matmul(
             d_tb2, d_tb, d_w_o + attn_out_offset, batch_size, head_dim * p->n_attn_heads, hidden_dim);
         HIP_CHECK(hipGetLastError());
     }
@@ -1522,7 +1659,7 @@ void moe_gpu(Transformer *transformer, int layer_idx, int batch_size)
     {
         TIME_SCOPE(matmul_kernel_simple_timer);
         // Launch the simple kernel
-        matmul_kernel_simple<<<grid_dim, block_dim>>>(
+        matmul(
             d_router_score, d_t, d_w_router + router_weight_offset, batch_size, hidden_dim, n_experts);
     }
     HIP_CHECK(hipGetLastError());
@@ -1593,7 +1730,7 @@ void moe_gpu(Transformer *transformer, int layer_idx, int batch_size)
         dim3 router_block(32, 32);
         {
             TIME_SCOPE(matmul_kernel_simple_timer);
-            matmul_kernel_simple<<<mlp1_grid, router_block>>>(d_mlp1_out, d_expert_input_buffer,
+            matmul(d_mlp1_out, d_expert_input_buffer,
                                                               d_w_mlp1 + mlp1_weight_offset, h_batch_count, hidden_dim, 2 * intermediate_dim);
         }
         // Split, add bias, and apply SwiGLU activation
@@ -1616,7 +1753,7 @@ void moe_gpu(Transformer *transformer, int layer_idx, int batch_size)
         dim3 mlp2_grid(h_batch_count, (hidden_dim + 31) / 32);
         {
             TIME_SCOPE(matmul_kernel_simple_timer);
-            matmul_kernel_simple<<<mlp2_grid, router_block>>>(d_expert_output_buffer, d_gate_up,
+            matmul(d_expert_output_buffer, d_gate_up,
                                                               d_w_mlp2 + mlp2_weight_offset, h_batch_count, intermediate_dim, hidden_dim);
         }
         // debug(d_expert_output_buffer);
@@ -1697,7 +1834,7 @@ float *forward_batch_gpu(Transformer *transformer, int *tokens, int batch_size)
     {
         TIME_SCOPE(matmul_kernel_simple_timer);
         // Launch the simple kernel
-        matmul_kernel_simple<<<grid_dim, block_dim>>>(
+        matmul(
             d_logits, d_x, d_out_w, batch_size, hidden_dim, p->vocab_size);
     }
     // Copy logits back to CPU (you might want to keep this on GPU for sampling)
