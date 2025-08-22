@@ -58,8 +58,8 @@ source .venv/bin/activate
 pip install -r requirements.txt
 
 # Set model paths
-export MODELS_ROOT="/mnt/getp/final-project/models"
-export MODELBIN_ROOT="/mnt/getp/final-project/modelbin"
+export MODELS_ROOT="/nfs/gpu_trainee/final-project/models"
+export MODELBIN_ROOT="/nfs/gpu_trainee/final-project/modelbin"
 ```
 
 ### Model Setup

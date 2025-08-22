@@ -32,3 +32,9 @@ build/
 *.bin
 
 .vscode/
+profiling_gpt_*
+
+# Ignore analyze script output
+times.csv
+analysis_report.txt
+kernel_analysis.png
