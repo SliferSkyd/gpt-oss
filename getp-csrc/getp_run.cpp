@@ -160,7 +160,6 @@ struct Timer
 
         log_file << name << "," << ms << "\n";
         log_file.flush();
-        std::cout << "[" << name << "] " << ms << " ms\n";
     }
 };
 
@@ -760,20 +759,21 @@ __global__ void matmul_kernel_simple(float *output, const float *input, const __
 //   will improve memory coalescing further. This version stays with your row-major W.
 
 #ifndef ROWS_PER_THREAD
-#define ROWS_PER_THREAD 4      // each thread computes 4 output rows, strided by blockDim.y
+#define ROWS_PER_THREAD 4 // each thread computes 4 output rows, strided by blockDim.y
 #endif
 #ifndef TK
-#define TK 32                  // K tile (must match blockDim.x)
+#define TK 32 // K tile (must match blockDim.x)
 #endif
 
 __global__ void matmul_kernel_tiled(
-    float* __restrict__ output,                  // [B, O]
-    const float* __restrict__ input,             // [B, I]
-    const __hip_bfloat16* __restrict__ weight,   // [O, I] row-major
+    float *__restrict__ output,                // [B, O]
+    const float *__restrict__ input,           // [B, I]
+    const __hip_bfloat16 *__restrict__ weight, // [O, I] row-major
     int batch_size, int input_dim, int output_dim)
 {
     const int batch_idx = blockIdx.x;
-    if (batch_idx >= batch_size) return;
+    if (batch_idx >= batch_size)
+        return;
 
     // Tile origin in output rows (M dimension)
     constexpr int TM = ROWS_PER_THREAD; // rows per thread * blockDim.y below
@@ -788,32 +788,36 @@ __global__ void matmul_kernel_tiled(
     //  - sX: tile of input vector of length TK
     //  - sW: tile of weights for 'rows_per_block' rows and TK columns
     extern __shared__ float smem[];
-    float* sX = smem;                                  // TK
-    float* sW = sX + TK;                               // rows_per_block * TK
+    float *sX = smem;    // TK
+    float *sW = sX + TK; // rows_per_block * TK
 
     // Pointer to this batch's input slice
-    const float* __restrict__ x_b = input + (size_t)batch_idx * input_dim;
+    const float *__restrict__ x_b = input + (size_t)batch_idx * input_dim;
 
     // Per-thread accumulators for the rows it owns
     float acc[ROWS_PER_THREAD] = {0};
 
     // Loop over K in tiles of TK
-    for (int k0 = 0; k0 < input_dim; k0 += TK) {
+    for (int k0 = 0; k0 < input_dim; k0 += TK)
+    {
         const int k = k0 + tx;
 
         // Load input tile cooperatively (only ty==0 threads need to do it)
-        if (ty == 0) {
+        if (ty == 0)
+        {
             sX[tx] = (k < input_dim) ? x_b[k] : 0.0f;
         }
 
-        // Load weight tile cooperatively:
-        // Pack rows_per_block x TK elements into shared memory.
-        // Each thread (ty, tx) loads ROWS_PER_THREAD rows for its column tx.
-        #pragma unroll
-        for (int r = 0; r < ROWS_PER_THREAD; ++r) {
-            const int out_row = m0 + ty + r * blockDim.y;   // global output row
+// Load weight tile cooperatively:
+// Pack rows_per_block x TK elements into shared memory.
+// Each thread (ty, tx) loads ROWS_PER_THREAD rows for its column tx.
+#pragma unroll
+        for (int r = 0; r < ROWS_PER_THREAD; ++r)
+        {
+            const int out_row = m0 + ty + r * blockDim.y; // global output row
             float w_val = 0.0f;
-            if (out_row < output_dim && k < input_dim) {
+            if (out_row < output_dim && k < input_dim)
+            {
                 const __hip_bfloat16 wb = weight[(size_t)out_row * input_dim + k];
                 w_val = __bfloat162float(wb);
             }
@@ -822,14 +826,16 @@ __global__ void matmul_kernel_tiled(
 
         __syncthreads();
 
-        // Compute partial sums: for each of the ROWS_PER_THREAD rows owned by this thread,
-        // do a small dot against sX[0..TK).
-        #pragma unroll
-        for (int r = 0; r < ROWS_PER_THREAD; ++r) {
+// Compute partial sums: for each of the ROWS_PER_THREAD rows owned by this thread,
+// do a small dot against sX[0..TK).
+#pragma unroll
+        for (int r = 0; r < ROWS_PER_THREAD; ++r)
+        {
             const int row_off = (ty + r * blockDim.y) * TK;
-            // Unroll the inner product over TK to help the scheduler.
-            #pragma unroll
-            for (int kk = 0; kk < TK; ++kk) {
+// Unroll the inner product over TK to help the scheduler.
+#pragma unroll
+            for (int kk = 0; kk < TK; ++kk)
+            {
                 acc[r] += sW[row_off + kk] * sX[kk];
             }
         }
@@ -837,22 +843,25 @@ __global__ void matmul_kernel_tiled(
         __syncthreads();
     }
 
-    // Write out results
-    #pragma unroll
-    for (int r = 0; r < ROWS_PER_THREAD; ++r) {
+// Write out results
+#pragma unroll
+    for (int r = 0; r < ROWS_PER_THREAD; ++r)
+    {
         const int out_row = m0 + ty + r * blockDim.y;
-        if (out_row < output_dim) {
+        if (out_row < output_dim)
+        {
             output[(size_t)batch_idx * output_dim + out_row] = acc[r];
         }
     }
 }
 
-void matmul(float* __restrict__ output,                  // [B, O]
-    const float* __restrict__ input,             // [B, I]
-    const __hip_bfloat16* __restrict__ weight,   // [O, I] row-major
-    int batch_size, int input_dim, int output_dim) {
+void matmul(float *__restrict__ output,                // [B, O]
+            const float *__restrict__ input,           // [B, I]
+            const __hip_bfloat16 *__restrict__ weight, // [O, I] row-major
+            int batch_size, int input_dim, int output_dim)
+{
     // Choose a compact block that balances occupancy and smem usage.
-    dim3 block_dim(TK /*=32*/, 8);                 // 32 x 8 = 256 threads
+    dim3 block_dim(TK /*=32*/, 8);                            // 32 x 8 = 256 threads
     const int rows_per_block = block_dim.y * ROWS_PER_THREAD; // 8 * 4 = 32 rows per block
 
     dim3 grid_dim;
@@ -864,14 +873,15 @@ void matmul(float* __restrict__ output,                  // [B, O]
 
     // launch
     hipLaunchKernelGGL(matmul_kernel_tiled,
-                    grid_dim, block_dim, shmem_bytes, 0,
-                    output, input, weight, batch_size, input_dim, output_dim);
+                       grid_dim, block_dim, shmem_bytes, 0,
+                       output, input, weight, batch_size, input_dim, output_dim);
 }
 
 // Memory allocation functions
 void malloc_gpu_run_state(RunState *s, Config *p)
 {
     int kv_dim = p->head_dim * p->n_kv_heads;
+    int expert_per_token = p->experts_per_token;
 
     // Initialize pointers to NULL
     d_mask = NULL;
@@ -902,7 +912,7 @@ void malloc_gpu_run_state(RunState *s, Config *p)
     HIP_CHECK(hipMalloc((void **)&d_expert_weights, BATCH_SIZE * p->experts_per_token * sizeof(float)));
     HIP_CHECK(hipMalloc((void **)&d_batch_count, sizeof(int)));
     // This buffer holds the expert's final output before scattering
-    HIP_CHECK(hipMalloc((void **)&d_expert_output_buffer, BATCH_SIZE * p->hidden_dim * sizeof(float)));
+    HIP_CHECK(hipMalloc((void **)&d_expert_output_buffer, BATCH_SIZE * p->hidden_dim * sizeof(float) * expert_per_token));
 
     // KV cache allocation - this is usually the largest allocation
     HIP_CHECK(hipMalloc((void **)&d_key_cache, kv_cache_size));
@@ -913,16 +923,16 @@ void malloc_gpu_run_state(RunState *s, Config *p)
     HIP_CHECK(hipMalloc((void **)&d_router_score, BATCH_SIZE * p->n_experts * sizeof(float)));
     HIP_CHECK(hipMalloc((void **)&d_topk_v, BATCH_SIZE * p->experts_per_token * sizeof(float)));
     HIP_CHECK(hipMalloc((void **)&d_topk_i, BATCH_SIZE * p->experts_per_token * sizeof(int)));
-    HIP_CHECK(hipMalloc((void **)&d_mlp1_out, BATCH_SIZE * 2 * p->intermediate_dim * sizeof(float)));
-    HIP_CHECK(hipMalloc((void **)&d_gate, BATCH_SIZE * p->intermediate_dim * sizeof(float)));
-    HIP_CHECK(hipMalloc((void **)&d_up, BATCH_SIZE * p->intermediate_dim * sizeof(float)));
-    HIP_CHECK(hipMalloc((void **)&d_gate_up, BATCH_SIZE * p->intermediate_dim * sizeof(float)));
+    HIP_CHECK(hipMalloc((void **)&d_mlp1_out, BATCH_SIZE * 2 * p->intermediate_dim * sizeof(float) * expert_per_token));
+    HIP_CHECK(hipMalloc((void **)&d_gate, BATCH_SIZE * p->intermediate_dim * sizeof(float) * expert_per_token));
+    HIP_CHECK(hipMalloc((void **)&d_up, BATCH_SIZE * p->intermediate_dim * sizeof(float) * expert_per_token));
+    HIP_CHECK(hipMalloc((void **)&d_gate_up, BATCH_SIZE * p->intermediate_dim * sizeof(float) * expert_per_token));
     HIP_CHECK(hipMalloc((void **)&d_e_agg, batch_hidden));
     HIP_CHECK(hipMalloc((void **)&d_current_tokens, BATCH_SIZE * sizeof(int)));
     HIP_CHECK(hipMalloc((void **)&d_positions, BATCH_SIZE * sizeof(int)));
     HIP_CHECK(hipMalloc((void **)&d_cos_vals, (p->head_dim / 2) * p->seq_len * sizeof(float)));
     HIP_CHECK(hipMalloc((void **)&d_sin_vals, (p->head_dim / 2) * p->seq_len * sizeof(float)));
-    HIP_CHECK(hipMalloc((void **)&d_expert_input_buffer, batch_hidden));
+    HIP_CHECK(hipMalloc((void **)&d_expert_input_buffer, batch_hidden * expert_per_token));
     HIP_CHECK(hipMalloc((void **)&d_temp_buffer, batch_hidden));
     HIP_CHECK(hipMalloc((void **)&d_token_embedding_table, p->vocab_size * p->hidden_dim * sizeof(__hip_bfloat16)));
 
@@ -1411,8 +1421,8 @@ void attention_gpu(Transformer *transformer, int layer_idx, int batch_size)
             batch_size,
             hidden_dim,
             (p->n_attn_heads + 2 * p->n_kv_heads) * head_dim);
-        */  
-        
+        */
+
         matmul(
             d_qkv,
             d_t,
@@ -1609,9 +1619,114 @@ __global__ void aggregate_expert_output_kernel(float *d_e_agg, const float *expe
     }
 }
 
+/**
+ * @brief Stage 1: Counts the number of tokens assigned to each expert in parallel.
+ *
+ * This kernel launches one thread per token. Each thread iterates through its
+ * top-k expert choices and atomically increments the counter for each chosen expert.
+ * Contention is low as it's distributed across all expert counters.
+ *
+ * @param topk_i Device pointer to the top-k expert indices for each token.
+ * @param d_expert_counts Device pointer to an array of size n_experts (pre-filled with zeros).
+ * @param batch_size Total number of tokens.
+ * @param experts_per_token The 'k' in top-k.
+ */
+__global__ void count_tokens_per_expert_kernel(const int *topk_i, int *d_expert_counts,
+                                               int batch_size, int experts_per_token)
+{
+    int token_idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (token_idx >= batch_size)
+    {
+        return;
+    }
+
+    // Each token contributes to the count of its assigned experts
+    for (int k = 0; k < experts_per_token; ++k)
+    {
+        int expert_id = topk_i[token_idx * experts_per_token + k];
+        // This atomic is low-contention because updates are spread across n_experts counters
+        atomicAdd(&d_expert_counts[expert_id], 1);
+    }
+}
+
+/**
+ * @brief Stage 2: Gathers/permutes expert inputs into a compact buffer using a
+ * block-per-token strategy for coalesced memory access.
+ *
+ * This kernel is the high-performance replacement for the original gather_expert_inputs_kernel.
+ * It uses a full thread block to process each token, allowing the `hidden_dim` vector
+ * to be copied in a fully parallel and coalesced manner.
+ *
+ * @param d_t The source hidden states (batch_size, hidden_dim).
+ * @param topk_i The top-k expert indices for each token.
+ * @param topk_v The top-k expert weights for each token.
+ * @param d_expert_offsets The starting index for each expert in the compact buffer.
+ * @param d_expert_write_idx A temporary counter for each expert to get a local index.
+ * @param batch_size Total number of tokens.
+ * @param hidden_dim Dimension of the hidden state.
+ * @param experts_per_token The 'k' in top-k.
+ * @param expert_input_buffer Destination compact buffer for hidden states.
+ * @param expert_indices Destination buffer for original token indices for scattering.
+ * @param expert_weights Destination buffer for router weights for scattering.
+ */
+__global__ void permute_expert_inputs_kernel(const float *d_t, const int *topk_i, const float *topk_v,
+                                             const int *d_expert_offsets, int *d_expert_write_idx,
+                                             int batch_size, int hidden_dim, int experts_per_token,
+                                             float *expert_input_buffer, int *expert_indices, float *expert_weights)
+{
+    // Each BLOCK processes one token to enable parallel copying
+    int token_idx = blockIdx.x;
+    if (token_idx >= batch_size)
+    {
+        return;
+    }
+
+    // Use shared memory to communicate the calculated destination index to all threads in the block.
+    // Size must match experts_per_token.
+    __shared__ int destination_indices[2]; // Assumes experts_per_token <= 2
+
+    // The first few threads handle the logic for each of the token's expert choices
+    if (threadIdx.x < experts_per_token)
+    {
+        int k = threadIdx.x;
+        int topk_flat_idx = token_idx * experts_per_token + k;
+        int expert_id = topk_i[topk_flat_idx];
+
+        // Atomically get the local write position within this expert's designated data block
+        int local_idx = atomicAdd(&d_expert_write_idx[expert_id], 1);
+
+        // Calculate the final destination index in the large compact buffer
+        int compact_idx = d_expert_offsets[expert_id] + local_idx;
+
+        // Store metadata needed for the later scatter step
+        expert_indices[compact_idx] = token_idx;
+        expert_weights[compact_idx] = topk_v[topk_flat_idx];
+
+        // Share the destination index with all threads in this block
+        destination_indices[k] = compact_idx;
+    }
+
+    // Synchronize to ensure destination_indices is visible to all threads in the block
+    __syncthreads();
+
+    // Now, all threads in the block cooperate to copy the hidden state for each expert choice.
+    // This loop ensures we handle all `experts_per_token` assignments for the current token.
+    for (int k = 0; k < experts_per_token; ++k)
+    {
+        const float *src = d_t + token_idx * hidden_dim;
+        float *dst = expert_input_buffer + destination_indices[k] * hidden_dim;
+
+        // This is the coalesced copy: each thread copies a different element of the hidden_dim vector
+        for (int i = threadIdx.x; i < hidden_dim; i += blockDim.x)
+        {
+            dst[i] = src[i];
+        }
+    }
+}
+
 void moe_gpu(Transformer *transformer, int layer_idx, int batch_size)
 {
-
+    // Timer declarations (assuming they are defined elsewhere)
     static Timer rms_norm_timer("RMSNorm_moe", true);
     static Timer matmul_kernel_simple_timer("MatMulKernelSimple_moe", true);
     static Timer add_bias_timer("AddBias_moe", true);
@@ -1621,172 +1736,179 @@ void moe_gpu(Transformer *transformer, int layer_idx, int batch_size)
     static Timer expert_agg_kernel_timer("ExpertAggKernel_moe", true);
     static Timer scatter_expert_outputs_kernel_timer("ScatterExpertOutputsKernel_moe", true);
     static Timer accumulate_kernel_timer("AccumulateKernel_moe", true);
-    static Timer expert_routing_kernel_timer("ExpertRoutingKernel_moe", true);
-    static Timer aggregate_expert_output_kernel_timer("AggregateExpertOutputKernel_moe", true);
-    static Timer add_sinks_kernel_timer("AddSinksKernel_moe", true);
-    static Timer softmax_kernel_variable_len_timer("SoftmaxKernelVariableLen_moe", true);
-    static Timer matmul_kernel_simple_timer2("MatMulKernelSimple2_moe", true);
-    static Timer apply_rope_timer("ApplyRoPE_moe", true);
-    static Timer update_kv_cache_timer("UpdateKVCache_moe", true);
     static Timer split_gate_up_kernel_timer("SplitGateUpKernel_moe", true);
     static Timer swiglu_kernel_timer("SwigluKernel_moe", true);
 
     Config *p = &transformer->config;
-
     int hidden_dim = p->hidden_dim;
     int intermediate_dim = p->intermediate_dim;
     int n_experts = p->n_experts;
-    // FFN RMSNorm - CORRECT
+    int experts_per_token = p->experts_per_token;
+
+    // FFN RMSNorm
     dim3 norm_grid(batch_size);
     dim3 norm_block(THREADS_PER_BLOCK);
     {
         TIME_SCOPE(rms_norm_timer);
-        rmsnorm_kernel<<<norm_grid, norm_block>>>(
-            d_t, d_x, d_rms_ffn_w + layer_idx * hidden_dim, batch_size, hidden_dim);
+        rmsnorm_kernel<<<norm_grid, norm_block>>>(d_t, d_x, d_rms_ffn_w + layer_idx * hidden_dim, batch_size, hidden_dim);
     }
     HIP_CHECK(hipGetLastError());
 
-    // Router computation & bias - CORRECT
-    int router_weight_offset = layer_idx * hidden_dim * n_experts;
-    dim3 router_grid(batch_size, (n_experts + 31) / 32);
-    dim3 router_block(32, 32);
-
-    dim3 block_dim(32, 32); // A 2D block, e.g., 32x32 = 1024 threads.
-    dim3 grid_dim;
-    grid_dim.x = batch_size;
-    grid_dim.y = (n_experts + block_dim.y - 1) / block_dim.y; // Ceiling division
-
+    // Router computation & bias
     {
         TIME_SCOPE(matmul_kernel_simple_timer);
-        // Launch the simple kernel
-        matmul(
-            d_router_score, d_t, d_w_router + router_weight_offset, batch_size, hidden_dim, n_experts);
+        matmul(d_router_score, d_t, d_w_router + layer_idx * hidden_dim * n_experts, batch_size, hidden_dim, n_experts);
     }
-    HIP_CHECK(hipGetLastError());
-
-    int router_bias_offset = layer_idx * n_experts;
-    dim3 bias_grid((batch_size * n_experts + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK);
     {
         TIME_SCOPE(add_bias_timer);
-        add_bias_kernel<<<bias_grid, THREADS_PER_BLOCK>>>(
-            d_router_score, d_b_router + router_bias_offset, batch_size, n_experts);
+        add_bias_kernel<<<(batch_size * n_experts + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK, THREADS_PER_BLOCK>>>(
+            d_router_score, d_b_router + layer_idx * n_experts, batch_size, n_experts);
     }
-    HIP_CHECK(hipGetLastError());
 
-    // Top-k expert selection - CORRECT
-    dim3 topk_grid(batch_size);
+    // Top-k expert selection
     {
         TIME_SCOPE(topk_kernel_timer);
-        topk_kernel<<<topk_grid, 1>>>(d_topk_v, d_topk_i, d_router_score, batch_size, n_experts, p->experts_per_token);
+        topk_kernel<<<batch_size, 1>>>(d_topk_v, d_topk_i, d_router_score, batch_size, n_experts, experts_per_token);
     }
-    HIP_CHECK(hipGetLastError());
 
-    // Softmax on top-k values to get weights - CORRECT
-    dim3 topk_soft_grid(batch_size);
+    // Softmax on top-k values to get weights
     {
         TIME_SCOPE(softmax_kernel_timer);
-        softmax_kernel<<<topk_soft_grid, norm_block>>>(d_topk_v, batch_size, p->experts_per_token);
+        softmax_kernel<<<batch_size, norm_block>>>(d_topk_v, batch_size, experts_per_token);
     }
     HIP_CHECK(hipGetLastError());
-    // Initialize expert aggregation buffer - CORRECT
+
+    // Initialize final aggregation buffer
     HIP_CHECK(hipMemset(d_e_agg, 0, batch_size * hidden_dim * sizeof(float)));
 
-    // --- REWRITTEN EXPERT PROCESSING AND AGGREGATION ---
-    dim3 expert_agg_grid((batch_size * hidden_dim + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK);
+    // --- 🚀 OPTIMIZED TWO-STAGE GATHER ALGORITHM 🚀 ---
+    int *d_expert_counts;
+    int *d_expert_offsets;
+    int *d_expert_write_idx;
+    HIP_CHECK(hipMalloc(&d_expert_counts, n_experts * sizeof(int)));
+    HIP_CHECK(hipMalloc(&d_expert_offsets, n_experts * sizeof(int)));
+    HIP_CHECK(hipMalloc(&d_expert_write_idx, n_experts * sizeof(int)));
 
-    int h_batch_count = 0;
-    // Loop through each expert to process its dedicated mini-batch
-    for (int expert_id = 0; expert_id < n_experts; expert_id++)
+    // **FIX:** Declare host-side arrays and total_tokens here, before the timed scope
+    int h_expert_counts[n_experts];
+    int h_expert_offsets[n_experts];
+    int total_tokens = 0;
+
     {
-        // --- 1. GATHER STEP ---
+        TIME_SCOPE(gather_expert_inputs_kernel_timer); // Timing the entire gather operation
 
-        // Reset the GPU-side counter for this expert
-        HIP_CHECK(hipMemset(d_batch_count, 0, sizeof(int)));
-
-        // Launch kernel to find all tokens for this expert and copy their inputs
-        dim3 gather_grid((batch_size + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK);
-        {
-            TIME_SCOPE(gather_expert_inputs_kernel_timer);
-            gather_expert_inputs_kernel<<<gather_grid, THREADS_PER_BLOCK>>>(
-                d_t, d_topk_i, d_topk_v, expert_id, batch_size, hidden_dim, p->experts_per_token,
-                d_expert_input_buffer, d_expert_indices, d_expert_weights, d_batch_count);
-        }
+        // === STAGE 1: COUNT TOKENS PER EXPERT ===
+        HIP_CHECK(hipMemset(d_expert_counts, 0, n_experts * sizeof(int)));
+        dim3 count_grid((batch_size + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK);
+        count_tokens_per_expert_kernel<<<count_grid, THREADS_PER_BLOCK>>>(
+            d_topk_i, d_expert_counts, batch_size, experts_per_token);
         HIP_CHECK(hipGetLastError());
 
-        // Get the number of tokens routed to this expert
-        HIP_CHECK(hipMemcpy(&h_batch_count, d_batch_count, sizeof(int), hipMemcpyDeviceToHost));
+        // === CALCULATE OFFSETS (PREFIX SUM ON CPU) ===
+        HIP_CHECK(hipMemcpy(h_expert_counts, d_expert_counts, n_experts * sizeof(int), hipMemcpyDeviceToHost));
+
+        for (int i = 0; i < n_experts; ++i)
+        {
+            h_expert_offsets[i] = total_tokens;
+            total_tokens += h_expert_counts[i];
+        }
+        HIP_CHECK(hipMemcpy(d_expert_offsets, h_expert_offsets, n_experts * sizeof(int), hipMemcpyHostToDevice));
+
+        // === STAGE 2: PERMUTE INPUTS WITH COALESCED COPY ===
+        HIP_CHECK(hipMemset(d_expert_write_idx, 0, n_experts * sizeof(int)));
+        dim3 permute_grid(batch_size); // One block per token
+        dim3 permute_block(256);       // Block size for efficient copying
+        permute_expert_inputs_kernel<<<permute_grid, permute_block>>>(
+            d_t, d_topk_i, d_topk_v, d_expert_offsets, d_expert_write_idx,
+            batch_size, hidden_dim, experts_per_token,
+            d_expert_input_buffer, d_expert_indices, d_expert_weights);
+        HIP_CHECK(hipGetLastError());
+    } // End of gather timer scope
+
+    // --- 2. COMPUTE STEP (EXPERT MLPS) ---
+    // Loop through each expert to run its MLP on its dedicated slice of the compact buffer.
+    for (int expert_id = 0; expert_id < n_experts; expert_id++)
+    {
+        int h_batch_count = h_expert_counts[expert_id];
         if (h_batch_count == 0)
         {
-            continue; // No tokens for this expert, skip to the next one
+            continue; // Skip experts with no tokens
         }
 
-        // --- 2. COMPUTE STEP ---
-        // Run the expert MLP only on the `h_batch_count` gathered tokens.
-        // NOTE: All subsequent kernels now use `h_batch_count` as their batch size.
+        // Calculate pointers to this expert's slice of the data
+        int expert_offset = h_expert_offsets[expert_id];
+        float *expert_input_ptr = d_expert_input_buffer + expert_offset * hidden_dim;
+        float *mlp1_out_ptr = d_mlp1_out + expert_offset * 2 * intermediate_dim;
+        float *gate_ptr = d_gate + expert_offset * intermediate_dim;
+        float *up_ptr = d_up + expert_offset * intermediate_dim;
+        float *gate_up_ptr = d_gate_up + expert_offset * intermediate_dim;
+        float *expert_output_ptr = d_expert_output_buffer + expert_offset * hidden_dim;
 
-        // MLP1 (Gate/Up projections) using d_expert_input_buffer
-        int mlp1_weight_offset = (layer_idx * n_experts + expert_id) * (2 * intermediate_dim) * hidden_dim;
-        dim3 mlp1_grid(h_batch_count, (2 * intermediate_dim + 31) / 32);
-        dim3 router_block(32, 32);
+        // MLP1 (Gate/Up projections)
         {
             TIME_SCOPE(matmul_kernel_simple_timer);
-            matmul(d_mlp1_out, d_expert_input_buffer,
-                                                              d_w_mlp1 + mlp1_weight_offset, h_batch_count, hidden_dim, 2 * intermediate_dim);
+            matmul(mlp1_out_ptr, expert_input_ptr,
+                   d_w_mlp1 + (layer_idx * n_experts + expert_id) * (2 * intermediate_dim) * hidden_dim,
+                   h_batch_count, hidden_dim, 2 * intermediate_dim);
         }
-        // Split, add bias, and apply SwiGLU activation
-        int mlp1_bias_offset = (layer_idx * n_experts + expert_id) * (2 * intermediate_dim);
-        dim3 split_grid((h_batch_count * intermediate_dim + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK);
+
+        // Split, add bias, and apply SwiGLU
+        dim3 expert_grid((h_batch_count * intermediate_dim + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK);
         {
             TIME_SCOPE(split_gate_up_kernel_timer);
-            split_gate_up_kernel<<<split_grid, THREADS_PER_BLOCK>>>(d_gate, d_up, d_mlp1_out,
-                                                                    d_b_mlp1 + mlp1_bias_offset, h_batch_count, intermediate_dim);
+            split_gate_up_kernel<<<expert_grid, THREADS_PER_BLOCK>>>(gate_ptr, up_ptr, mlp1_out_ptr,
+                                                                     d_b_mlp1 + (layer_idx * n_experts + expert_id) * (2 * intermediate_dim), h_batch_count, intermediate_dim);
         }
-
         {
             TIME_SCOPE(swiglu_kernel_timer);
-            swiglu_kernel<<<split_grid, THREADS_PER_BLOCK>>>(d_gate, d_up, d_gate_up,
-                                                             h_batch_count, intermediate_dim, p->swiglu_limit);
+            swiglu_kernel<<<expert_grid, THREADS_PER_BLOCK>>>(gate_ptr, up_ptr, gate_up_ptr,
+                                                              h_batch_count, intermediate_dim, p->swiglu_limit);
         }
 
-        // MLP2 (Down projection) -> output stored in d_expert_output_buffer
-        int mlp2_weight_offset = (layer_idx * n_experts + expert_id) * hidden_dim * intermediate_dim;
-        dim3 mlp2_grid(h_batch_count, (hidden_dim + 31) / 32);
+        // MLP2 (Down projection)
         {
             TIME_SCOPE(matmul_kernel_simple_timer);
-            matmul(d_expert_output_buffer, d_gate_up,
-                                                              d_w_mlp2 + mlp2_weight_offset, h_batch_count, intermediate_dim, hidden_dim);
+            matmul(expert_output_ptr, gate_up_ptr,
+                   d_w_mlp2 + (layer_idx * n_experts + expert_id) * hidden_dim * intermediate_dim,
+                   h_batch_count, intermediate_dim, hidden_dim);
         }
-        // debug(d_expert_output_buffer);
 
         // Add MLP2 bias
-        int mlp2_bias_offset = (layer_idx * n_experts + expert_id) * hidden_dim;
         {
             TIME_SCOPE(add_bias_timer);
-            add_bias_kernel<<<(h_batch_count * hidden_dim + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK, THREADS_PER_BLOCK>>>(
-                d_expert_output_buffer, d_b_mlp2 + mlp2_bias_offset, h_batch_count, hidden_dim);
+            dim3 bias_grid((h_batch_count * hidden_dim + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK);
+            add_bias_kernel<<<bias_grid, THREADS_PER_BLOCK>>>(
+                expert_output_ptr, d_b_mlp2 + (layer_idx * n_experts + expert_id) * hidden_dim, h_batch_count, hidden_dim);
             HIP_CHECK(hipGetLastError());
         }
+    }
 
-        // --- 3. SCATTER STEP ---
-
-        // Add the results from this expert back to the main aggregation buffer
-        dim3 scatter_grid((h_batch_count * hidden_dim + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK);
+    // --- 3. SCATTER STEP ---
+    // The scatter kernel works as before, but we launch it over the total number of processed tokens.
+    if (total_tokens > 0)
+    {
+        dim3 scatter_grid((total_tokens * hidden_dim + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK);
         {
             TIME_SCOPE(scatter_expert_outputs_kernel_timer);
             scatter_expert_outputs_kernel<<<scatter_grid, THREADS_PER_BLOCK>>>(
                 d_e_agg, d_expert_output_buffer, d_expert_indices, d_expert_weights,
-                h_batch_count, hidden_dim);
+                total_tokens, hidden_dim);
             HIP_CHECK(hipGetLastError());
         }
     }
 
+    // --- FINAL RESIDUAL CONNECTION ---
     {
         TIME_SCOPE(accumulate_kernel_timer);
-        // Residual connection - CORRECT
         accumulate_kernel<<<(batch_size * hidden_dim + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK, THREADS_PER_BLOCK>>>(
             d_x, d_e_agg, 1.0f, batch_size, hidden_dim);
         HIP_CHECK(hipGetLastError());
     }
+
+    // Free the temporary buffers used in the gather operation
+    HIP_CHECK(hipFree(d_expert_counts));
+    HIP_CHECK(hipFree(d_expert_offsets));
+    HIP_CHECK(hipFree(d_expert_write_idx));
 }
 
 float *forward_batch_gpu(Transformer *transformer, int *tokens, int batch_size)
