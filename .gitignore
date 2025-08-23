@@ -34,7 +34,8 @@ build/
 .vscode/
 profiling_gpt_*
 
-# Ignore analyze script output
+# Ignore analyze script output and logs
+logs/
 times.csv
 analysis_report.txt
 kernel_analysis.png
