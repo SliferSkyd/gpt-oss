@@ -741,141 +741,166 @@ __global__ void matmul_kernel_simple(float *output, const float *input, const __
     output[batch_idx * output_dim + out_idx] = sum;
 }
 
-// Kernel: batched GEMV (many rows) with tiling over K (=input_dim).
-// Layouts:
-//   input  : [batch_size, input_dim]        (row-major per batch)
-//   weight : [output_dim, input_dim]        (row-major, one row per output unit)
-//   output : [batch_size, output_dim]       (row-major per batch)
-//
-// Each block handles:
-//   - one batch vector (blockIdx.x)
-//   - a tile of output rows (blockIdx.y)
-// Tiling over K with TK; a block computes TM rows (per tile) using shared memory.
-//
-// Notes:
-// - Accumulate in float (FP32) for numerical stability.
-// - weight is bfloat16; convert on the fly.
-// - If you can afford a one-time change, storing W column-major (or a pretranspose)
-//   will improve memory coalescing further. This version stays with your row-major W.
+#include <hip/hip_runtime.h>
+#include <hip/hip_bf16.h>
+#include <rocwmma/rocwmma.hpp>
 
-#ifndef ROWS_PER_THREAD
-#define ROWS_PER_THREAD 4 // each thread computes 4 output rows, strided by blockDim.y
-#endif
-#ifndef TK
-#define TK 32 // K tile (must match blockDim.x)
-#endif
+// Wave-level WMMA tile sizes (fixed by hardware)
+constexpr int WM = 16;   // wmma M
+constexpr int WN = 16;   // wmma N
+constexpr int WK = 16;   // wmma K  (rocWMMA handles issuing 2xK=8 mfmas for BF16 under the hood)
 
-__global__ void matmul_kernel_tiled(
-    float *__restrict__ output,                // [B, O]
-    const float *__restrict__ input,           // [B, I]
-    const __hip_bfloat16 *__restrict__ weight, // [O, I] row-major
-    int batch_size, int input_dim, int output_dim)
+// Block tile = 64x64 made of 4x4 WMMA tiles (16 waves per block)
+constexpr int WAVES_M = 4;                   // number of WMMA tiles along M in a block
+constexpr int WAVES_N = 4;                   // number of WMMA tiles along N in a block
+constexpr int BLOCK_M = WM * WAVES_M;        // 64
+constexpr int BLOCK_N = WN * WAVES_N;        // 64
+constexpr int BLOCK_K = WK;                  // iterate over K in steps of 16
+
+// Workgroup: 64 lanes per wave x (WAVES_M * WAVES_N) waves = 64 x 16 = 1024 threads
+constexpr int LANE_PER_WAVE = 64;
+constexpr int WAVES_PER_BLOCK = WAVES_M * WAVES_N;
+
+__device__ inline rocwmma::bfloat16_t f32_to_bf16_rn(float x) {
+    // round-to-nearest: add 0x8000 to lower 16 bits before truncation
+    uint32_t u = __float_as_uint(x);
+    u += 0x8000u;
+    rocwmma::bfloat16_t y;
+    // rocWMMA bfloat16_t is 16-bit storage type; alias-safe cast
+    reinterpret_cast<uint16_t&>(y) = static_cast<uint16_t>(u >> 16);
+    return y;
+}
+
+__global__ void gemm_wmma_bf16_kernel(
+    float* __restrict__ C,                     // [M, N]
+    const float* __restrict__ A,               // [M, K] (FP32)
+    const __hip_bfloat16* __restrict__ W,      // [N, K] row-major (== [O, I])
+    int M, int K, int N)
 {
-    const int batch_idx = blockIdx.x;
-    if (batch_idx >= batch_size)
-        return;
+    using namespace rocwmma;
 
-    // Tile origin in output rows (M dimension)
-    constexpr int TM = ROWS_PER_THREAD; // rows per thread * blockDim.y below
-    const int rows_per_block = blockDim.y * ROWS_PER_THREAD;
-    const int m0 = blockIdx.y * rows_per_block;
+    // Block origin
+    const int m0 = blockIdx.y * BLOCK_M;
+    const int n0 = blockIdx.x * BLOCK_N;
 
-    // Thread identifiers
-    const int tx = threadIdx.x; // [0..TK-1], used along K tile dimension
-    const int ty = threadIdx.y; // groups output rows within the block
+    // Wave & lane ids
+    const int lane = threadIdx.x;              // 0..63
+    const int wave = threadIdx.y;              // 0..(WAVES_PER_BLOCK-1)
+    const int wave_m = wave / WAVES_N;         // 0..(WAVES_M-1)
+    const int wave_n = wave % WAVES_N;         // 0..(WAVES_N-1)
 
-    // Shared memory:
-    //  - sX: tile of input vector of length TK
-    //  - sW: tile of weights for 'rows_per_block' rows and TK columns
-    extern __shared__ float smem[];
-    float *sX = smem;    // TK
-    float *sW = sX + TK; // rows_per_block * TK
+    // LDS layout:
+    // sA: [BLOCK_M, BLOCK_K] row-major -> ldA = BLOCK_K
+    // sB: [BLOCK_K, BLOCK_N] col-major -> ldB = BLOCK_K (so columns are contiguous for WMMA col_major)
+    extern __shared__ uint8_t smemRaw[];
+    auto* sA = reinterpret_cast<rocwmma::bfloat16_t*>(smemRaw);
+    auto* sB = reinterpret_cast<rocwmma::bfloat16_t*>(sA + (BLOCK_M * BLOCK_K));
 
-    // Pointer to this batch's input slice
-    const float *__restrict__ x_b = input + (size_t)batch_idx * input_dim;
+    // Optional per-wave scratch to mask ragged stores (only used at edges)
+    auto* sC = reinterpret_cast<float*>(sB + (BLOCK_K * BLOCK_N));  // size: WAVES_PER_BLOCK * WM * WN
 
-    // Per-thread accumulators for the rows it owns
-    float acc[ROWS_PER_THREAD] = {0};
+    // Accumulator fragment for this wave's 16x16 tile
+    fragment<accumulator, WM, WN, WK, float> cFrag;
+    fill_fragment(cFrag, 0.0f);
 
-    // Loop over K in tiles of TK
-    for (int k0 = 0; k0 < input_dim; k0 += TK)
-    {
-        const int k = k0 + tx;
+    // Iterate over K in BLOCK_K(=16) steps
+    for (int k0 = 0; k0 < K; k0 += BLOCK_K) {
 
-        // Load input tile cooperatively (only ty==0 threads need to do it)
-        if (ty == 0)
-        {
-            sX[tx] = (k < input_dim) ? x_b[k] : 0.0f;
+        // --- Cooperative load of A tile [BLOCK_M x BLOCK_K], FP32->BF16 (row-major) ---
+        // Use all threads in the block
+        const int threadsPerBlock = blockDim.x * blockDim.y; // 64 * WAVES_PER_BLOCK
+        int linearT = wave * blockDim.x + lane;              // 0..(threadsPerBlock-1)
+        for (int idx = linearT; idx < BLOCK_M * BLOCK_K; idx += threadsPerBlock) {
+            int r = idx / BLOCK_K;           // 0..BLOCK_M-1
+            int c = idx % BLOCK_K;           // 0..BLOCK_K-1
+            int gm = m0 + r;
+            int gk = k0 + c;
+            float a = (gm < M && gk < K) ? A[(size_t)gm * K + gk] : 0.0f;
+            sA[r * BLOCK_K + c] = f32_to_bf16_rn(a);
         }
 
-// Load weight tile cooperatively:
-// Pack rows_per_block x TK elements into shared memory.
-// Each thread (ty, tx) loads ROWS_PER_THREAD rows for its column tx.
-#pragma unroll
-        for (int r = 0; r < ROWS_PER_THREAD; ++r)
-        {
-            const int out_row = m0 + ty + r * blockDim.y; // global output row
-            float w_val = 0.0f;
-            if (out_row < output_dim && k < input_dim)
-            {
-                const __hip_bfloat16 wb = weight[(size_t)out_row * input_dim + k];
-                w_val = __bfloat162float(wb);
-            }
-            sW[(ty + r * blockDim.y) * TK + tx] = w_val;
+        // --- Cooperative load of B tile as col-major in LDS: [BLOCK_K x BLOCK_N] ---
+        for (int idx = linearT; idx < BLOCK_K * BLOCK_N; idx += threadsPerBlock) {
+            int c = idx / BLOCK_K;           // 0..BLOCK_N-1 (column index)
+            int r = idx % BLOCK_K;           // 0..BLOCK_K-1 (row index == k)
+            int gn = n0 + c;
+            int gk = k0 + r;
+            __hip_bfloat16 wb = (gk < K && gn < N) ? W[(size_t)gn * K + gk] : __float2bfloat16(0.0f);
+            // store col-major: element(r,c) at c*ld + r, with ld = BLOCK_K
+            reinterpret_cast<rocwmma::bfloat16_t&>(wb); // alias ok
+            sB[c * BLOCK_K + r] = *reinterpret_cast<rocwmma::bfloat16_t*>(&wb);
         }
 
         __syncthreads();
 
-// Compute partial sums: for each of the ROWS_PER_THREAD rows owned by this thread,
-// do a small dot against sX[0..TK).
-#pragma unroll
-        for (int r = 0; r < ROWS_PER_THREAD; ++r)
-        {
-            const int row_off = (ty + r * blockDim.y) * TK;
-// Unroll the inner product over TK to help the scheduler.
-#pragma unroll
-            for (int kk = 0; kk < TK; ++kk)
-            {
-                acc[r] += sW[row_off + kk] * sX[kk];
-            }
-        }
+        // --- Load A/B WMMA fragments for this wave's 16x16 subtile and MMA ---
+        fragment<matrix_a, WM, WN, WK, bfloat16_t, row_major> aFrag;
+        fragment<matrix_b, WM, WN, WK, bfloat16_t, col_major> bFrag;
+
+        // Wave's local offset inside the block tiles
+        const int aRow = wave_m * WM;           // start row in sA
+        const int bCol = wave_n * WN;           // start col in sB
+
+        // Leading dimensions
+        const int ldA = BLOCK_K;                // row-major A in LDS
+        const int ldB = BLOCK_K;                // col-major B in LDS
+
+        // Each K-slice is entire fragment depth WK
+        load_matrix_sync(aFrag, sA + aRow * ldA, ldA);
+        load_matrix_sync(bFrag, sB + bCol * ldB, ldB);
+
+        mma_sync(cFrag, aFrag, bFrag, cFrag);
 
         __syncthreads();
     }
 
-// Write out results
-#pragma unroll
-    for (int r = 0; r < ROWS_PER_THREAD; ++r)
-    {
-        const int out_row = m0 + ty + r * blockDim.y;
-        if (out_row < output_dim)
-        {
-            output[(size_t)batch_idx * output_dim + out_row] = acc[r];
+    // --- Masked store: write to LDS scratch per-wave, then guarded global write ---
+    // Per-wave scratch base
+    float* sCbase = sC + wave * (WM * WN);
+    // Store 16x16 to LDS (row-major, ld = WN)
+    store_matrix_sync(sCbase, cFrag, WN, mem_row_major);
+    __syncthreads();
+
+    // Each lane writes several elements with bounds checks
+    const int c_m0 = m0 + wave_m * WM;
+    const int c_n0 = n0 + wave_n * WN;
+    for (int t = lane; t < WM * WN; t += LANE_PER_WAVE) {
+        int r = t / WN;
+        int c = t % WN;
+        int gm = c_m0 + r;
+        int gn = c_n0 + c;
+        if (gm < M && gn < N) {
+            C[(size_t)gm * N + gn] = sCbase[r * WN + c];
         }
     }
 }
 
-void matmul(float *__restrict__ output,                // [B, O]
-            const float *__restrict__ input,           // [B, I]
-            const __hip_bfloat16 *__restrict__ weight, // [O, I] row-major
-            int batch_size, int input_dim, int output_dim)
+// Host wrapper using WMMA path
+void matmul(
+    float* __restrict__ output,                 // [B, O]
+    const float* __restrict__ input,            // [B, I]
+    const __hip_bfloat16* __restrict__ weight,  // [O, I] row-major  == [N, K]
+    int batch_size, int input_dim, int output_dim,
+    hipStream_t stream = nullptr)
 {
-    // Choose a compact block that balances occupancy and smem usage.
-    dim3 block_dim(TK /*=32*/, 8);                            // 32 x 8 = 256 threads
-    const int rows_per_block = block_dim.y * ROWS_PER_THREAD; // 8 * 4 = 32 rows per block
+    const int M = batch_size, K = input_dim, N = output_dim;
 
-    dim3 grid_dim;
-    grid_dim.x = batch_size;
-    grid_dim.y = (output_dim + rows_per_block - 1) / rows_per_block;
+    // Grid tiles the output into 64x64 blocks
+    dim3 grid((N + BLOCK_N - 1) / BLOCK_N, (M + BLOCK_M - 1) / BLOCK_M);
+    // 64 lanes x 16 waves = 1024 threads per block
+    dim3 block(LANE_PER_WAVE, WAVES_PER_BLOCK);
 
-    // Shared memory size: TK floats for x, plus rows_per_block * TK floats for W tile.
-    size_t shmem_bytes = (TK + rows_per_block * TK) * sizeof(float);
+    // LDS: sA(BLOCK_M*BLOCK_K) + sB(BLOCK_K*BLOCK_N) + sC(WAVES_PER_BLOCK*WM*WN)
+    size_t shmem_bytes =
+        (size_t)(BLOCK_M * BLOCK_K + BLOCK_K * BLOCK_N) * sizeof(rocwmma::bfloat16_t) +
+        (size_t)(WAVES_PER_BLOCK * WM * WN) * sizeof(float);
 
-    // launch
-    hipLaunchKernelGGL(matmul_kernel_tiled,
-                       grid_dim, block_dim, shmem_bytes, 0,
-                       output, input, weight, batch_size, input_dim, output_dim);
+    hipLaunchKernelGGL(
+        gemm_wmma_bf16_kernel,
+        grid, block, shmem_bytes, stream,
+        output, input, weight, M, K, N);
 }
+
 
 // Memory allocation functions
 void malloc_gpu_run_state(RunState *s, Config *p)

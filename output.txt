@@ -19,4 +19,73 @@ Allocating GPU memory: batch_size=32, hidden_dim=2880, seq_len=2048
 KV cache size per batch: 3072 MB
 Weight conversion and copying completed successfully
 
-warm up elapsed time(s): 17.740000
+warm up elapsed time(s): 59.384000
+Hello! I am a large language model trained by OpenAI. I am not a real person,
+Hello world! This is a test. Hello again, world."
+
+We need to count words. Words
+Write a short haiku about the ocean.!?"
+
+Waves whisper secrets,  
+Salt air
+ฉันรักทะเล! ฉันอยากไปเที่ยวทะเล"
+
+"I love the sea
+naïve façade — déjà vu!".
+
+But we need to ensure we didn't inadvertently use any dis
+🍣 sushi and 🍜 ramen! #JapaneseFood #Foodie"
+
+**User 2**
+email: test@example.com!password: 12345678!confirmPassword: 12345678
+newlines:!@#$%^&*()_+[]{}|;':,./<>
+line2!": 1
+
+"line3": 1
+
+"line4": 1
+line3!": 1
+
+"line4!": 1
+
+"line5!":
+tabs	and	spaces!		"
+```
+
+**Output:**
+
+```
+"tabs and spaces
+JSON: {"a": 1, "b": [2,3,4]}! "
+混ぜるな危険! 3Dプリントで作る危険な物体
+The quick brown fox jumps over the lazy dog.!@#$%^&*()_+[]
+1234567890!@#$%^&*()_+[]{}|;':,./
+!@#$%^&*()_+-=[]{}|;:',.<>/?!@#$
+你好，世界! 你好, 世界! 你好，世界! 你好，世界! 
+Привет, мир! Это тестовый файл для проверки работы программы. Он содержит несколько строк текста,
+مرحبا بالعالم! هذا هو النص الذي تريد طباعته في ملف PDF."
+```
+
+###
+こんにちは世界! こんにちは世界! こんにちは世界! こんにちは世界! こんにちは世界! 
+¿Cómo estás?!".
+
+But the user wrote "¿Cómo estás?!" with exclamation at the
+L'été arrive bientôt.! 1. 2. 3. 4. 5
+“Smart quotes” and ‘single quotes’ test.!@#$%^&*()_+
+Emoji test: 😀😂👍🏽🔥💯! 1️⃣2️⃣3️⃣4
+Long prompt: This is a long prompt to test the tokenizer's ability to handle longer sequences of text, including punctuation, numbers (12345), and special symbols like ©, ™, and ∞.!!!!!!!!!!!!!!!!!!!!!! The detective is a woman named
+Write a short story about a detective who solves crimes using AI.! The detective is a woman named
+Describe a future where gravity stops working for 24 hours.! The story should be told from the
+Write a letter from a cat to its human explaining why it knocks things over.! The cat is
+Invent a new holiday and explain how it’s celebrated.!**"
+
+**Answer**:  
+**
+Write a poem in the style of Shakespeare about pizza.! The poem should be 4 lines long
+Create a backstory for a superhero whose only power is baking bread.! The superhero is named "
+Write a scene where two strangers accidentally swap phones.! The scene should be set in a bustling city
+
+elapsed time(s): 7.396000, achieved throughput TPS (tok/s): 48.269335
+
+finish elapsed time(s): 0.002000
