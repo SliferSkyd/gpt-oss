@@ -2,6 +2,7 @@
 #include <hip/hip_bf16.h>
 #include <rocwmma/rocwmma.hpp>
 #include "../config.hpp"
+#include "../memory/mxfp4.hpp"
 
 __global__ void matmul_kernel(float *output, const float *input, const __hip_bfloat16 *weight,
                               int batch_size, int input_dim, int output_dim)
@@ -284,4 +285,138 @@ void matmul(
         gemm_wmma_bf16_kernel,
         grid, block, shmem_bytes, stream,
         output, input, weight, M, K, N);
+}
+
+
+__global__ void gemm_wmma_uint8_kernel(
+    float* __restrict__ C,                     // [M, N]
+    const float* __restrict__ A,               // [M, K] (FP32)
+    const uint8_t* __restrict__ W,      // [N, K] row-major (== [O, I])
+    const float* __restrict__ weight_scales, // [N / 32] (per 32 output channels)
+    int M, int K, int N, size_t total_weight_elements)
+{
+    using namespace rocwmma;
+
+    // Block origin
+    const int m0 = blockIdx.y * BLOCK_M;
+    const int n0 = blockIdx.x * BLOCK_N;
+
+    // Wave & lane ids
+    const int lane = threadIdx.x;              // 0..63
+    const int wave = threadIdx.y;              // 0..(WAVES_PER_BLOCK-1)
+    const int wave_m = wave / WAVES_N;         // 0..(WAVES_M-1)
+    const int wave_n = wave % WAVES_N;         // 0..(WAVES_N-1)
+
+    // LDS layout:
+    // sA: [BLOCK_M, BLOCK_K] row-major -> ldA = BLOCK_K
+    // sB: [BLOCK_K, BLOCK_N] col-major -> ldB = BLOCK_K (so columns are contiguous for WMMA col_major)
+    extern __shared__ uint8_t smemRaw[];
+    auto* sA = reinterpret_cast<rocwmma::bfloat16_t*>(smemRaw);
+    auto* sB = reinterpret_cast<rocwmma::bfloat16_t*>(sA + (BLOCK_M * BLOCK_K));
+
+    // Optional per-wave scratch to mask ragged stores (only used at edges)
+    auto* sC = reinterpret_cast<float*>(sB + (BLOCK_K * BLOCK_N));  // size: WAVES_PER_BLOCK * WM * WN
+
+    // Accumulator fragment for this wave's 16x16 tile
+    fragment<accumulator, WM, WN, WK, float> cFrag;
+    fill_fragment(cFrag, 0.0f);
+
+    // Iterate over K in BLOCK_K(=16) steps
+    for (int k0 = 0; k0 < K; k0 += BLOCK_K) {
+
+        // --- Cooperative load of A tile [BLOCK_M x BLOCK_K], FP32->BF16 (row-major) ---
+        // Use all threads in the block
+        const int threadsPerBlock = blockDim.x * blockDim.y; // 64 * WAVES_PER_BLOCK
+        int linearT = wave * blockDim.x + lane;              // 0..(threadsPerBlock-1)
+        for (int idx = linearT; idx < BLOCK_M * BLOCK_K; idx += threadsPerBlock) {
+            int r = idx / BLOCK_K;           // 0..BLOCK_M-1
+            int c = idx % BLOCK_K;           // 0..BLOCK_K-1
+            int gm = m0 + r;
+            int gk = k0 + c;
+            float a = (gm < M && gk < K) ? A[(size_t)gm * K + gk] : 0.0f;
+            sA[r * BLOCK_K + c] = f32_to_bf16_rn(a);
+        }
+
+        // --- Cooperative load of B tile as col-major in LDS: [BLOCK_K x BLOCK_N] ---
+        for (int idx = linearT; idx < BLOCK_K * BLOCK_N; idx += threadsPerBlock) {
+            int c = idx / BLOCK_K;           // 0..BLOCK_N-1 (column index)
+            int r = idx % BLOCK_K;           // 0..BLOCK_K-1 (row index == k)
+            int gn = n0 + c;
+            int gk = k0 + r;
+            float wb = (gk < K && gn < N) ? dequantize_mxfp4(W, weight_scales, (size_t)gn * K + gk, total_weight_elements) : 0.0f;
+            // store col-major: element(r,c) at c*ld + r, with ld = BLOCK_K
+            sB[c * BLOCK_K + r] = f32_to_bf16_rn(wb);
+        }
+
+        __syncthreads();
+
+        // --- Load A/B WMMA fragments for this wave's 16x16 subtile and MMA ---
+        fragment<matrix_a, WM, WN, WK, bfloat16_t, row_major> aFrag;
+        fragment<matrix_b, WM, WN, WK, bfloat16_t, col_major> bFrag;
+
+        // Wave's local offset inside the block tiles
+        const int aRow = wave_m * WM;           // start row in sA
+        const int bCol = wave_n * WN;           // start col in sB
+
+        // Leading dimensions
+        const int ldA = BLOCK_K;                // row-major A in LDS
+        const int ldB = BLOCK_K;                // col-major B in LDS
+
+        // Each K-slice is entire fragment depth WK
+        load_matrix_sync(aFrag, sA + aRow * ldA, ldA);
+        load_matrix_sync(bFrag, sB + bCol * ldB, ldB);
+
+        mma_sync(cFrag, aFrag, bFrag, cFrag);
+
+        __syncthreads();
+    }
+
+    // --- Masked store: write to LDS scratch per-wave, then guarded global write ---
+    // Per-wave scratch base
+    float* sCbase = sC + wave * (WM * WN);
+    // Store 16x16 to LDS (row-major, ld = WN)
+    store_matrix_sync(sCbase, cFrag, WN, mem_row_major);
+    __syncthreads();
+
+    // Each lane writes several elements with bounds checks
+    const int c_m0 = m0 + wave_m * WM;
+    const int c_n0 = n0 + wave_n * WN;
+    for (int t = lane; t < WM * WN; t += LANE_PER_WAVE) {
+        int r = t / WN;
+        int c = t % WN;
+        int gm = c_m0 + r;
+        int gn = c_n0 + c;
+        if (gm < M && gn < N) {
+            C[(size_t)gm * N + gn] = sCbase[r * WN + c];
+        }
+    }
+}
+
+
+// Host wrapper for MXFP4 matmul
+void matmul_mxfp4(
+    float* __restrict__ output,
+    const float* __restrict__ input,
+    const uint8_t* __restrict__ weight_packed,
+    const float* __restrict__ weight_scales,
+    int batch_size, int input_dim, int output_dim,
+    size_t total_weight_elements,
+    hipStream_t stream = nullptr)
+{
+    const int M = batch_size, K = input_dim, N = output_dim;
+
+    // Grid tiles the output into 64x64 blocks
+    dim3 grid((N + BLOCK_N - 1) / BLOCK_N, (M + BLOCK_M - 1) / BLOCK_M);
+    // 64 lanes x 16 waves = 1024 threads per block
+    dim3 block(LANE_PER_WAVE, WAVES_PER_BLOCK);
+
+    // LDS: sA(BLOCK_M*BLOCK_K) + sB(BLOCK_K*BLOCK_N) + sC(WAVES_PER_BLOCK*WM*WN)
+    size_t shmem_bytes =
+        (size_t)(BLOCK_M * BLOCK_K + BLOCK_K * BLOCK_N) * sizeof(rocwmma::bfloat16_t) +
+        (size_t)(WAVES_PER_BLOCK * WM * WN) * sizeof(float);
+
+    hipLaunchKernelGGL(
+        gemm_wmma_uint8_kernel,
+        grid, block, shmem_bytes, stream,
+        output, input, weight_packed, weight_scales, M, K, N, total_weight_elements);
 }
