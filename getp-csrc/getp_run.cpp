@@ -361,6 +361,47 @@ __global__ void softmax_kernel(float *x, int batch_size, int size)
     }
 }
 
+__global__ void matmul_kernel(float *output, const float *input, const __hip_bfloat16 *weight,
+                              int batch_size, int input_dim, int output_dim)
+{
+    int batch_idx = blockIdx.x;
+    int out_idx = blockIdx.y * blockDim.y + threadIdx.y;
+    int tid = threadIdx.x;
+
+    if (batch_idx >= batch_size || out_idx >= output_dim)
+        return;
+
+    const float *x = input + batch_idx * input_dim;
+    float *out = output + batch_idx * output_dim;
+
+    __shared__ float shared_val[THREADS_PER_BLOCK];
+
+    float val = 0.0f;
+    for (int i = tid; i < input_dim; i += blockDim.x)
+    {
+        // Convert bfloat16 weight to fp32 on-the-fly
+        float weight_fp32 = __bfloat162float(weight[out_idx * input_dim + i]);
+        val += weight_fp32 * x[i];
+    }
+    shared_val[tid] = val;
+    __syncthreads();
+
+    // Reduction
+    for (int stride = blockDim.x / 2; stride > 0; stride /= 2)
+    {
+        if (tid < stride)
+        {
+            shared_val[tid] += shared_val[tid + stride];
+        }
+        __syncthreads();
+    }
+
+    if (tid == 0)
+    {
+        out[out_idx] = shared_val[0];
+    }
+}
+
 __global__ void accumulate_kernel(float *a, const float *b, float factor,
                                   int batch_size, int size)
 {
@@ -614,6 +655,90 @@ __global__ void copy_embeddings_kernel(float *output, const __hip_bfloat16 *embe
     // Convert bfloat16 embedding to fp32 on-the-fly
     float embedding_fp32 = __bfloat162float(embeddings[token * hidden_dim + dim_idx]);
     output[idx] = embedding_fp32;
+}
+
+// Add bounds checking to matmul kernel
+__global__ void matmul_kernel_safe(float *output, const float *input, const __hip_bfloat16 *weight,
+                                   int batch_size, int input_dim, int output_dim)
+{
+    int batch_idx = blockIdx.x;
+    int out_idx = blockIdx.y * blockDim.y + threadIdx.y;
+    int tid = threadIdx.x;
+
+    if (batch_idx >= batch_size || out_idx >= output_dim)
+        return;
+
+    const float *x = input + batch_idx * input_dim;
+    float *out = output + batch_idx * output_dim;
+
+    __shared__ float shared_val[THREADS_PER_BLOCK];
+
+    float val = 0.0f;
+    for (int i = tid; i < input_dim; i += blockDim.x)
+    {
+        // Convert bfloat16 weight to fp32 on-the-fly
+        float weight_fp32 = __bfloat162float(weight[out_idx * input_dim + i]);
+        val += weight_fp32 * x[i];
+    }
+
+    if (tid < THREADS_PER_BLOCK)
+    {
+        shared_val[tid] = val;
+    }
+    __syncthreads();
+
+    // Reduction with bounds checking
+    for (int stride = min(blockDim.x, THREADS_PER_BLOCK) / 2; stride > 0; stride /= 2)
+    {
+        if (tid < stride && tid + stride < THREADS_PER_BLOCK)
+        {
+            shared_val[tid] += shared_val[tid + stride];
+        }
+        __syncthreads();
+    }
+
+    if (tid == 0)
+    {
+        out[out_idx] = shared_val[0];
+    }
+}
+
+__global__ void matmul_kernel_simple(float *output, const float *input, const __hip_bfloat16 *weight,
+                                     int batch_size, int input_dim, int output_dim)
+{
+    // Each thread will compute one element in the output matrix.
+    // blockIdx.x maps to the batch dimension.
+    // The combination of blockIdx.y, blockDim.y, and threadIdx.y maps to the output dimension.
+    int batch_idx = blockIdx.x;
+    int out_idx = blockIdx.y * blockDim.y + threadIdx.y;
+
+    // Bounds check: Ensure we are not writing out of bounds.
+    if (batch_idx >= batch_size || out_idx >= output_dim)
+    {
+        return;
+    }
+
+    // Initialize accumulator for this thread's output value.
+    float sum = 0.0f;
+
+    // Get a pointer to the start of the correct input vector for this batch.
+    const float *x_b = input + batch_idx * input_dim;
+
+    // Get a pointer to the start of the correct weight matrix row for this output.
+    const __hip_bfloat16 *w_row = weight + out_idx * input_dim;
+
+    // --- Core Logic (Same as CPU) ---
+    // This single thread performs the entire dot product.
+    for (int j = 0; j < input_dim; j++)
+    {
+        // Convert bfloat16 weight to fp32 on-the-fly
+        float weight_fp32 = __bfloat162float(w_row[j]);
+        sum += weight_fp32 * x_b[j];
+    }
+    // ---------------------------------
+
+    // Write the final result to the correct position in the output matrix.
+    output[batch_idx * output_dim + out_idx] = sum;
 }
 
 #include <rocwmma/rocwmma.hpp>

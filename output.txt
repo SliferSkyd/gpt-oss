@@ -19,31 +19,27 @@ Allocating GPU memory: batch_size=72, hidden_dim=2880, seq_len=2048
 KV cache size per batch: 6912 MB
 Weight conversion and copying completed successfully
 
-warm up elapsed time(s): 17.685000
-Hello! I am a large language model trained by OpenAI. I am not a real person,
-Hello world! This is a test. Hello again, world."
-
-We need to count words. Words
+warm up elapsed time(s): 158.475000
+Hello! I am a language model trained by OpenAI. I am not a real person, but
+Hello world! This is a test of the text-to-speech system. Let's see how it handles
 Write a short haiku about the ocean.!?"
 
-Waves whisper secrets,  
-Salt air
+Waves whisper secrets,
+Salt air kisses
 ฉันรักทะเล! ฉันอยากไปเที่ยวทะเล"
 
-"I love the sea
+"ฉันรัก
 naïve façade — déjà vu!".
 
-But we need to ensure we didn't inadvertently use any dis
-🍣 sushi and 🍜 ramen! #JapaneseFood #Foodie"
-
-**User 2**
+But we need to check if we used any word that
+🍣 sushi and 🍜 ramen! 🍱🍣🍜🍱🍣🍜
 email: test@example.com!password: 12345678!confirmPassword: 12345678
-newlines:!@#$%^&*()_+[]{}|;':,./<>
+newlines:! 1 2 3 4 5 6 7 8
 line2!": 1
 
-"line3": 1
+"line3!": 1
 
-"line4": 1
+"line4!":
 line3!": 1
 
 "line4!": 1
@@ -52,63 +48,59 @@ line3!": 1
 tabs	and	spaces!		"
 ```
 
-**Output:**
+**Explanation:**
 
-```
-"tabs and spaces
-JSON: {"a": 1, "b": [2,3,4]}! "
-混ぜるな危険! 3Dプリントで作る危険な物体
+- The first line contains a
+JSON: {"a": 1, "b": [2,3,4]}!"),
+
+混ぜるな危険! 1.5%の混合物は、混合
 The quick brown fox jumps over the lazy dog.!@#$%^&*()_+[]
-1234567890!@#$%^&*()_+[]{}|;':,./
+1234567890!@#$%^&*()_+[]{}|;:,.<>
 !@#$%^&*()_+-=[]{}|;:',.<>/?!@#$
-你好，世界! 你好, 世界! 你好，世界! 你好，世界! 
+你好，世界! 你好, 世界! 你好, 世界! 你好, 世界! 
 Привет, мир! Это тестовый файл для проверки работы программы. Он содержит несколько строк текста,
-مرحبا بالعالم! هذا هو النص الذي تريد طباعته في ملف PDF."
+مرحبا بالعالم! هذا هو نص باللغة العربية."
 ```
 
-###
+### 2. Using `p
 こんにちは世界! こんにちは世界! こんにちは世界! こんにちは世界! こんにちは世界! 
 ¿Cómo estás?!".
 
-But the user wrote "¿Cómo estás?!" with exclamation at the
+But we need to check if the phrase "¿Cómo estás?" is considered
 L'été arrive bientôt.! 1. 2. 3. 4. 5
 “Smart quotes” and ‘single quotes’ test.!@#$%^&*()_+
 Emoji test: 😀😂👍🏽🔥💯! 1️⃣2️⃣3️⃣4
 Long prompt: This is a long prompt to test the tokenizer's ability to handle longer sequences of text, including punctuation, numbers (12345), and special symbols like ©, ™, and ∞.!!!!!!!!!!!!!!!!!!!!!! The detective is a woman named
 Write a short story about a detective who solves crimes using AI.! The detective is a woman named
-Describe a future where gravity stops working for 24 hours.! 1. The world is in
-Write a letter from a cat to its human explaining why it knocks things over.! The cat is
+Describe a future where gravity stops working for 24 hours.! The world is a chaotic, but
+Write a letter from a cat to its human explaining why it knocks things over.! Write a letter
 Invent a new holiday and explain how it’s celebrated.!**"
 
 **Answer**:  
 **
-Write a poem in the style of Shakespeare about pizza.! The poem should be 4 lines long
-Create a backstory for a superhero whose only power is baking bread.! The superhero is named "
-Write a scene where two strangers accidentally swap phones.! The scene should be set in a bustling city
-Hello! I am a large language model trained by OpenAI. I am not a real person,
-Hello world! This is a test. Hello again, world."
-
-We need to count words. Words
+Write a poem in the style of Shakespeare about pizza.! The poem should be in the form of
+Create a backstory for a superhero whose only power is baking bread.! The superhero is named '
+Write a scene where two strangers accidentally swap phones.! The scene should be in a comedic tone,
+Hello! I am a language model trained by OpenAI. I am not a real person, but
+Hello world! This is a test of the text-to-speech system. Let's see how it handles
 Write a short haiku about the ocean.!?"
 
-Waves whisper secrets,  
-Salt air
+Waves whisper secrets,
+Salt air kisses
 ฉันรักทะเล! ฉันอยากไปเที่ยวทะเล"
 
-"I love the sea
+"ฉันรัก
 naïve façade — déjà vu!".
 
-But we need to ensure we didn't inadvertently use any dis
-🍣 sushi and 🍜 ramen! #JapaneseFood #Foodie"
-
-**User 2**
+But we need to check if we used any word that
+🍣 sushi and 🍜 ramen! 🍱🍣🍜🍱🍣🍜
 email: test@example.com!password: 12345678!confirmPassword: 12345678
-newlines:!@#$%^&*()_+[]{}|;':,./<>
+newlines:! 1 2 3 4 5 6 7 8
 line2!": 1
 
-"line3": 1
+"line3!": 1
 
-"line4": 1
+"line4!":
 line3!": 1
 
 "line4!": 1
@@ -117,59 +109,55 @@ line3!": 1
 tabs	and	spaces!		"
 ```
 
-**Output:**
+**Explanation:**
 
-```
-"tabs and spaces
-JSON: {"a": 1, "b": [2,3,4]}! "
-混ぜるな危険! 3Dプリントで作る危険な物体
+- The first line contains a
+JSON: {"a": 1, "b": [2,3,4]}!"),
+
+混ぜるな危険! 1.5%の混合物は、混合
 The quick brown fox jumps over the lazy dog.!@#$%^&*()_+[]
-1234567890!@#$%^&*()_+[]{}|;':,./
+1234567890!@#$%^&*()_+[]{}|;:,.<>
 !@#$%^&*()_+-=[]{}|;:',.<>/?!@#$
-你好，世界! 你好, 世界! 你好，世界! 你好，世界! 
+你好，世界! 你好, 世界! 你好, 世界! 你好, 世界! 
 Привет, мир! Это тестовый файл для проверки работы программы. Он содержит несколько строк текста,
-مرحبا بالعالم! هذا هو النص الذي تريد طباعته في ملف PDF."
+مرحبا بالعالم! هذا هو نص باللغة العربية."
 ```
 
-###
+### 2. Using `p
 こんにちは世界! こんにちは世界! こんにちは世界! こんにちは世界! こんにちは世界! 
 ¿Cómo estás?!".
 
-But the user wrote "¿Cómo estás?!" with exclamation at the
+But we need to check if the phrase "¿Cómo estás?" is considered
 L'été arrive bientôt.! 1. 2. 3. 4. 5
 “Smart quotes” and ‘single quotes’ test.!@#$%^&*()_+
 Emoji test: 😀😂👍🏽🔥💯! 1️⃣2️⃣3️⃣4
 Long prompt: This is a long prompt to test the tokenizer's ability to handle longer sequences of text, including punctuation, numbers (12345), and special symbols like ©, ™, and ∞.!!!!!!!!!!!!!!!!!!!!!! The detective is a woman named
 Write a short story about a detective who solves crimes using AI.! The detective is a woman named
-Describe a future where gravity stops working for 24 hours.! 1. The world is in
-Write a letter from a cat to its human explaining why it knocks things over.! The cat is
+Describe a future where gravity stops working for 24 hours.! The world is a chaotic, but
+Write a letter from a cat to its human explaining why it knocks things over.! Write a letter
 Invent a new holiday and explain how it’s celebrated.!**"
 
 **Answer**:  
 **
-Write a poem in the style of Shakespeare about pizza.! The poem should be 4 lines long
-Create a backstory for a superhero whose only power is baking bread.! The superhero is named "
-Write a scene where two strangers accidentally swap phones.! The scene should be set in a bustling city
-Hello! I am a large language model trained by OpenAI. I am not a real person,
-Hello world! This is a test. Hello again, world."
-
-We need to count words. Words
+Write a poem in the style of Shakespeare about pizza.! The poem should be in the form of
+Create a backstory for a superhero whose only power is baking bread.! The superhero is named '
+Write a scene where two strangers accidentally swap phones.! The scene should be in a comedic tone,
+Hello! I am a language model trained by OpenAI. I am not a real person, but
+Hello world! This is a test of the text-to-speech system. Let's see how it handles
 Write a short haiku about the ocean.!?"
 
-Waves whisper secrets,  
-Salt air
+Waves whisper secrets,
+Salt air kisses
 ฉันรักทะเล! ฉันอยากไปเที่ยวทะเล"
 
-"I love the sea
+"ฉันรัก
 naïve façade — déjà vu!".
 
-But we need to ensure we didn't inadvertently use any dis
-🍣 sushi and 🍜 ramen! #JapaneseFood #Foodie"
-
-**User 2**
+But we need to check if we used any word that
+🍣 sushi and 🍜 ramen! 🍱🍣🍜🍱🍣🍜
 email: test@example.com!password: 12345678!confirmPassword: 12345678
-newlines:!@#$%^&*()_+[]{}|;':,./<>
+newlines:! 1 2 3 4 5 6 7 8
 
-elapsed time(s): 8.144000, achieved throughput TPS (tok/s): 101.547151
+elapsed time(s): 8.656000, achieved throughput TPS (tok/s): 95.540665
 
 finish elapsed time(s): 0.002000
