@@ -21,6 +21,7 @@
 #include "kernels/moe.hpp"
 #include "kernels/swiglu.hpp"
 #include "kernels/rope.hpp"
+#include "memory/mxfp4.hpp"
 
 
 #ifndef GETP_RUN
@@ -49,12 +50,11 @@ typedef struct {
   __hip_bfloat16 *w_router;   // (n_layers, hidden_dim, n_experts)
   __hip_bfloat16 *b_router;   // (n_layers, n_experts)
   
-  // MoE MLP weights
-  __hip_bfloat16 *w_mlp1;     // (n_layers, n_experts, 2 * intermediate_dim, hidden_dim)
-  __hip_bfloat16 *b_mlp1;     // (n_layers, n_experts, 2 * intermediate_dim)
-  __hip_bfloat16 *w_mlp2;     // (n_layers, n_experts, hidden_dim, intermediate_dim)
-  __hip_bfloat16 *b_mlp2;     // (n_layers, n_experts, hidden_dim)
-  
+  // MoE weights now use MXFP4 quantization
+  uint8_t *w_mlp1_mxfp4, *w_mlp2_mxfp4;  // Packed MXFP4 indices
+  float *w_mlp1_scales, *w_mlp2_scales;   // MXFP4 block scales
+  __hip_bfloat16 *b_mlp1, *b_mlp2;        // Biases remain in bfloat16
+  __hip_bfloat16 *out_w;
   // Output weights
   __hip_bfloat16 *out;        // (vocab_size, hidden_dim)
 } GPUTransformerWeights;
@@ -245,12 +245,19 @@ void malloc_gpu_weights(GPUTransformerWeights *w, Config *p)
     HIP_CHECK(hipMalloc((void **)&w->w_router, p->n_layers * p->hidden_dim * p->n_experts * sizeof(__hip_bfloat16)));
     HIP_CHECK(hipMalloc((void **)&w->b_router, p->n_layers * p->n_experts * sizeof(__hip_bfloat16)));
 
-    int mlp1_size = p->n_layers * p->n_experts * (2 * p->intermediate_dim) * p->hidden_dim;
-    HIP_CHECK(hipMalloc((void **)&w->w_mlp1, mlp1_size * sizeof(__hip_bfloat16)));
+     // MoE weights allocation with MXFP4 quantization
+    size_t mlp1_size = p->n_layers * p->n_experts * (2 * p->intermediate_dim) * p->hidden_dim;
+    size_t mlp1_packed_size = (mlp1_size + 1) / 2;  // 2 FP4 values per byte
+    size_t mlp1_num_blocks = (mlp1_size + MXFP4_BLOCK_SIZE - 1) / MXFP4_BLOCK_SIZE;
+    HIP_CHECK(hipMalloc((void **)&w->w_mlp1_mxfp4, mlp1_packed_size));
+    HIP_CHECK(hipMalloc((void **)&w->w_mlp1_scales, mlp1_num_blocks * sizeof(float)));
     HIP_CHECK(hipMalloc((void **)&w->b_mlp1, p->n_layers * p->n_experts * (2 * p->intermediate_dim) * sizeof(__hip_bfloat16)));
 
-    int mlp2_size = p->n_layers * p->n_experts * p->hidden_dim * p->intermediate_dim;
-    HIP_CHECK(hipMalloc((void **)&w->w_mlp2, mlp2_size * sizeof(__hip_bfloat16)));
+    size_t mlp2_size = p->n_layers * p->n_experts * p->hidden_dim * p->intermediate_dim;
+    size_t mlp2_packed_size = (mlp2_size + 1) / 2;  // 2 FP4 values per byte
+    size_t mlp2_num_blocks = (mlp2_size + MXFP4_BLOCK_SIZE - 1) / MXFP4_BLOCK_SIZE;
+    HIP_CHECK(hipMalloc((void **)&w->w_mlp2_mxfp4, mlp2_packed_size));
+    HIP_CHECK(hipMalloc((void **)&w->w_mlp2_scales, mlp2_num_blocks * sizeof(float)));
     HIP_CHECK(hipMalloc((void **)&w->b_mlp2, p->n_layers * p->n_experts * p->hidden_dim * sizeof(__hip_bfloat16)));
 
     HIP_CHECK(hipMalloc((void **)&w->out, p->hidden_dim * p->vocab_size * sizeof(__hip_bfloat16)));
@@ -334,10 +341,12 @@ void copy_weights_to_gpu(Transformer *transformer, GPUTransformerWeights *gpu_we
     free(h_b_router_bf16);
 
     size_t mlp1_size = p->n_layers * p->n_experts * (2 * p->intermediate_dim) * p->hidden_dim;
-    __hip_bfloat16 *h_w_mlp1_bf16 = (__hip_bfloat16 *)malloc(mlp1_size * sizeof(__hip_bfloat16));
-    convert_float_array_to_bfloat16(w->w_mlp1, h_w_mlp1_bf16, mlp1_size);
-    HIP_CHECK(hipMemcpy(gpu_weights->w_mlp1, h_w_mlp1_bf16, mlp1_size * sizeof(__hip_bfloat16), hipMemcpyHostToDevice));
-    free(h_w_mlp1_bf16);
+    MXFP4Weights mlp1_mxfp4;
+    quantize_to_mxfp4(w->w_mlp1, mlp1_mxfp4, mlp1_size);
+    size_t mlp1_packed_size = (mlp1_size + 1) / 2;
+    HIP_CHECK(hipMemcpy(gpu_weights->w_mlp1_mxfp4, mlp1_mxfp4.packed_values, mlp1_packed_size, hipMemcpyHostToDevice));
+    HIP_CHECK(hipMemcpy(gpu_weights->w_mlp1_scales, mlp1_mxfp4.scales, mlp1_mxfp4.num_blocks * sizeof(float), hipMemcpyHostToDevice));
+    free_mxfp4_weights(mlp1_mxfp4);
 
     size_t b_mlp1_size = p->n_layers * p->n_experts * (2 * p->intermediate_dim);
     __hip_bfloat16 *h_b_mlp1_bf16 = (__hip_bfloat16 *)malloc(b_mlp1_size * sizeof(__hip_bfloat16));
@@ -346,10 +355,12 @@ void copy_weights_to_gpu(Transformer *transformer, GPUTransformerWeights *gpu_we
     free(h_b_mlp1_bf16);
 
     size_t mlp2_size = p->n_layers * p->n_experts * p->hidden_dim * p->intermediate_dim;
-    __hip_bfloat16 *h_w_mlp2_bf16 = (__hip_bfloat16 *)malloc(mlp2_size * sizeof(__hip_bfloat16));
-    convert_float_array_to_bfloat16(w->w_mlp2, h_w_mlp2_bf16, mlp2_size);
-    HIP_CHECK(hipMemcpy(gpu_weights->w_mlp2, h_w_mlp2_bf16, mlp2_size * sizeof(__hip_bfloat16), hipMemcpyHostToDevice));
-    free(h_w_mlp2_bf16);
+    MXFP4Weights mlp2_mxfp4;
+    quantize_to_mxfp4(w->w_mlp2, mlp2_mxfp4, mlp2_size);
+    size_t mlp2_packed_size = (mlp2_size + 1) / 2;
+    HIP_CHECK(hipMemcpy(gpu_weights->w_mlp2_mxfp4, mlp2_mxfp4.packed_values, mlp2_packed_size, hipMemcpyHostToDevice));
+    HIP_CHECK(hipMemcpy(gpu_weights->w_mlp2_scales, mlp2_mxfp4.scales, mlp2_mxfp4.num_blocks * sizeof(float), hipMemcpyHostToDevice));
+    free_mxfp4_weights(mlp2_mxfp4);
 
     size_t b_mlp2_size = p->n_layers * p->n_experts * p->hidden_dim;
     __hip_bfloat16 *h_b_mlp2_bf16 = (__hip_bfloat16 *)malloc(b_mlp2_size * sizeof(__hip_bfloat16));
@@ -441,9 +452,11 @@ void free_gpu_weights(GPUTransformerWeights *w)
     if (w->attn_sinks) HIP_CHECK(hipFree(w->attn_sinks));
     if (w->w_router) HIP_CHECK(hipFree(w->w_router));
     if (w->b_router) HIP_CHECK(hipFree(w->b_router));
-    if (w->w_mlp1) HIP_CHECK(hipFree(w->w_mlp1));
+    if (w->w_mlp1_mxfp4) HIP_CHECK(hipFree(w->w_mlp1_mxfp4));
+    if (w->w_mlp1_scales) HIP_CHECK(hipFree(w->w_mlp1_scales));
     if (w->b_mlp1) HIP_CHECK(hipFree(w->b_mlp1));
-    if (w->w_mlp2) HIP_CHECK(hipFree(w->w_mlp2));
+    if (w->w_mlp2_mxfp4) HIP_CHECK(hipFree(w->w_mlp2_mxfp4));
+    if (w->w_mlp2_scales) HIP_CHECK(hipFree(w->w_mlp2_scales));
     if (w->b_mlp2) HIP_CHECK(hipFree(w->b_mlp2));
     if (w->out) HIP_CHECK(hipFree(w->out));
 }
@@ -837,10 +850,18 @@ void moe_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size)
 
         // MLP1 (Gate/Up projections)
         {
-            TIME_SCOPE(matmul_kernel_simple_timer);
-            matmul(mlp1_out_ptr, expert_input_ptr,
-                   w->w_mlp1 + (layer_idx * n_experts + expert_id) * (2 * intermediate_dim) * hidden_dim,
-                   h_batch_count, hidden_dim, 2 * intermediate_dim);
+           TIME_SCOPE(matmul_kernel_simple_timer);
+            // Calculate offset for this expert's MXFP4 weights
+            size_t expert_offset = (layer_idx * n_experts + expert_id) * (2 * intermediate_dim) * hidden_dim;
+            size_t expert_packed_offset = expert_offset / 2;  // 2 FP4 values per byte
+            size_t expert_scale_offset = expert_offset / MXFP4_BLOCK_SIZE;
+            size_t total_elements = (2 * intermediate_dim) * hidden_dim;
+            
+            matmul_mxfp4(mlp1_out_ptr, expert_input_ptr,
+                        w->w_mlp1_mxfp4 + expert_packed_offset,
+                        w->w_mlp1_scales + expert_scale_offset,
+                        h_batch_count, hidden_dim, 2 * intermediate_dim,
+                        total_elements);
         }
 
         // Split, add bias, and apply SwiGLU
@@ -858,10 +879,18 @@ void moe_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size)
 
         // MLP2 (Down projection)
         {
-            TIME_SCOPE(matmul_kernel_simple_timer);
-            matmul(expert_output_ptr, gate_up_ptr,
-                   w->w_mlp2 + (layer_idx * n_experts + expert_id) * hidden_dim * intermediate_dim,
-                   h_batch_count, intermediate_dim, hidden_dim);
+             TIME_SCOPE(matmul_kernel_simple_timer);
+            // Calculate offset for this expert's MXFP4 weights
+            size_t expert_offset_mlp2 = (layer_idx * n_experts + expert_id) * hidden_dim * intermediate_dim;
+            size_t expert_packed_offset_mlp2 = expert_offset_mlp2 / 2;  // 2 FP4 values per byte
+            size_t expert_scale_offset_mlp2 = expert_offset_mlp2 / MXFP4_BLOCK_SIZE;
+            size_t total_elements_mlp2 = hidden_dim * intermediate_dim;
+            
+            matmul_mxfp4(expert_output_ptr, gate_up_ptr,
+                        w->w_mlp2_mxfp4 + expert_packed_offset_mlp2,
+                        w->w_mlp2_scales + expert_scale_offset_mlp2,
+                        h_batch_count, intermediate_dim, hidden_dim,
+                        total_elements_mlp2);
         }
 
         // Add MLP2 bias
