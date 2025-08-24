@@ -13,79 +13,1278 @@ rope theta: 150000.000000
 rope_scaling_factor: 32.000000
 sliding window: 128
 swiglu_limit: 7.000000
-requests size = 172032 B
-Num requests: 32
-Allocating GPU memory: batch_size=32, hidden_dim=2880, seq_len=2048
-KV cache size per batch: 3072 MB
+requests size = 2752512 B
+Num requests: 512
+Allocating GPU memory: batch_size=512, hidden_dim=2880, seq_len=2048
+KV cache size per batch (BF16): 24576 MB (50% reduction from FP32)
 Weight conversion and copying completed successfully
 
-warm up elapsed time(s): 59.384000
-Hello! I am a large language model trained by OpenAI. I am not a real person,
-Hello world! This is a test. Hello again, world."
+warm up elapsed time(s): 159.115000
+Hello!, World!".
 
-We need to count words. Words
-Write a short haiku about the ocean.!?"
+Answer:
 
-Waves whisper secrets,  
-Salt air
-ฉันรักทะเล! ฉันอยากไปเที่ยวทะเล"
+```java
+import org.springframework.web.bind.annotation.GetMapping;
+import org!! This is a test. This test is only a test. Hello again. This is a
+Hello world!! This is a test. This test is only a test. Hello again. This is a
+Write a short haiku about the ocean.!
 
-"I love the sea
-naïve façade — déjà vu!".
+Waves whisper to shore,  
+Salt air kisses the
+ฉันรักทะเล!และความเป็นมิตรของพวกเขา
 
-But we need to ensure we didn't inadvertently use any dis
-🍣 sushi and 🍜 ramen! #JapaneseFood #Foodie"
+**คำแนะนำ**
+naïve façade — déjà vu!" (2008) and "The Last of the Mohicans"
+🍣 sushi and 🍜 ramen!. The city is a blend of tradition and modernity, with a
+email: test@example.com!, password: password123, confirmPassword: password123, name: John Doe
+newlines:! 1, 2, 3, 4, 5, 6,
+line2! = "This is a test line."
+line3 = "This is a test line."
+line
+line3!: "1 2 3 4 5 6 7 8 9
+tabs	and	spaces!		// 1 tab, 2 spaces
+		// 1 tab
+JSON: {"a": 1, "b": [2,3,4]}!.
 
-**User 2**
-email: test@example.com!password: 12345678!confirmPassword: 12345678
-newlines:!@#$%^&*()_+[]{}|;':,./<>
-line2!": 1
+We need
+混ぜるな危険!なことがあるんだよ。
 
-"line3": 1
-
-"line4": 1
-line3!": 1
-
-"line4!": 1
-
-"line5!":
-tabs	and	spaces!		"
+以下のように書き
+The quick brown fox jumps over the lazy dog.! The quick brown fox jumps over the lazy dog. The
+1234567890!abcdef1234567890abcdef12345678',
+        '0x123456789
+!@#$%^&*()_+-=[]{}|;:',.<>/?!`~"
+   
+你好，世界!！"
 ```
 
-**Output:**
+### 2. 使用 `iconv` 命令
 
-```
-"tabs and spaces
-JSON: {"a": 1, "b": [2,3,4]}! "
-混ぜるな危険! 3Dプリントで作る危険な物体
-The quick brown fox jumps over the lazy dog.!@#$%^&*()_+[]
-1234567890!@#$%^&*()_+[]{}|;':,./
-!@#$%^&*()_+-=[]{}|;:',.<>/?!@#$
-你好，世界! 你好, 世界! 你好，世界! 你好，世界! 
-Привет, мир! Это тестовый файл для проверки работы программы. Он содержит несколько строк текста,
-مرحبا بالعالم! هذا هو النص الذي تريد طباعته في ملف PDF."
-```
+如果
+Привет, мир!! Это тестовый текст для проверки функции подсчета слов. В этом тексте
+مرحبا بالعالم!! هذا هو النص الذي نريد تحويله إلى صوت. هل يمكنك مساعدتي؟
+こんにちは世界!！"
+    print(f"Original text: {original_text}")
+    encoded_text = encode_text
+¿Cómo estás?!
 
-###
-こんにちは世界! こんにちは世界! こんにちは世界! こんにちは世界! こんにちは世界! 
-¿Cómo estás?!".
+¡Hola! Soy un modelo de lenguaje entrenado por OpenAI, así que no
+L'été arrive bientôt.!
 
-But the user wrote "¿Cómo estás?!" with exclamation at the
-L'été arrive bientôt.! 1. 2. 3. 4. 5
-“Smart quotes” and ‘single quotes’ test.!@#$%^&*()_+
-Emoji test: 😀😂👍🏽🔥💯! 1️⃣2️⃣3️⃣4
-Long prompt: This is a long prompt to test the tokenizer's ability to handle longer sequences of text, including punctuation, numbers (12345), and special symbols like ©, ™, and ∞.!!!!!!!!!!!!!!!!!!!!!! The detective is a woman named
-Write a short story about a detective who solves crimes using AI.! The detective is a woman named
-Describe a future where gravity stops working for 24 hours.! The story should be told from the
-Write a letter from a cat to its human explaining why it knocks things over.! The cat is
-Invent a new holiday and explain how it’s celebrated.!**"
+Voici une version corrigée de votre texte :
 
-**Answer**:  
+"Bonjour, je suis un
+“Smart quotes” and ‘single quotes’ test.! The “Smart quotes” and ‘single quotes’
+Emoji test: 😀😂👍🏽🔥💯!
+
+Emoji test: 😎🤓🤠
+Long prompt: This is a long prompt to test the tokenizer's ability to handle longer sequences of text, including punctuation, numbers (12345), and special symbols like ©, ™, and ∞.!!!!!!!!!!!!!!!!!!!!!! The detective is a detective named "Detect
+Write a short story about a detective who solves crimes using AI.! The detective is a detective named "Detect
+Describe a future where gravity stops working for 24 hours.! What would happen? The answer: The world
+Write a letter from a cat to its human explaining why it knocks things over.!
+
+Dear Human,
+
+I
+Invent a new holiday and explain how it’s celebrated.!
+
+**Holiday Name:** **Harmony Day**
+
 **
-Write a poem in the style of Shakespeare about pizza.! The poem should be 4 lines long
-Create a backstory for a superhero whose only power is baking bread.! The superhero is named "
-Write a scene where two strangers accidentally swap phones.! The scene should be set in a bustling city
+Write a poem in the style of Shakespeare about pizza.!
 
-elapsed time(s): 7.396000, achieved throughput TPS (tok/s): 48.269335
+**Ode to the Divine Pizza**
 
-finish elapsed time(s): 0.002000
+**
+Create a backstory for a superhero whose only power is baking bread.! The superhero is a loaf of bread
+Write a scene where two strangers accidentally swap phones.! The scene is a bustling city, the city is a
+Hello!, World!".
+
+Answer:
+
+```java
+import org.springframework.web.bind.annotation.GetMapping;
+import org!! This is a test. This test is only a test. Hello again. This is a
+Hello world!! This is a test. This test is only a test. Hello again. This is a
+Write a short haiku about the ocean.!
+
+Waves whisper to shore,  
+Salt air kisses the
+ฉันรักทะเล!และความเป็นมิตรของพวกเขา
+
+**คำแนะนำ**
+naïve façade — déjà vu!" (2008) and "The Last of the Mohicans"
+🍣 sushi and 🍜 ramen!. The city is a blend of tradition and modernity, with a
+email: test@example.com!, password: password123, confirmPassword: password123, name: John Doe
+newlines:! 1, 2, 3, 4, 5, 6,
+line2! = "This is a test line."
+line3 = "This is a test line."
+line
+line3!: "1 2 3 4 5 6 7 8 9
+tabs	and	spaces!		// 1 tab, 2 spaces
+		// 1 tab
+JSON: {"a": 1, "b": [2,3,4]}!.
+
+We need
+混ぜるな危険!なことがあるんだよ。
+
+以下のように書き
+The quick brown fox jumps over the lazy dog.! The quick brown fox jumps over the lazy dog. The
+1234567890!abcdef1234567890abcdef12345678',
+        '0x123456789
+!@#$%^&*()_+-=[]{}|;:',.<>/?!`~"
+   
+你好，世界!！"
+```
+
+### 2. 使用 `iconv` 命令
+
+如果
+Привет, мир!! Это тестовый текст для проверки функции подсчета слов. В этом тексте
+مرحبا بالعالم!! هذا هو النص الذي نريد تحويله إلى صوت. هل يمكنك مساعدتي؟
+こんにちは世界!！"
+    print(f"Original text: {original_text}")
+    encoded_text = encode_text
+¿Cómo estás?!
+
+¡Hola! Soy un modelo de lenguaje entrenado por OpenAI, así que no
+L'été arrive bientôt.!
+
+Voici une version corrigée de votre texte :
+
+"Bonjour, je suis un
+“Smart quotes” and ‘single quotes’ test.! The “Smart quotes” and ‘single quotes’
+Emoji test: 😀😂👍🏽🔥💯!
+
+Emoji test: 😎🤓🤠
+Long prompt: This is a long prompt to test the tokenizer's ability to handle longer sequences of text, including punctuation, numbers (12345), and special symbols like ©, ™, and ∞.!!!!!!!!!!!!!!!!!!!!!! The detective is a detective named "Detect
+Write a short story about a detective who solves crimes using AI.! The detective is a detective named "Detect
+Describe a future where gravity stops working for 24 hours.! What would happen? The answer: The world
+Write a letter from a cat to its human explaining why it knocks things over.!
+
+Dear Human,
+
+I
+Invent a new holiday and explain how it’s celebrated.!
+
+**Holiday Name:** **Harmony Day**
+
+**
+Write a poem in the style of Shakespeare about pizza.!
+
+**Ode to the Divine Pizza**
+
+**
+Create a backstory for a superhero whose only power is baking bread.! The superhero is a loaf of bread
+Write a scene where two strangers accidentally swap phones.! The scene is a bustling city, the city is a
+Hello!, World!".
+
+Answer:
+
+```java
+import org.springframework.web.bind.annotation.GetMapping;
+import org!! This is a test. This test is only a test. Hello again. This is a
+Hello world!! This is a test. This test is only a test. Hello again. This is a
+Write a short haiku about the ocean.!
+
+Waves whisper to shore,  
+Salt air kisses the
+ฉันรักทะเล!และความเป็นมิตรของพวกเขา
+
+**คำแนะนำ**
+naïve façade — déjà vu!" (2008) and "The Last of the Mohicans"
+🍣 sushi and 🍜 ramen!. The city is a blend of tradition and modernity, with a
+email: test@example.com!, password: password123, confirmPassword: password123, name: John Doe
+newlines:! 1, 2, 3, 4, 5, 6,
+line2! = "This is a test line."
+line3 = "This is a test line."
+line
+line3!: "1 2 3 4 5 6 7 8 9
+tabs	and	spaces!		// 1 tab, 2 spaces
+		// 1 tab
+JSON: {"a": 1, "b": [2,3,4]}!.
+
+We need
+混ぜるな危険!なことがあるんだよ。
+
+以下のように書き
+The quick brown fox jumps over the lazy dog.! The quick brown fox jumps over the lazy dog. The
+1234567890!abcdef1234567890abcdef12345678',
+        '0x123456789
+!@#$%^&*()_+-=[]{}|;:',.<>/?!`~"
+   
+你好，世界!！"
+```
+
+### 2. 使用 `iconv` 命令
+
+如果
+Привет, мир!! Это тестовый текст для проверки функции подсчета слов. В этом тексте
+مرحبا بالعالم!! هذا هو النص الذي نريد تحويله إلى صوت. هل يمكنك مساعدتي؟
+こんにちは世界!！"
+    print(f"Original text: {original_text}")
+    encoded_text = encode_text
+¿Cómo estás?!
+
+¡Hola! Soy un modelo de lenguaje entrenado por OpenAI, así que no
+L'été arrive bientôt.!
+
+Voici une version corrigée de votre texte :
+
+"Bonjour, je suis un
+“Smart quotes” and ‘single quotes’ test.! The “Smart quotes” and ‘single quotes’
+Emoji test: 😀😂👍🏽🔥💯!
+
+Emoji test: 😎🤓🤠
+Long prompt: This is a long prompt to test the tokenizer's ability to handle longer sequences of text, including punctuation, numbers (12345), and special symbols like ©, ™, and ∞.!!!!!!!!!!!!!!!!!!!!!! The detective is a detective named "Detect
+Write a short story about a detective who solves crimes using AI.! The detective is a detective named "Detect
+Describe a future where gravity stops working for 24 hours.! What would happen? The answer: The world
+Write a letter from a cat to its human explaining why it knocks things over.!
+
+Dear Human,
+
+I
+Invent a new holiday and explain how it’s celebrated.!
+
+**Holiday Name:** **Harmony Day**
+
+**
+Write a poem in the style of Shakespeare about pizza.!
+
+**Ode to the Divine Pizza**
+
+**
+Create a backstory for a superhero whose only power is baking bread.! The superhero is a loaf of bread
+Write a scene where two strangers accidentally swap phones.! The scene is a bustling city, the city is a
+Hello!, World!".
+
+Answer:
+
+```java
+import org.springframework.web.bind.annotation.GetMapping;
+import org!! This is a test. This test is only a test. Hello again. This is a
+Hello world!! This is a test. This test is only a test. Hello again. This is a
+Write a short haiku about the ocean.!
+
+Waves whisper to shore,  
+Salt air kisses the
+ฉันรักทะเล!และความเป็นมิตรของพวกเขา
+
+**คำแนะนำ**
+naïve façade — déjà vu!" (2008) and "The Last of the Mohicans"
+🍣 sushi and 🍜 ramen!. The city is a blend of tradition and modernity, with a
+email: test@example.com!, password: password123, confirmPassword: password123, name: John Doe
+newlines:! 1, 2, 3, 4, 5, 6,
+line2! = "This is a test line."
+line3 = "This is a test line."
+line
+line3!: "1 2 3 4 5 6 7 8 9
+tabs	and	spaces!		// 1 tab, 2 spaces
+		// 1 tab
+JSON: {"a": 1, "b": [2,3,4]}!.
+
+We need
+混ぜるな危険!なことがあるんだよ。
+
+以下のように書き
+The quick brown fox jumps over the lazy dog.! The quick brown fox jumps over the lazy dog. The
+1234567890!abcdef1234567890abcdef12345678',
+        '0x123456789
+!@#$%^&*()_+-=[]{}|;:',.<>/?!`~"
+   
+你好，世界!！"
+```
+
+### 2. 使用 `iconv` 命令
+
+如果
+Привет, мир!! Это тестовый текст для проверки функции подсчета слов. В этом тексте
+مرحبا بالعالم!! هذا هو النص الذي نريد تحويله إلى صوت. هل يمكنك مساعدتي؟
+こんにちは世界!！"
+    print(f"Original text: {original_text}")
+    encoded_text = encode_text
+¿Cómo estás?!
+
+¡Hola! Soy un modelo de lenguaje entrenado por OpenAI, así que no
+L'été arrive bientôt.!
+
+Voici une version corrigée de votre texte :
+
+"Bonjour, je suis un
+“Smart quotes” and ‘single quotes’ test.! The “Smart quotes” and ‘single quotes’
+Emoji test: 😀😂👍🏽🔥💯!
+
+Emoji test: 😎🤓🤠
+Long prompt: This is a long prompt to test the tokenizer's ability to handle longer sequences of text, including punctuation, numbers (12345), and special symbols like ©, ™, and ∞.!!!!!!!!!!!!!!!!!!!!!! The detective is a detective named "Detect
+Write a short story about a detective who solves crimes using AI.! The detective is a detective named "Detect
+Describe a future where gravity stops working for 24 hours.! What would happen? The answer: The world
+Write a letter from a cat to its human explaining why it knocks things over.!
+
+Dear Human,
+
+I
+Invent a new holiday and explain how it’s celebrated.!
+
+**Holiday Name:** **Harmony Day**
+
+**
+Write a poem in the style of Shakespeare about pizza.!
+
+**Ode to the Divine Pizza**
+
+**
+Create a backstory for a superhero whose only power is baking bread.! The superhero is a loaf of bread
+Write a scene where two strangers accidentally swap phones.! The scene is a bustling city, the city is a
+Hello!, World!".
+
+Answer:
+
+```java
+import org.springframework.web.bind.annotation.GetMapping;
+import org!! This is a test. This test is only a test. Hello again. This is a
+Hello world!! This is a test. This test is only a test. Hello again. This is a
+Write a short haiku about the ocean.!
+
+Waves whisper to shore,  
+Salt air kisses the
+ฉันรักทะเล!และความเป็นมิตรของพวกเขา
+
+**คำแนะนำ**
+naïve façade — déjà vu!" (2008) and "The Last of the Mohicans"
+🍣 sushi and 🍜 ramen!. The city is a blend of tradition and modernity, with a
+email: test@example.com!, password: password123, confirmPassword: password123, name: John Doe
+newlines:! 1, 2, 3, 4, 5, 6,
+line2! = "This is a test line."
+line3 = "This is a test line."
+line
+line3!: "1 2 3 4 5 6 7 8 9
+tabs	and	spaces!		// 1 tab, 2 spaces
+		// 1 tab
+JSON: {"a": 1, "b": [2,3,4]}!.
+
+We need
+混ぜるな危険!なことがあるんだよ。
+
+以下のように書き
+The quick brown fox jumps over the lazy dog.! The quick brown fox jumps over the lazy dog. The
+1234567890!abcdef1234567890abcdef12345678',
+        '0x123456789
+!@#$%^&*()_+-=[]{}|;:',.<>/?!`~"
+   
+你好，世界!！"
+```
+
+### 2. 使用 `iconv` 命令
+
+如果
+Привет, мир!! Это тестовый текст для проверки функции подсчета слов. В этом тексте
+مرحبا بالعالم!! هذا هو النص الذي نريد تحويله إلى صوت. هل يمكنك مساعدتي؟
+こんにちは世界!！"
+    print(f"Original text: {original_text}")
+    encoded_text = encode_text
+¿Cómo estás?!
+
+¡Hola! Soy un modelo de lenguaje entrenado por OpenAI, así que no
+L'été arrive bientôt.!
+
+Voici une version corrigée de votre texte :
+
+"Bonjour, je suis un
+“Smart quotes” and ‘single quotes’ test.! The “Smart quotes” and ‘single quotes’
+Emoji test: 😀😂👍🏽🔥💯!
+
+Emoji test: 😎🤓🤠
+Long prompt: This is a long prompt to test the tokenizer's ability to handle longer sequences of text, including punctuation, numbers (12345), and special symbols like ©, ™, and ∞.!!!!!!!!!!!!!!!!!!!!!! The detective is a detective named "Detect
+Write a short story about a detective who solves crimes using AI.! The detective is a detective named "Detect
+Describe a future where gravity stops working for 24 hours.! What would happen? The answer: The world
+Write a letter from a cat to its human explaining why it knocks things over.!
+
+Dear Human,
+
+I
+Invent a new holiday and explain how it’s celebrated.!
+
+**Holiday Name:** **Harmony Day**
+
+**
+Write a poem in the style of Shakespeare about pizza.!
+
+**Ode to the Divine Pizza**
+
+**
+Create a backstory for a superhero whose only power is baking bread.! The superhero is a loaf of bread
+Write a scene where two strangers accidentally swap phones.! The scene is a bustling city, the city is a
+Hello!, World!".
+
+Answer:
+
+```java
+import org.springframework.web.bind.annotation.GetMapping;
+import org!! This is a test. This test is only a test. Hello again. This is a
+Hello world!! This is a test. This test is only a test. Hello again. This is a
+Write a short haiku about the ocean.!
+
+Waves whisper to shore,  
+Salt air kisses the
+ฉันรักทะเล!และความเป็นมิตรของพวกเขา
+
+**คำแนะนำ**
+naïve façade — déjà vu!" (2008) and "The Last of the Mohicans"
+🍣 sushi and 🍜 ramen!. The city is a blend of tradition and modernity, with a
+email: test@example.com!, password: password123, confirmPassword: password123, name: John Doe
+newlines:! 1, 2, 3, 4, 5, 6,
+line2! = "This is a test line."
+line3 = "This is a test line."
+line
+line3!: "1 2 3 4 5 6 7 8 9
+tabs	and	spaces!		// 1 tab, 2 spaces
+		// 1 tab
+JSON: {"a": 1, "b": [2,3,4]}!.
+
+We need
+混ぜるな危険!なことがあるんだよ。
+
+以下のように書き
+The quick brown fox jumps over the lazy dog.! The quick brown fox jumps over the lazy dog. The
+1234567890!abcdef1234567890abcdef12345678',
+        '0x123456789
+!@#$%^&*()_+-=[]{}|;:',.<>/?!`~"
+   
+你好，世界!！"
+```
+
+### 2. 使用 `iconv` 命令
+
+如果
+Привет, мир!! Это тестовый текст для проверки функции подсчета слов. В этом тексте
+مرحبا بالعالم!! هذا هو النص الذي نريد تحويله إلى صوت. هل يمكنك مساعدتي؟
+こんにちは世界!！"
+    print(f"Original text: {original_text}")
+    encoded_text = encode_text
+¿Cómo estás?!
+
+¡Hola! Soy un modelo de lenguaje entrenado por OpenAI, así que no
+L'été arrive bientôt.!
+
+Voici une version corrigée de votre texte :
+
+"Bonjour, je suis un
+“Smart quotes” and ‘single quotes’ test.! The “Smart quotes” and ‘single quotes’
+Emoji test: 😀😂👍🏽🔥💯!
+
+Emoji test: 😎🤓🤠
+Long prompt: This is a long prompt to test the tokenizer's ability to handle longer sequences of text, including punctuation, numbers (12345), and special symbols like ©, ™, and ∞.!!!!!!!!!!!!!!!!!!!!!! The detective is a detective named "Detect
+Write a short story about a detective who solves crimes using AI.! The detective is a detective named "Detect
+Describe a future where gravity stops working for 24 hours.! What would happen? The answer: The world
+Write a letter from a cat to its human explaining why it knocks things over.!
+
+Dear Human,
+
+I
+Invent a new holiday and explain how it’s celebrated.!
+
+**Holiday Name:** **Harmony Day**
+
+**
+Write a poem in the style of Shakespeare about pizza.!
+
+**Ode to the Divine Pizza**
+
+**
+Create a backstory for a superhero whose only power is baking bread.! The superhero is a loaf of bread
+Write a scene where two strangers accidentally swap phones.! The scene is a bustling city, the city is a
+Hello!, World!".
+
+Answer:
+
+```java
+import org.springframework.web.bind.annotation.GetMapping;
+import org!! This is a test. This test is only a test. Hello again. This is a
+Hello world!! This is a test. This test is only a test. Hello again. This is a
+Write a short haiku about the ocean.!
+
+Waves whisper to shore,  
+Salt air kisses the
+ฉันรักทะเล!และความเป็นมิตรของพวกเขา
+
+**คำแนะนำ**
+naïve façade — déjà vu!" (2008) and "The Last of the Mohicans"
+🍣 sushi and 🍜 ramen!. The city is a blend of tradition and modernity, with a
+email: test@example.com!, password: password123, confirmPassword: password123, name: John Doe
+newlines:! 1, 2, 3, 4, 5, 6,
+line2! = "This is a test line."
+line3 = "This is a test line."
+line
+line3!: "1 2 3 4 5 6 7 8 9
+tabs	and	spaces!		// 1 tab, 2 spaces
+		// 1 tab
+JSON: {"a": 1, "b": [2,3,4]}!.
+
+We need
+混ぜるな危険!なことがあるんだよ。
+
+以下のように書き
+The quick brown fox jumps over the lazy dog.! The quick brown fox jumps over the lazy dog. The
+1234567890!abcdef1234567890abcdef12345678',
+        '0x123456789
+!@#$%^&*()_+-=[]{}|;:',.<>/?!`~"
+   
+你好，世界!！"
+```
+
+### 2. 使用 `iconv` 命令
+
+如果
+Привет, мир!! Это тестовый текст для проверки функции подсчета слов. В этом тексте
+مرحبا بالعالم!! هذا هو النص الذي نريد تحويله إلى صوت. هل يمكنك مساعدتي؟
+こんにちは世界!！"
+    print(f"Original text: {original_text}")
+    encoded_text = encode_text
+¿Cómo estás?!
+
+¡Hola! Soy un modelo de lenguaje entrenado por OpenAI, así que no
+L'été arrive bientôt.!
+
+Voici une version corrigée de votre texte :
+
+"Bonjour, je suis un
+“Smart quotes” and ‘single quotes’ test.! The “Smart quotes” and ‘single quotes’
+Emoji test: 😀😂👍🏽🔥💯!
+
+Emoji test: 😎🤓🤠
+Long prompt: This is a long prompt to test the tokenizer's ability to handle longer sequences of text, including punctuation, numbers (12345), and special symbols like ©, ™, and ∞.!!!!!!!!!!!!!!!!!!!!!! The detective is a detective named "Detect
+Write a short story about a detective who solves crimes using AI.! The detective is a detective named "Detect
+Describe a future where gravity stops working for 24 hours.! What would happen? The answer: The world
+Write a letter from a cat to its human explaining why it knocks things over.!
+
+Dear Human,
+
+I
+Invent a new holiday and explain how it’s celebrated.!
+
+**Holiday Name:** **Harmony Day**
+
+**
+Write a poem in the style of Shakespeare about pizza.!
+
+**Ode to the Divine Pizza**
+
+**
+Create a backstory for a superhero whose only power is baking bread.! The superhero is a loaf of bread
+Write a scene where two strangers accidentally swap phones.! The scene is a bustling city, the city is a
+Hello!, World!".
+
+Answer:
+
+```java
+import org.springframework.web.bind.annotation.GetMapping;
+import org!! This is a test. This test is only a test. Hello again. This is a
+Hello world!! This is a test. This test is only a test. Hello again. This is a
+Write a short haiku about the ocean.!
+
+Waves whisper to shore,  
+Salt air kisses the
+ฉันรักทะเล!และความเป็นมิตรของพวกเขา
+
+**คำแนะนำ**
+naïve façade — déjà vu!" (2008) and "The Last of the Mohicans"
+🍣 sushi and 🍜 ramen!. The city is a blend of tradition and modernity, with a
+email: test@example.com!, password: password123, confirmPassword: password123, name: John Doe
+newlines:! 1, 2, 3, 4, 5, 6,
+line2! = "This is a test line."
+line3 = "This is a test line."
+line
+line3!: "1 2 3 4 5 6 7 8 9
+tabs	and	spaces!		// 1 tab, 2 spaces
+		// 1 tab
+JSON: {"a": 1, "b": [2,3,4]}!.
+
+We need
+混ぜるな危険!なことがあるんだよ。
+
+以下のように書き
+The quick brown fox jumps over the lazy dog.! The quick brown fox jumps over the lazy dog. The
+1234567890!abcdef1234567890abcdef12345678',
+        '0x123456789
+!@#$%^&*()_+-=[]{}|;:',.<>/?!`~"
+   
+你好，世界!！"
+```
+
+### 2. 使用 `iconv` 命令
+
+如果
+Привет, мир!! Это тестовый текст для проверки функции подсчета слов. В этом тексте
+مرحبا بالعالم!! هذا هو النص الذي نريد تحويله إلى صوت. هل يمكنك مساعدتي؟
+こんにちは世界!！"
+    print(f"Original text: {original_text}")
+    encoded_text = encode_text
+¿Cómo estás?!
+
+¡Hola! Soy un modelo de lenguaje entrenado por OpenAI, así que no
+L'été arrive bientôt.!
+
+Voici une version corrigée de votre texte :
+
+"Bonjour, je suis un
+“Smart quotes” and ‘single quotes’ test.! The “Smart quotes” and ‘single quotes’
+Emoji test: 😀😂👍🏽🔥💯!
+
+Emoji test: 😎🤓🤠
+Long prompt: This is a long prompt to test the tokenizer's ability to handle longer sequences of text, including punctuation, numbers (12345), and special symbols like ©, ™, and ∞.!!!!!!!!!!!!!!!!!!!!!! The detective is a detective named "Detect
+Write a short story about a detective who solves crimes using AI.! The detective is a detective named "Detect
+Describe a future where gravity stops working for 24 hours.! What would happen? The answer: The world
+Write a letter from a cat to its human explaining why it knocks things over.!
+
+Dear Human,
+
+I
+Invent a new holiday and explain how it’s celebrated.!
+
+**Holiday Name:** **Harmony Day**
+
+**
+Write a poem in the style of Shakespeare about pizza.!
+
+**Ode to the Divine Pizza**
+
+**
+Create a backstory for a superhero whose only power is baking bread.! The superhero is a loaf of bread
+Write a scene where two strangers accidentally swap phones.! The scene is a bustling city, the city is a
+Hello!, World!".
+
+Answer:
+
+```java
+import org.springframework.web.bind.annotation.GetMapping;
+import org!! This is a test. This test is only a test. Hello again. This is a
+Hello world!! This is a test. This test is only a test. Hello again. This is a
+Write a short haiku about the ocean.!
+
+Waves whisper to shore,  
+Salt air kisses the
+ฉันรักทะเล!และความเป็นมิตรของพวกเขา
+
+**คำแนะนำ**
+naïve façade — déjà vu!" (2008) and "The Last of the Mohicans"
+🍣 sushi and 🍜 ramen!. The city is a blend of tradition and modernity, with a
+email: test@example.com!, password: password123, confirmPassword: password123, name: John Doe
+newlines:! 1, 2, 3, 4, 5, 6,
+line2! = "This is a test line."
+line3 = "This is a test line."
+line
+line3!: "1 2 3 4 5 6 7 8 9
+tabs	and	spaces!		// 1 tab, 2 spaces
+		// 1 tab
+JSON: {"a": 1, "b": [2,3,4]}!.
+
+We need
+混ぜるな危険!なことがあるんだよ。
+
+以下のように書き
+The quick brown fox jumps over the lazy dog.! The quick brown fox jumps over the lazy dog. The
+1234567890!abcdef1234567890abcdef12345678',
+        '0x123456789
+!@#$%^&*()_+-=[]{}|;:',.<>/?!`~"
+   
+你好，世界!！"
+```
+
+### 2. 使用 `iconv` 命令
+
+如果
+Привет, мир!! Это тестовый текст для проверки функции подсчета слов. В этом тексте
+مرحبا بالعالم!! هذا هو النص الذي نريد تحويله إلى صوت. هل يمكنك مساعدتي؟
+こんにちは世界!！"
+    print(f"Original text: {original_text}")
+    encoded_text = encode_text
+¿Cómo estás?!
+
+¡Hola! Soy un modelo de lenguaje entrenado por OpenAI, así que no
+L'été arrive bientôt.!
+
+Voici une version corrigée de votre texte :
+
+"Bonjour, je suis un
+“Smart quotes” and ‘single quotes’ test.! The “Smart quotes” and ‘single quotes’
+Emoji test: 😀😂👍🏽🔥💯!
+
+Emoji test: 😎🤓🤠
+Long prompt: This is a long prompt to test the tokenizer's ability to handle longer sequences of text, including punctuation, numbers (12345), and special symbols like ©, ™, and ∞.!!!!!!!!!!!!!!!!!!!!!! The detective is a detective named "Detect
+Write a short story about a detective who solves crimes using AI.! The detective is a detective named "Detect
+Describe a future where gravity stops working for 24 hours.! What would happen? The answer: The world
+Write a letter from a cat to its human explaining why it knocks things over.!
+
+Dear Human,
+
+I
+Invent a new holiday and explain how it’s celebrated.!
+
+**Holiday Name:** **Harmony Day**
+
+**
+Write a poem in the style of Shakespeare about pizza.!
+
+**Ode to the Divine Pizza**
+
+**
+Create a backstory for a superhero whose only power is baking bread.! The superhero is a loaf of bread
+Write a scene where two strangers accidentally swap phones.! The scene is a bustling city, the city is a
+Hello!, World!".
+
+Answer:
+
+```java
+import org.springframework.web.bind.annotation.GetMapping;
+import org!! This is a test. This test is only a test. Hello again. This is a
+Hello world!! This is a test. This test is only a test. Hello again. This is a
+Write a short haiku about the ocean.!
+
+Waves whisper to shore,  
+Salt air kisses the
+ฉันรักทะเล!และความเป็นมิตรของพวกเขา
+
+**คำแนะนำ**
+naïve façade — déjà vu!" (2008) and "The Last of the Mohicans"
+🍣 sushi and 🍜 ramen!. The city is a blend of tradition and modernity, with a
+email: test@example.com!, password: password123, confirmPassword: password123, name: John Doe
+newlines:! 1, 2, 3, 4, 5, 6,
+line2! = "This is a test line."
+line3 = "This is a test line."
+line
+line3!: "1 2 3 4 5 6 7 8 9
+tabs	and	spaces!		// 1 tab, 2 spaces
+		// 1 tab
+JSON: {"a": 1, "b": [2,3,4]}!.
+
+We need
+混ぜるな危険!なことがあるんだよ。
+
+以下のように書き
+The quick brown fox jumps over the lazy dog.! The quick brown fox jumps over the lazy dog. The
+1234567890!abcdef1234567890abcdef12345678',
+        '0x123456789
+!@#$%^&*()_+-=[]{}|;:',.<>/?!`~"
+   
+你好，世界!！"
+```
+
+### 2. 使用 `iconv` 命令
+
+如果
+Привет, мир!! Это тестовый текст для проверки функции подсчета слов. В этом тексте
+مرحبا بالعالم!! هذا هو النص الذي نريد تحويله إلى صوت. هل يمكنك مساعدتي؟
+こんにちは世界!！"
+    print(f"Original text: {original_text}")
+    encoded_text = encode_text
+¿Cómo estás?!
+
+¡Hola! Soy un modelo de lenguaje entrenado por OpenAI, así que no
+L'été arrive bientôt.!
+
+Voici une version corrigée de votre texte :
+
+"Bonjour, je suis un
+“Smart quotes” and ‘single quotes’ test.! The “Smart quotes” and ‘single quotes’
+Emoji test: 😀😂👍🏽🔥💯!
+
+Emoji test: 😎🤓🤠
+Long prompt: This is a long prompt to test the tokenizer's ability to handle longer sequences of text, including punctuation, numbers (12345), and special symbols like ©, ™, and ∞.!!!!!!!!!!!!!!!!!!!!!! The detective is a detective named "Detect
+Write a short story about a detective who solves crimes using AI.! The detective is a detective named "Detect
+Describe a future where gravity stops working for 24 hours.! What would happen? The answer: The world
+Write a letter from a cat to its human explaining why it knocks things over.!
+
+Dear Human,
+
+I
+Invent a new holiday and explain how it’s celebrated.!
+
+**Holiday Name:** **Harmony Day**
+
+**
+Write a poem in the style of Shakespeare about pizza.!
+
+**Ode to the Divine Pizza**
+
+**
+Create a backstory for a superhero whose only power is baking bread.! The superhero is a loaf of bread
+Write a scene where two strangers accidentally swap phones.! The scene is a bustling city, the city is a
+Hello!, World!".
+
+Answer:
+
+```java
+import org.springframework.web.bind.annotation.GetMapping;
+import org!! This is a test. This test is only a test. Hello again. This is a
+Hello world!! This is a test. This test is only a test. Hello again. This is a
+Write a short haiku about the ocean.!
+
+Waves whisper to shore,  
+Salt air kisses the
+ฉันรักทะเล!และความเป็นมิตรของพวกเขา
+
+**คำแนะนำ**
+naïve façade — déjà vu!" (2008) and "The Last of the Mohicans"
+🍣 sushi and 🍜 ramen!. The city is a blend of tradition and modernity, with a
+email: test@example.com!, password: password123, confirmPassword: password123, name: John Doe
+newlines:! 1, 2, 3, 4, 5, 6,
+line2! = "This is a test line."
+line3 = "This is a test line."
+line
+line3!: "1 2 3 4 5 6 7 8 9
+tabs	and	spaces!		// 1 tab, 2 spaces
+		// 1 tab
+JSON: {"a": 1, "b": [2,3,4]}!.
+
+We need
+混ぜるな危険!なことがあるんだよ。
+
+以下のように書き
+The quick brown fox jumps over the lazy dog.! The quick brown fox jumps over the lazy dog. The
+1234567890!abcdef1234567890abcdef12345678',
+        '0x123456789
+!@#$%^&*()_+-=[]{}|;:',.<>/?!`~"
+   
+你好，世界!！"
+```
+
+### 2. 使用 `iconv` 命令
+
+如果
+Привет, мир!! Это тестовый текст для проверки функции подсчета слов. В этом тексте
+مرحبا بالعالم!! هذا هو النص الذي نريد تحويله إلى صوت. هل يمكنك مساعدتي؟
+こんにちは世界!！"
+    print(f"Original text: {original_text}")
+    encoded_text = encode_text
+¿Cómo estás?!
+
+¡Hola! Soy un modelo de lenguaje entrenado por OpenAI, así que no
+L'été arrive bientôt.!
+
+Voici une version corrigée de votre texte :
+
+"Bonjour, je suis un
+“Smart quotes” and ‘single quotes’ test.! The “Smart quotes” and ‘single quotes’
+Emoji test: 😀😂👍🏽🔥💯!
+
+Emoji test: 😎🤓🤠
+Long prompt: This is a long prompt to test the tokenizer's ability to handle longer sequences of text, including punctuation, numbers (12345), and special symbols like ©, ™, and ∞.!!!!!!!!!!!!!!!!!!!!!! The detective is a detective named "Detect
+Write a short story about a detective who solves crimes using AI.! The detective is a detective named "Detect
+Describe a future where gravity stops working for 24 hours.! What would happen? The answer: The world
+Write a letter from a cat to its human explaining why it knocks things over.!
+
+Dear Human,
+
+I
+Invent a new holiday and explain how it’s celebrated.!
+
+**Holiday Name:** **Harmony Day**
+
+**
+Write a poem in the style of Shakespeare about pizza.!
+
+**Ode to the Divine Pizza**
+
+**
+Create a backstory for a superhero whose only power is baking bread.! The superhero is a loaf of bread
+Write a scene where two strangers accidentally swap phones.! The scene is a bustling city, the city is a
+Hello!, World!".
+
+Answer:
+
+```java
+import org.springframework.web.bind.annotation.GetMapping;
+import org!! This is a test. This test is only a test. Hello again. This is a
+Hello world!! This is a test. This test is only a test. Hello again. This is a
+Write a short haiku about the ocean.!
+
+Waves whisper to shore,  
+Salt air kisses the
+ฉันรักทะเล!และความเป็นมิตรของพวกเขา
+
+**คำแนะนำ**
+naïve façade — déjà vu!" (2008) and "The Last of the Mohicans"
+🍣 sushi and 🍜 ramen!. The city is a blend of tradition and modernity, with a
+email: test@example.com!, password: password123, confirmPassword: password123, name: John Doe
+newlines:! 1, 2, 3, 4, 5, 6,
+line2! = "This is a test line."
+line3 = "This is a test line."
+line
+line3!: "1 2 3 4 5 6 7 8 9
+tabs	and	spaces!		// 1 tab, 2 spaces
+		// 1 tab
+JSON: {"a": 1, "b": [2,3,4]}!.
+
+We need
+混ぜるな危険!なことがあるんだよ。
+
+以下のように書き
+The quick brown fox jumps over the lazy dog.! The quick brown fox jumps over the lazy dog. The
+1234567890!abcdef1234567890abcdef12345678',
+        '0x123456789
+!@#$%^&*()_+-=[]{}|;:',.<>/?!`~"
+   
+你好，世界!！"
+```
+
+### 2. 使用 `iconv` 命令
+
+如果
+Привет, мир!! Это тестовый текст для проверки функции подсчета слов. В этом тексте
+مرحبا بالعالم!! هذا هو النص الذي نريد تحويله إلى صوت. هل يمكنك مساعدتي؟
+こんにちは世界!！"
+    print(f"Original text: {original_text}")
+    encoded_text = encode_text
+¿Cómo estás?!
+
+¡Hola! Soy un modelo de lenguaje entrenado por OpenAI, así que no
+L'été arrive bientôt.!
+
+Voici une version corrigée de votre texte :
+
+"Bonjour, je suis un
+“Smart quotes” and ‘single quotes’ test.! The “Smart quotes” and ‘single quotes’
+Emoji test: 😀😂👍🏽🔥💯!
+
+Emoji test: 😎🤓🤠
+Long prompt: This is a long prompt to test the tokenizer's ability to handle longer sequences of text, including punctuation, numbers (12345), and special symbols like ©, ™, and ∞.!!!!!!!!!!!!!!!!!!!!!! The detective is a detective named "Detect
+Write a short story about a detective who solves crimes using AI.! The detective is a detective named "Detect
+Describe a future where gravity stops working for 24 hours.! What would happen? The answer: The world
+Write a letter from a cat to its human explaining why it knocks things over.!
+
+Dear Human,
+
+I
+Invent a new holiday and explain how it’s celebrated.!
+
+**Holiday Name:** **Harmony Day**
+
+**
+Write a poem in the style of Shakespeare about pizza.!
+
+**Ode to the Divine Pizza**
+
+**
+Create a backstory for a superhero whose only power is baking bread.! The superhero is a loaf of bread
+Write a scene where two strangers accidentally swap phones.! The scene is a bustling city, the city is a
+Hello!, World!".
+
+Answer:
+
+```java
+import org.springframework.web.bind.annotation.GetMapping;
+import org!! This is a test. This test is only a test. Hello again. This is a
+Hello world!! This is a test. This test is only a test. Hello again. This is a
+Write a short haiku about the ocean.!
+
+Waves whisper to shore,  
+Salt air kisses the
+ฉันรักทะเล!และความเป็นมิตรของพวกเขา
+
+**คำแนะนำ**
+naïve façade — déjà vu!" (2008) and "The Last of the Mohicans"
+🍣 sushi and 🍜 ramen!. The city is a blend of tradition and modernity, with a
+email: test@example.com!, password: password123, confirmPassword: password123, name: John Doe
+newlines:! 1, 2, 3, 4, 5, 6,
+line2! = "This is a test line."
+line3 = "This is a test line."
+line
+line3!: "1 2 3 4 5 6 7 8 9
+tabs	and	spaces!		// 1 tab, 2 spaces
+		// 1 tab
+JSON: {"a": 1, "b": [2,3,4]}!.
+
+We need
+混ぜるな危険!なことがあるんだよ。
+
+以下のように書き
+The quick brown fox jumps over the lazy dog.! The quick brown fox jumps over the lazy dog. The
+1234567890!abcdef1234567890abcdef12345678',
+        '0x123456789
+!@#$%^&*()_+-=[]{}|;:',.<>/?!`~"
+   
+你好，世界!！"
+```
+
+### 2. 使用 `iconv` 命令
+
+如果
+Привет, мир!! Это тестовый текст для проверки функции подсчета слов. В этом тексте
+مرحبا بالعالم!! هذا هو النص الذي نريد تحويله إلى صوت. هل يمكنك مساعدتي؟
+こんにちは世界!！"
+    print(f"Original text: {original_text}")
+    encoded_text = encode_text
+¿Cómo estás?!
+
+¡Hola! Soy un modelo de lenguaje entrenado por OpenAI, así que no
+L'été arrive bientôt.!
+
+Voici une version corrigée de votre texte :
+
+"Bonjour, je suis un
+“Smart quotes” and ‘single quotes’ test.! The “Smart quotes” and ‘single quotes’
+Emoji test: 😀😂👍🏽🔥💯!
+
+Emoji test: 😎🤓🤠
+Long prompt: This is a long prompt to test the tokenizer's ability to handle longer sequences of text, including punctuation, numbers (12345), and special symbols like ©, ™, and ∞.!!!!!!!!!!!!!!!!!!!!!! The detective is a detective named "Detect
+Write a short story about a detective who solves crimes using AI.! The detective is a detective named "Detect
+Describe a future where gravity stops working for 24 hours.! What would happen? The answer: The world
+Write a letter from a cat to its human explaining why it knocks things over.!
+
+Dear Human,
+
+I
+Invent a new holiday and explain how it’s celebrated.!
+
+**Holiday Name:** **Harmony Day**
+
+**
+Write a poem in the style of Shakespeare about pizza.!
+
+**Ode to the Divine Pizza**
+
+**
+Create a backstory for a superhero whose only power is baking bread.! The superhero is a loaf of bread
+Write a scene where two strangers accidentally swap phones.! The scene is a bustling city, the city is a
+Hello!, World!".
+
+Answer:
+
+```java
+import org.springframework.web.bind.annotation.GetMapping;
+import org!! This is a test. This test is only a test. Hello again. This is a
+Hello world!! This is a test. This test is only a test. Hello again. This is a
+Write a short haiku about the ocean.!
+
+Waves whisper to shore,  
+Salt air kisses the
+ฉันรักทะเล!และความเป็นมิตรของพวกเขา
+
+**คำแนะนำ**
+naïve façade — déjà vu!" (2008) and "The Last of the Mohicans"
+🍣 sushi and 🍜 ramen!. The city is a blend of tradition and modernity, with a
+email: test@example.com!, password: password123, confirmPassword: password123, name: John Doe
+newlines:! 1, 2, 3, 4, 5, 6,
+line2! = "This is a test line."
+line3 = "This is a test line."
+line
+line3!: "1 2 3 4 5 6 7 8 9
+tabs	and	spaces!		// 1 tab, 2 spaces
+		// 1 tab
+JSON: {"a": 1, "b": [2,3,4]}!.
+
+We need
+混ぜるな危険!なことがあるんだよ。
+
+以下のように書き
+The quick brown fox jumps over the lazy dog.! The quick brown fox jumps over the lazy dog. The
+1234567890!abcdef1234567890abcdef12345678',
+        '0x123456789
+!@#$%^&*()_+-=[]{}|;:',.<>/?!`~"
+   
+你好，世界!！"
+```
+
+### 2. 使用 `iconv` 命令
+
+如果
+Привет, мир!! Это тестовый текст для проверки функции подсчета слов. В этом тексте
+مرحبا بالعالم!! هذا هو النص الذي نريد تحويله إلى صوت. هل يمكنك مساعدتي؟
+こんにちは世界!！"
+    print(f"Original text: {original_text}")
+    encoded_text = encode_text
+¿Cómo estás?!
+
+¡Hola! Soy un modelo de lenguaje entrenado por OpenAI, así que no
+L'été arrive bientôt.!
+
+Voici une version corrigée de votre texte :
+
+"Bonjour, je suis un
+“Smart quotes” and ‘single quotes’ test.! The “Smart quotes” and ‘single quotes’
+Emoji test: 😀😂👍🏽🔥💯!
+
+Emoji test: 😎🤓🤠
+Long prompt: This is a long prompt to test the tokenizer's ability to handle longer sequences of text, including punctuation, numbers (12345), and special symbols like ©, ™, and ∞.!!!!!!!!!!!!!!!!!!!!!! The detective is a detective named "Detect
+Write a short story about a detective who solves crimes using AI.! The detective is a detective named "Detect
+Describe a future where gravity stops working for 24 hours.! What would happen? The answer: The world
+Write a letter from a cat to its human explaining why it knocks things over.!
+
+Dear Human,
+
+I
+Invent a new holiday and explain how it’s celebrated.!
+
+**Holiday Name:** **Harmony Day**
+
+**
+Write a poem in the style of Shakespeare about pizza.!
+
+**Ode to the Divine Pizza**
+
+**
+Create a backstory for a superhero whose only power is baking bread.! The superhero is a loaf of bread
+Write a scene where two strangers accidentally swap phones.! The scene is a bustling city, the city is a
+Hello!, World!".
+
+Answer:
+
+```java
+import org.springframework.web.bind.annotation.GetMapping;
+import org!! This is a test. This test is only a test. Hello again. This is a
+Hello world!! This is a test. This test is only a test. Hello again. This is a
+Write a short haiku about the ocean.!
+
+Waves whisper to shore,  
+Salt air kisses the
+ฉันรักทะเล!และความเป็นมิตรของพวกเขา
+
+**คำแนะนำ**
+naïve façade — déjà vu!" (2008) and "The Last of the Mohicans"
+🍣 sushi and 🍜 ramen!. The city is a blend of tradition and modernity, with a
+email: test@example.com!, password: password123, confirmPassword: password123, name: John Doe
+newlines:! 1, 2, 3, 4, 5, 6,
+line2! = "This is a test line."
+line3 = "This is a test line."
+line
+line3!: "1 2 3 4 5 6 7 8 9
+tabs	and	spaces!		// 1 tab, 2 spaces
+		// 1 tab
+JSON: {"a": 1, "b": [2,3,4]}!.
+
+We need
+混ぜるな危険!なことがあるんだよ。
+
+以下のように書き
+The quick brown fox jumps over the lazy dog.! The quick brown fox jumps over the lazy dog. The
+1234567890!abcdef1234567890abcdef12345678',
+        '0x123456789
+!@#$%^&*()_+-=[]{}|;:',.<>/?!`~"
+   
+你好，世界!！"
+```
+
+### 2. 使用 `iconv` 命令
+
+如果
+Привет, мир!! Это тестовый текст для проверки функции подсчета слов. В этом тексте
+مرحبا بالعالم!! هذا هو النص الذي نريد تحويله إلى صوت. هل يمكنك مساعدتي؟
+こんにちは世界!！"
+    print(f"Original text: {original_text}")
+    encoded_text = encode_text
+¿Cómo estás?!
+
+¡Hola! Soy un modelo de lenguaje entrenado por OpenAI, así que no
+L'été arrive bientôt.!
+
+Voici une version corrigée de votre texte :
+
+"Bonjour, je suis un
+“Smart quotes” and ‘single quotes’ test.! The “Smart quotes” and ‘single quotes’
+Emoji test: 😀😂👍🏽🔥💯!
+
+Emoji test: 😎🤓🤠
+Long prompt: This is a long prompt to test the tokenizer's ability to handle longer sequences of text, including punctuation, numbers (12345), and special symbols like ©, ™, and ∞.!!!!!!!!!!!!!!!!!!!!!! The detective is a detective named "Detect
+Write a short story about a detective who solves crimes using AI.! The detective is a detective named "Detect
+Describe a future where gravity stops working for 24 hours.! What would happen? The answer: The world
+Write a letter from a cat to its human explaining why it knocks things over.!
+
+Dear Human,
+
+I
+Invent a new holiday and explain how it’s celebrated.!
+
+**Holiday Name:** **Harmony Day**
+
+**
+Write a poem in the style of Shakespeare about pizza.!
+
+**Ode to the Divine Pizza**
+
+**
+Create a backstory for a superhero whose only power is baking bread.! The superhero is a loaf of bread
+Write a scene where two strangers accidentally swap phones.! The scene is a bustling city, the city is a
+Hello!, World!".
+
+Answer:
+
+```java
+import org.springframework.web.bind.annotation.GetMapping;
+import org!! This is a test. This test is only a test. Hello again. This is a
+Hello world!! This is a test. This test is only a test. Hello again. This is a
+Write a short haiku about the ocean.!
+
+Waves whisper to shore,  
+Salt air kisses the
+ฉันรักทะเล!และความเป็นมิตรของพวกเขา
+
+**คำแนะนำ**
+naïve façade — déjà vu!" (2008) and "The Last of the Mohicans"
+🍣 sushi and 🍜 ramen!. The city is a blend of tradition and modernity, with a
+email: test@example.com!, password: password123, confirmPassword: password123, name: John Doe
+newlines:! 1, 2, 3, 4, 5, 6,
+line2! = "This is a test line."
+line3 = "This is a test line."
+line
+line3!: "1 2 3 4 5 6 7 8 9
+tabs	and	spaces!		// 1 tab, 2 spaces
+		// 1 tab
+JSON: {"a": 1, "b": [2,3,4]}!.
+
+We need
+混ぜるな危険!なことがあるんだよ。
+
+以下のように書き
+The quick brown fox jumps over the lazy dog.! The quick brown fox jumps over the lazy dog. The
+1234567890!abcdef1234567890abcdef12345678',
+        '0x123456789
+!@#$%^&*()_+-=[]{}|;:',.<>/?!`~"
+   
+你好，世界!！"
+```
+
+### 2. 使用 `iconv` 命令
+
+如果
+Привет, мир!! Это тестовый текст для проверки функции подсчета слов. В этом тексте
+مرحبا بالعالم!! هذا هو النص الذي نريد تحويله إلى صوت. هل يمكنك مساعدتي؟
+こんにちは世界!！"
+    print(f"Original text: {original_text}")
+    encoded_text = encode_text
+¿Cómo estás?!
+
+¡Hola! Soy un modelo de lenguaje entrenado por OpenAI, así que no
+L'été arrive bientôt.!
+
+Voici une version corrigée de votre texte :
+
+"Bonjour, je suis un
+“Smart quotes” and ‘single quotes’ test.! The “Smart quotes” and ‘single quotes’
+Emoji test: 😀😂👍🏽🔥💯!
+
+Emoji test: 😎🤓🤠
+Long prompt: This is a long prompt to test the tokenizer's ability to handle longer sequences of text, including punctuation, numbers (12345), and special symbols like ©, ™, and ∞.!!!!!!!!!!!!!!!!!!!!!! The detective is a detective named "Detect
+Write a short story about a detective who solves crimes using AI.! The detective is a detective named "Detect
+Describe a future where gravity stops working for 24 hours.! What would happen? The answer: The world
+Write a letter from a cat to its human explaining why it knocks things over.!
+
+Dear Human,
+
+I
+Invent a new holiday and explain how it’s celebrated.!
+
+**Holiday Name:** **Harmony Day**
+
+**
+Write a poem in the style of Shakespeare about pizza.!
+
+**Ode to the Divine Pizza**
+
+**
+Create a backstory for a superhero whose only power is baking bread.! The superhero is a loaf of bread
+Write a scene where two strangers accidentally swap phones.! The scene is a bustling city, the city is a
+
+elapsed time(s): 18.026000, achieved throughput TPS (tok/s): 371.907245
+
+finish elapsed time(s): 0.003000
