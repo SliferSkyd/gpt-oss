@@ -18,7 +18,7 @@
 #define GETP_RUN
 
 // BATCH_SIZE can be increased for higher throughput
-#define BATCH_SIZE 72
+#define BATCH_SIZE 256LL
 #define THREADS_PER_BLOCK 256
 #define WARP_SIZE 64
 
@@ -250,14 +250,14 @@ void compute_cos_sin_getp(int pos, float base, int head_dim, float scaling_facto
 __global__ void rmsnorm_kernel(float *output, const float *input, const __hip_bfloat16 *weight,
                                int batch_size, int size)
 {
-    int batch_idx = blockIdx.x;
-    int tid = threadIdx.x;
+    size_t batch_idx = blockIdx.x;
+    size_t tid = threadIdx.x;
 
     if (batch_idx >= batch_size)
         return;
 
-    const float *x = input + batch_idx * size;
-    float *o = output + batch_idx * size;
+    const float *x = input + 1LL * batch_idx * size;
+    float *o = output + 1LL * batch_idx * size;
 
     // Shared memory for reduction
     __shared__ float shared_ss[THREADS_PER_BLOCK];
@@ -302,13 +302,13 @@ __global__ void rmsnorm_kernel(float *output, const float *input, const __hip_bf
 
 __global__ void softmax_kernel(float *x, int batch_size, int size)
 {
-    int batch_idx = blockIdx.x;
-    int tid = threadIdx.x;
+    size_t batch_idx = blockIdx.x;
+    size_t tid = threadIdx.x;
 
     if (batch_idx >= batch_size)
         return;
 
-    float *batch_x = x + batch_idx * size;
+    float *batch_x = x + 1LL * batch_idx * size;
 
     __shared__ float shared_max[THREADS_PER_BLOCK];
     __shared__ float shared_sum[THREADS_PER_BLOCK];
@@ -365,53 +365,11 @@ __global__ void softmax_kernel(float *x, int batch_size, int size)
     }
 }
 
-__global__ void matmul_kernel(float *output, const float *input, const __hip_bfloat16 *weight,
-                              int batch_size, int input_dim, int output_dim)
-{
-    int batch_idx = blockIdx.x;
-    int out_idx = blockIdx.y * blockDim.y + threadIdx.y;
-    int tid = threadIdx.x;
-
-    if (batch_idx >= batch_size || out_idx >= output_dim)
-        return;
-
-    const float *x = input + batch_idx * input_dim;
-    float *out = output + batch_idx * output_dim;
-
-    __shared__ float shared_val[THREADS_PER_BLOCK];
-
-    float val = 0.0f;
-    for (int i = tid; i < input_dim; i += blockDim.x)
-    {
-        // Convert bfloat16 weight to fp32 on-the-fly
-        float weight_fp32 = __bfloat162float(weight[out_idx * input_dim + i]);
-        val += weight_fp32 * x[i];
-    }
-    shared_val[tid] = val;
-    __syncthreads();
-
-    // Reduction
-    for (int stride = blockDim.x / 2; stride > 0; stride /= 2)
-    {
-        if (tid < stride)
-        {
-            shared_val[tid] += shared_val[tid + stride];
-        }
-        __syncthreads();
-    }
-
-    if (tid == 0)
-    {
-        out[out_idx] = shared_val[0];
-    }
-}
-
 __global__ void accumulate_kernel(float *a, const float *b, float factor,
                                   int batch_size, int size)
 {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    int total_size = batch_size * size;
-
+    size_t idx = 1LL * blockIdx.x * blockDim.x + threadIdx.x;
+    size_t total_size = batch_size * size;
     if (idx < total_size)
     {
         a[idx] += b[idx] * factor;
@@ -421,7 +379,7 @@ __global__ void accumulate_kernel(float *a, const float *b, float factor,
 // NEW: Kernel to add bias to matrix multiplication result with bfloat16 bias
 __global__ void add_bias_kernel(float *output, const __hip_bfloat16 *bias, int batch_size, int size)
 {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    size_t idx = 1LL * blockIdx.x * blockDim.x + threadIdx.x;
     if (idx < batch_size * size)
     {
         int dim_idx = idx % size;
@@ -468,8 +426,8 @@ __global__ void update_kv_cache_kernel(float *key_cache, float *value_cache,
                                        int n_layers, int layer_idx, int seq_len,
                                        int kv_dim)
 {
-    int batch_idx = blockIdx.x;
-    int dim_idx = blockIdx.y * blockDim.y + threadIdx.y;
+    size_t batch_idx = blockIdx.x;
+    size_t dim_idx = 1LL * blockIdx.y * blockDim.y + threadIdx.y;
 
     if (batch_idx >= batch_size || dim_idx >= kv_dim)
         return;
@@ -478,15 +436,10 @@ __global__ void update_kv_cache_kernel(float *key_cache, float *value_cache,
     if (pos >= seq_len)
         return; // Safety check
 
-    // Update key cache
-    int k_cache_idx = batch_idx * n_layers * seq_len * kv_dim +
-                      layer_idx * seq_len * kv_dim + pos * kv_dim + dim_idx;
-    key_cache[k_cache_idx] = k[batch_idx * kv_dim + dim_idx];
-
-    // Update value cache
-    int v_cache_idx = batch_idx * n_layers * seq_len * kv_dim +
-                      layer_idx * seq_len * kv_dim + pos * kv_dim + dim_idx;
-    value_cache[v_cache_idx] = v[batch_idx * kv_dim + dim_idx];
+    size_t cache_idx = 1LL * batch_idx * n_layers * seq_len * kv_dim +
+                      1LL * layer_idx * seq_len * kv_dim + 1LL * pos * kv_dim + dim_idx;
+    key_cache[cache_idx] = k[1LL * batch_idx * kv_dim + dim_idx];
+    value_cache[cache_idx] = v[1LL * batch_idx * kv_dim + dim_idx];
 }
 
 __global__ void attention_scores_kernel(float *att, const float *q, const float *key_cache,
@@ -495,9 +448,9 @@ __global__ void attention_scores_kernel(float *att, const float *q, const float 
                                         int seq_len, int n_layers, int layer_idx,
                                         bool use_sliding_window)
 {
-    int batch_idx = blockIdx.x;
-    int head_idx = blockIdx.y;
-    int t = blockIdx.z * blockDim.z + threadIdx.z;
+    size_t batch_idx = blockIdx.x;
+    size_t head_idx = blockIdx.y;
+    size_t t = 1LL * blockIdx.z * blockDim.z + threadIdx.z;
 
     if (batch_idx >= batch_size || head_idx >= n_heads)
         return;
@@ -509,9 +462,9 @@ __global__ void attention_scores_kernel(float *att, const float *q, const float 
     int kv_dim = head_dim * (n_heads / 8); // Assuming GQA with 4:1 ratio
     int kv_head = head_idx / 8;
 
-    const float *q_head = q + batch_idx * n_heads * head_dim + head_idx * head_dim;
-    const float *k_head = key_cache + batch_idx * n_layers * seq_len * kv_dim +
-                          layer_idx * seq_len * kv_dim + t * kv_dim + kv_head * head_dim;
+    const float *q_head = q + 1LL * batch_idx * n_heads * head_dim + head_idx * head_dim;
+    const float *k_head = key_cache + 1LL * batch_idx * n_layers * seq_len * kv_dim +
+                          1LL * layer_idx * seq_len * kv_dim + 1LL * t * kv_dim + kv_head * head_dim;
 
     float score = 0.0f;
     for (int i = 0; i < head_dim; i++)
@@ -526,7 +479,7 @@ __global__ void attention_scores_kernel(float *att, const float *q, const float 
         score += mask[pos * seq_len + t];
     }
 
-    att[batch_idx * n_heads * seq_len + head_idx * seq_len + t] = score;
+    att[1LL * batch_idx * n_heads * seq_len + 1LL * head_idx * seq_len + t] = score;
 }
 
 __global__ void attention_weighted_sum_kernel(float *output, const float *att,
@@ -545,14 +498,14 @@ __global__ void attention_weighted_sum_kernel(float *output, const float *att,
     int kv_dim = head_dim * (n_heads / 8);
     int kv_head = head_idx / 8;
 
-    const float *att_head = att + batch_idx * n_heads * seq_len + head_idx * seq_len;
-    float *out_head = output + batch_idx * n_heads * head_dim + head_idx * head_dim;
-
+    const float *att_head = att + 1LL * batch_idx * n_heads * seq_len + 1LL * head_idx * seq_len;
+    float *out_head = output + 1LL * batch_idx * n_heads * head_dim + 1LL * head_idx * head_dim;
+    
     float sum = 0.0f;
     for (int t = 0; t <= pos; t++)
     {
-        const float *v_head = value_cache + batch_idx * n_layers * seq_len * kv_dim +
-                              layer_idx * seq_len * kv_dim + t * kv_dim + kv_head * head_dim;
+        const float *v_head = value_cache + 1LL * batch_idx * n_layers * seq_len * kv_dim +
+                              1LL * layer_idx * seq_len * kv_dim + 1LL * t * kv_dim + 1LL * kv_head * head_dim;
         sum += att_head[t] * v_head[dim_idx];
     }
     out_head[dim_idx] = sum;
@@ -707,46 +660,6 @@ __global__ void matmul_kernel_safe(float *output, const float *input, const __hi
     }
 }
 
-__global__ void matmul_kernel_simple(float *output, const float *input, const __hip_bfloat16 *weight,
-                                     int batch_size, int input_dim, int output_dim)
-{
-    // Each thread will compute one element in the output matrix.
-    // blockIdx.x maps to the batch dimension.
-    // The combination of blockIdx.y, blockDim.y, and threadIdx.y maps to the output dimension.
-    int batch_idx = blockIdx.x;
-    int out_idx = blockIdx.y * blockDim.y + threadIdx.y;
-
-    // Bounds check: Ensure we are not writing out of bounds.
-    if (batch_idx >= batch_size || out_idx >= output_dim)
-    {
-        return;
-    }
-
-    // Initialize accumulator for this thread's output value.
-    float sum = 0.0f;
-
-    // Get a pointer to the start of the correct input vector for this batch.
-    const float *x_b = input + batch_idx * input_dim;
-
-    // Get a pointer to the start of the correct weight matrix row for this output.
-    const __hip_bfloat16 *w_row = weight + out_idx * input_dim;
-
-    // --- Core Logic (Same as CPU) ---
-    // This single thread performs the entire dot product.
-    for (int j = 0; j < input_dim; j++)
-    {
-        // Convert bfloat16 weight to fp32 on-the-fly
-        float weight_fp32 = __bfloat162float(w_row[j]);
-        sum += weight_fp32 * x_b[j];
-    }
-    // ---------------------------------
-
-    // Write the final result to the correct position in the output matrix.
-    output[batch_idx * output_dim + out_idx] = sum;
-}
-
-#include <hip/hip_runtime.h>
-#include <hip/hip_bf16.h>
 #include <rocwmma/rocwmma.hpp>
 
 // Wave-level WMMA tile sizes (fixed by hardware)
@@ -1576,31 +1489,10 @@ void attention_gpu(Transformer *transformer, int layer_idx, int batch_size)
         HIP_CHECK(hipGetLastError());
     }
 
-    dim3 matmul_grid(batch_size, ((p->n_attn_heads + 2 * p->n_kv_heads) * head_dim + 31) / 32);
-    dim3 matmul_block(32, min(32, THREADS_PER_BLOCK / 32));
     int qkv_weight_offset = layer_idx * hidden_dim * (head_dim * p->n_attn_heads + 2 * head_dim * p->n_kv_heads);
 
-    // Your existing variables: d_qkv, d_t, d_w_qkv, etc.
-    // ...
-
-    // Define block and grid dimensions
-    dim3 block_dim(32, 32); // A 2D block, e.g., 32x32 = 1024 threads.
-    dim3 grid_dim;
-    grid_dim.x = batch_size;
-    grid_dim.y = ((p->n_attn_heads + 2 * p->n_kv_heads) * head_dim + block_dim.y - 1) / block_dim.y; // Ceiling division
     {
         TIME_SCOPE(matmul_timer);
-        // QKV projection using safer matmul kernel - FIXED: Use GPU weight pointer
-        // Launch the simple kernel
-        /*
-        matmul_kernel_simple<<<grid_dim, block_dim>>>(
-            d_qkv,
-            d_t,
-            d_w_qkv + qkv_weight_offset,
-            batch_size,
-            hidden_dim,
-            (p->n_attn_heads + 2 * p->n_kv_heads) * head_dim);
-        */
 
         matmul(
             d_qkv,
@@ -1612,10 +1504,9 @@ void attention_gpu(Transformer *transformer, int layer_idx, int batch_size)
         HIP_CHECK(hipGetLastError());
     }
 
-    HIP_CHECK(hipGetLastError());
     // Add bias - FIXED: Use GPU bias pointer and proper kernel
     int qkv_bias_offset = layer_idx * (head_dim * p->n_attn_heads + 2 * head_dim * p->n_kv_heads);
-    dim3 bias_grid((batch_size * (p->n_attn_heads + 2 * p->n_kv_heads) * head_dim + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK);
+    dim3 bias_grid((1LL * batch_size * (p->n_attn_heads + 2 * p->n_kv_heads) * head_dim + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK);
 
     {
         TIME_SCOPE(add_bias_timer);
@@ -1632,8 +1523,8 @@ void attention_gpu(Transformer *transformer, int layer_idx, int batch_size)
     // Copy Q: shape [batch_size, n_attn_heads * head_dim]
     for (int b = 0; b < BATCH_SIZE; b++)
     {
-        float *src = d_qkv + b * (p->n_attn_heads + 2 * p->n_kv_heads) * head_dim;
-        float *dst = d_q + b * q_size;
+        float *src = d_qkv + 1LL * b * (p->n_attn_heads + 2 * p->n_kv_heads) * head_dim;
+        float *dst = d_q + 1LL * b * q_size;
         HIP_CHECK(hipMemcpy(dst, src, q_size * sizeof(float), hipMemcpyDeviceToDevice));
     }
 
@@ -1641,8 +1532,8 @@ void attention_gpu(Transformer *transformer, int layer_idx, int batch_size)
     int k_offset = p->n_attn_heads * head_dim;
     for (int b = 0; b < BATCH_SIZE; b++)
     {
-        float *src = d_qkv + b * (p->n_attn_heads + 2 * p->n_kv_heads) * head_dim + k_offset;
-        float *dst = d_k + b * k_size;
+        float *src = d_qkv + 1LL * b * (p->n_attn_heads + 2 * p->n_kv_heads) * head_dim + k_offset;
+        float *dst = d_k + 1LL * b * k_size;
         HIP_CHECK(hipMemcpy(dst, src, k_size * sizeof(float), hipMemcpyDeviceToDevice));
     }
 
@@ -1650,8 +1541,8 @@ void attention_gpu(Transformer *transformer, int layer_idx, int batch_size)
     int v_offset = (p->n_attn_heads + p->n_kv_heads) * head_dim;
     for (int b = 0; b < BATCH_SIZE; b++)
     {
-        float *src = d_qkv + b * (p->n_attn_heads + 2 * p->n_kv_heads) * head_dim + v_offset;
-        float *dst = d_v + b * v_size;
+        float *src = d_qkv + 1LL * b * (p->n_attn_heads + 2 * p->n_kv_heads) * head_dim + v_offset;
+        float *dst = d_v + 1LL * b * v_size;
         HIP_CHECK(hipMemcpy(dst, src, v_size * sizeof(float), hipMemcpyDeviceToDevice));
     }
 
@@ -1723,8 +1614,6 @@ void attention_gpu(Transformer *transformer, int layer_idx, int batch_size)
         HIP_CHECK(hipGetLastError());
     }
     // Output projection - FIXED: Use GPU weight pointer
-
-    grid_dim.y = (hidden_dim + block_dim.y - 1) / block_dim.y; // Ceiling division
 
     int attn_out_offset = layer_idx * (head_dim * p->n_attn_heads) * hidden_dim;
 
