@@ -5,9 +5,9 @@
 __global__ void swiglu_kernel(float *gate, float *up, float *output,
                               int batch_size, int intermediate_dim, float limit)
 {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    int batch_idx = idx / intermediate_dim;
-    int dim_idx = idx % intermediate_dim;
+    size_t idx = 1LL * blockIdx.x * blockDim.x + threadIdx.x;
+    size_t batch_idx = idx / intermediate_dim;
+    size_t dim_idx = idx % intermediate_dim;
 
     if (batch_idx >= batch_size || dim_idx >= intermediate_dim)
         return;

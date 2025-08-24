@@ -76,9 +76,9 @@ typedef struct {
   float *att;                  // attention scores (batch_size, n_attn_heads, seq_len)
   float *mask;                 // attention mask (seq_len, seq_len)
   
-  // KV cache
-  float *key_cache;            // (batch_size, n_layers, seq_len, kv_dim)
-  float *value_cache;          // (batch_size, n_layers, seq_len, kv_dim)
+  // KV cache - now using BF16 for 50% memory reduction
+  __hip_bfloat16 *key_cache;   // (batch_size, n_layers, seq_len, kv_dim)
+  __hip_bfloat16 *value_cache; // (batch_size, n_layers, seq_len, kv_dim)
   
   // RoPE buffers
   float *cos_vals;             // (head_dim/2, seq_len)
@@ -142,11 +142,12 @@ void malloc_gpu_run_state(GPURunState *s, Config *p)
     size_t total_memory = 0;
     size_t batch_hidden = BATCH_SIZE * p->hidden_dim * sizeof(float);
     size_t batch_qkv = BATCH_SIZE * p->head_dim * (p->n_attn_heads + 2 * p->n_kv_heads) * sizeof(float);
-    size_t kv_cache_size = BATCH_SIZE * p->n_layers * p->seq_len * kv_dim * sizeof(float);
+    // BF16 KV cache - 50% memory reduction compared to FP32
+    size_t kv_cache_size = BATCH_SIZE * p->n_layers * p->seq_len * kv_dim * sizeof(__hip_bfloat16);
 
     printf("Allocating GPU memory: batch_size=%d, hidden_dim=%d, seq_len=%d\n",
            BATCH_SIZE, p->hidden_dim, p->seq_len);
-    printf("KV cache size per batch: %zu MB\n", kv_cache_size / (1024 * 1024));
+    printf("KV cache size per batch (BF16): %zu MB (50%% reduction from FP32)\n", kv_cache_size / (1024 * 1024));
 
     // Allocate GPU memory with error checking
     HIP_CHECK(hipMalloc((void **)&s->x, batch_hidden));
@@ -588,7 +589,7 @@ void attention_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size)
     HIP_CHECK(hipGetLastError());
     // Add bias - FIXED: Use GPU bias pointer and proper kernel
     int qkv_bias_offset = layer_idx * (head_dim * p->n_attn_heads + 2 * head_dim * p->n_kv_heads);
-    dim3 bias_grid((batch_size * (p->n_attn_heads + 2 * p->n_kv_heads) * head_dim + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK);
+    dim3 bias_grid((1LL*batch_size * (p->n_attn_heads + 2 * p->n_kv_heads) * head_dim + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK);
 
     {
         TIME_SCOPE(add_bias_timer);
@@ -605,8 +606,8 @@ void attention_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size)
     // Copy Q: shape [batch_size, n_attn_heads * head_dim]
     for (int b = 0; b < BATCH_SIZE; b++)
     {
-        float *src = s->qkv + b * (p->n_attn_heads + 2 * p->n_kv_heads) * head_dim;
-        float *dst = s->q + b * q_size;
+        float *src = s->qkv + 1LL*b * (p->n_attn_heads + 2 * p->n_kv_heads) * head_dim;
+        float *dst = s->q + 1LL*b * q_size;
         HIP_CHECK(hipMemcpy(dst, src, q_size * sizeof(float), hipMemcpyDeviceToDevice));
     }
 
@@ -614,8 +615,8 @@ void attention_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size)
     int k_offset = p->n_attn_heads * head_dim;
     for (int b = 0; b < BATCH_SIZE; b++)
     {
-        float *src = s->qkv + b * (p->n_attn_heads + 2 * p->n_kv_heads) * head_dim + k_offset;
-        float *dst = s->k + b * k_size;
+        float *src = s->qkv + 1LL*b * (p->n_attn_heads + 2 * p->n_kv_heads) * head_dim + k_offset;
+        float *dst = s->k + 1LL*b * k_size;
         HIP_CHECK(hipMemcpy(dst, src, k_size * sizeof(float), hipMemcpyDeviceToDevice));
     }
 
@@ -623,8 +624,8 @@ void attention_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size)
     int v_offset = (p->n_attn_heads + p->n_kv_heads) * head_dim;
     for (int b = 0; b < BATCH_SIZE; b++)
     {
-        float *src = s->qkv + b * (p->n_attn_heads + 2 * p->n_kv_heads) * head_dim + v_offset;
-        float *dst = s->v + b * v_size;
+        float *src = s->qkv + 1LL*b * (p->n_attn_heads + 2 * p->n_kv_heads) * head_dim + v_offset;
+        float *dst = s->v + 1LL*b * v_size;
         HIP_CHECK(hipMemcpy(dst, src, v_size * sizeof(float), hipMemcpyDeviceToDevice));
     }
 
@@ -896,7 +897,7 @@ void moe_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size)
         // Add MLP2 bias
         {
             TIME_SCOPE(add_bias_timer);
-            dim3 bias_grid((h_batch_count * hidden_dim + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK);
+            dim3 bias_grid((1LL*h_batch_count * hidden_dim + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK);
             add_bias_kernel<<<bias_grid, THREADS_PER_BLOCK>>>(
                 expert_output_ptr, w->b_mlp2 + (layer_idx * n_experts + expert_id) * hidden_dim, h_batch_count, hidden_dim);
             HIP_CHECK(hipGetLastError());

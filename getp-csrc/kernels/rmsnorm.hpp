@@ -6,14 +6,14 @@
 __global__ void rmsnorm_kernel(float *output, const float *input, const __hip_bfloat16 *weight,
                                int batch_size, int size)
 {
-    int batch_idx = blockIdx.x;
-    int tid = threadIdx.x;
+    size_t batch_idx = blockIdx.x;
+    size_t tid = threadIdx.x;
 
     if (batch_idx >= batch_size)
         return;
 
-    const float *x = input + batch_idx * size;
-    float *o = output + batch_idx * size;
+    const float *x = input + 1LL * batch_idx * size;
+    float *o = output + 1LL * batch_idx * size;
 
     // Shared memory for reduction
     __shared__ float shared_ss[THREADS_PER_BLOCK];

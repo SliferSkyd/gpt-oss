@@ -4,13 +4,13 @@
 
 __global__ void softmax_kernel(float *x, int batch_size, int size)
 {
-    int batch_idx = blockIdx.x;
-    int tid = threadIdx.x;
+    size_t batch_idx = blockIdx.x;
+    size_t tid = threadIdx.x;
 
     if (batch_idx >= batch_size)
         return;
 
-    float *batch_x = x + batch_idx * size;
+    float *batch_x = x + 1LL * batch_idx * size;
 
     __shared__ float shared_max[THREADS_PER_BLOCK];
     __shared__ float shared_sum[THREADS_PER_BLOCK];

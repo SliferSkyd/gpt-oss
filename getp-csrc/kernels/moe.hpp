@@ -5,14 +5,14 @@
 __global__ void split_gate_up_kernel(float *gate, float *up, const float *mlp1_out,
                                      const __hip_bfloat16 *bias, int batch_size, int intermediate_dim)
 {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    int batch_idx = idx / intermediate_dim;
-    int dim_idx = idx % intermediate_dim;
+    size_t idx = 1LL * blockIdx.x * blockDim.x + threadIdx.x;
+    size_t batch_idx = idx / intermediate_dim;
+    size_t dim_idx = idx % intermediate_dim;
 
     if (batch_idx >= batch_size || dim_idx >= intermediate_dim)
         return;
 
-    int mlp1_idx = batch_idx * 2 * intermediate_dim;
+    size_t mlp1_idx = 1LL * batch_idx * 2 * intermediate_dim;
     // Convert bfloat16 bias to fp32 on-the-fly
     float bias_gate_fp32 = __bfloat162float(bias[2 * dim_idx]);
     float bias_up_fp32 = __bfloat162float(bias[2 * dim_idx + 1]);
@@ -30,9 +30,9 @@ __global__ void topk_kernel(float *topk_values, int *topk_indices, const float *
     if (batch_idx >= batch_size)
         return;
 
-    const float *batch_scores = scores + batch_idx * n_experts;
-    float *batch_topk_v = topk_values + batch_idx * k;
-    int *batch_topk_i = topk_indices + batch_idx * k;
+    const float *batch_scores = scores + 1LL * batch_idx * n_experts;
+    float *batch_topk_v = topk_values + 1LL * batch_idx * k;
+    int *batch_topk_i = topk_indices + 1LL * batch_idx * k;
 
     // Simple selection sort for top-k (works well for small k)
     for (int i = 0; i < k; i++)

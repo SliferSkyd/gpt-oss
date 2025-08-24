@@ -5,8 +5,8 @@
 __global__ void accumulate_kernel(float *a, const float *b, float factor,
                                   int batch_size, int size)
 {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    int total_size = batch_size * size;
+    size_t idx = 1LL * blockIdx.x * blockDim.x + threadIdx.x;
+    size_t total_size = batch_size * size;
 
     if (idx < total_size)
     {
@@ -17,7 +17,7 @@ __global__ void accumulate_kernel(float *a, const float *b, float factor,
 // NEW: Kernel to add bias to matrix multiplication result with bfloat16 bias
 __global__ void add_bias_kernel(float *output, const __hip_bfloat16 *bias, int batch_size, int size)
 {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    size_t idx = 1LL * blockIdx.x * blockDim.x + threadIdx.x;
     if (idx < batch_size * size)
     {
         int dim_idx = idx % size;
@@ -27,15 +27,15 @@ __global__ void add_bias_kernel(float *output, const __hip_bfloat16 *bias, int b
     }
 }
 
-// NEW: KV cache update kernel
-__global__ void update_kv_cache_kernel(float *key_cache, float *value_cache,
+// NEW: KV cache update kernel with BF16 quantization
+__global__ void update_kv_cache_kernel(__hip_bfloat16 *key_cache, __hip_bfloat16 *value_cache,
                                        const float *k, const float *v,
                                        const int *positions, int batch_size,
                                        int n_layers, int layer_idx, int seq_len,
                                        int kv_dim)
 {
-    int batch_idx = blockIdx.x;
-    int dim_idx = blockIdx.y * blockDim.y + threadIdx.y;
+    size_t batch_idx = blockIdx.x;
+    size_t dim_idx = 1LL * blockIdx.y * blockDim.y + threadIdx.y;
 
     if (batch_idx >= batch_size || dim_idx >= kv_dim)
         return;
@@ -44,24 +44,24 @@ __global__ void update_kv_cache_kernel(float *key_cache, float *value_cache,
     if (pos >= seq_len)
         return; // Safety check
 
-    // Update key cache
-    int k_cache_idx = batch_idx * n_layers * seq_len * kv_dim +
+    // Update key cache - convert FP32 to BF16 for memory efficiency
+    size_t k_cache_idx = batch_idx * n_layers * seq_len * kv_dim +
                       layer_idx * seq_len * kv_dim + pos * kv_dim + dim_idx;
-    key_cache[k_cache_idx] = k[batch_idx * kv_dim + dim_idx];
+    key_cache[k_cache_idx] = __float2bfloat16(k[1LL*batch_idx * kv_dim + dim_idx]);
 
-    // Update value cache
-    int v_cache_idx = batch_idx * n_layers * seq_len * kv_dim +
+    // Update value cache - convert FP32 to BF16 for memory efficiency
+    size_t v_cache_idx = batch_idx * n_layers * seq_len * kv_dim +
                       layer_idx * seq_len * kv_dim + pos * kv_dim + dim_idx;
-    value_cache[v_cache_idx] = v[batch_idx * kv_dim + dim_idx];
+    value_cache[v_cache_idx] = __float2bfloat16(v[1LL*batch_idx * kv_dim + dim_idx]);
 }
 
 
 __global__ void copy_embeddings_kernel(float *output, const __hip_bfloat16 *embeddings,
                                        const int *tokens, int batch_size, int hidden_dim)
 {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    int batch_idx = idx / hidden_dim;
-    int dim_idx = idx % hidden_dim;
+    size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    size_t batch_idx = idx / hidden_dim;
+    size_t dim_idx = idx % hidden_dim;
 
     if (batch_idx >= batch_size || dim_idx >= hidden_dim)
         return;

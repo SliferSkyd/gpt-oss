@@ -6,9 +6,9 @@ __global__ void apply_rotary_emb_kernel(float *x, const float *cos_vals, const f
                                         const int *positions, int batch_size,
                                         int n_heads, int head_dim)
 {
-    int batch_idx = blockIdx.x;
-    int head_idx = blockIdx.y;
-    int dim_idx = threadIdx.x;
+    size_t batch_idx = blockIdx.x;
+    size_t head_idx = blockIdx.y;
+    size_t dim_idx = threadIdx.x;
 
     if (batch_idx >= batch_size || head_idx >= n_heads)
         return;
