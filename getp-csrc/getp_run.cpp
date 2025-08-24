@@ -1016,7 +1016,7 @@ long long batched_generate_gpu(GPUTransformer *gpu_t, Tokenizer *tokenizer,
             const char *input_seq = get_str_req_ptr(requests, req_idx);
 
             // Encode prompt
-            encode(tokenizer, input_seq, 1, 0, cpu_buf->prompt_tokens[b],
+            encode(tokenizer, input_seq, -1, -1, cpu_buf->prompt_tokens[b],
                    &cpu_buf->prompt_lens[b], p->initial_context_length);
 
             if (cpu_buf->prompt_lens[b] < 1)

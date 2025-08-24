@@ -66,7 +66,7 @@ We will tackle this project in phases. I will prompt you for help on specific it
 ### Phase 2: Memory Optimization 🧠
 - **Goal:** Minimize memory footprint and data movement overhead.
 - **Tasks:**
-    - Design a memory layout for MXFP4 quantized weights.
+    - Design a memory layout for MXFP4 quantized weights. (done)
     - Optimize the model loading process to map weights directly to GPU memory efficiently.
 
 ### Phase 3: Compute Kernel Optimization ⚡

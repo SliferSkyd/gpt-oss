@@ -63,7 +63,6 @@ run_inference() {
     ./scripts/run.sh run \
         --checkpoint ${MODELBIN_ROOT}/gpt-oss-20b.bin \
         -m getp \
-        -n 20 \
         -i data/input.txt \
         -o data/output.txt
     
