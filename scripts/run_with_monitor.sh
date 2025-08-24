@@ -65,6 +65,7 @@ run_inference() {
         -m getp \
         -i data/input.txt \
         -o data/output.txt
+        # -n 64 \
     
     local exit_code=$?
     echo "Inference completed with exit code: $exit_code"

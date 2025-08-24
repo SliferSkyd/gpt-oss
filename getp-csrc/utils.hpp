@@ -1,4 +1,5 @@
 
+#pragma once
 // HIP error checking macro
 #define HIP_CHECK(call)                                                                                 \
     do                                                                                                  \
