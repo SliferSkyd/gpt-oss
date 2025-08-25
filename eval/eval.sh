@@ -1,1 +1,1 @@
-python eval.py -p ../data/input.txt -s ../data/output.txt -r ./ref_test.json 
+python eval.py -p ../data/input.txt -s ../data/output.txt -r ./refs_openai_gpt5.jsonl 
