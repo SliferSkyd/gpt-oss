@@ -1105,16 +1105,19 @@ long long continuous_batching_inference(GPUTransformer *gpu_t, Tokenizer *tokeni
             float *logits_slot = logits + slot * p->vocab_size;
             
             int next_token;
-            if (pos < cpu_buf->prompt_lens[slot] - 1) {
-                // Still processing prompt
-                next_token = cpu_buf->prompt_tokens[slot][pos + 1];
+            // Advance position first  
+            pos++;
+            
+            if (pos < cpu_buf->prompt_lens[slot]) {
+                // Still processing prompt - force next prompt token
+                next_token = cpu_buf->prompt_tokens[slot][pos];
             } else {
                 // Generate new token
                 next_token = sample(sampler, logits_slot);
                 
                 // Save generated token
                 int *output_tokens = get_tok_gen_ptr(requests, req_idx);
-                int gen_pos = pos - (cpu_buf->prompt_lens[slot] - 1);
+                int gen_pos = pos - cpu_buf->prompt_lens[slot];
                 if (gen_pos >= 0 && gen_pos < requests->max_seq_len) {
                     output_tokens[gen_pos] = next_token;
                     total_tokens_generated++;
@@ -1132,7 +1135,7 @@ long long continuous_batching_inference(GPUTransformer *gpu_t, Tokenizer *tokeni
                 // fprintf(stderr, "Request %d completed at position %d with token %d\n", req_idx, pos, next_token);
                 // Mark end of generation
                 int *output_tokens = get_tok_gen_ptr(requests, req_idx);
-                int gen_pos = pos - (cpu_buf->prompt_lens[slot] - 1) + 1;
+                int gen_pos = pos - cpu_buf->prompt_lens[slot] + 1;
                 if (gen_pos >= 0 && gen_pos < requests->max_seq_len) {
                     output_tokens[gen_pos] = -1; // End marker
                 }
@@ -1166,7 +1169,7 @@ long long continuous_batching_inference(GPUTransformer *gpu_t, Tokenizer *tokeni
                 }
             } else {
                 // Continue generation
-                cpu_buf->positions[slot]++;
+                cpu_buf->positions[slot] = pos;
                 cpu_buf->seq_lengths_cpu[slot]++;
                 cpu_buf->current_tokens[slot] = next_token;
             }
@@ -1273,10 +1276,13 @@ long long batched_generate_gpu(GPUTransformer *gpu_t, Tokenizer *tokenizer,
                 float *logits_b = logits + b * p->vocab_size;
 
                 int next_token;
-                if (pos < cpu_buf->prompt_lens[b] - 1)
+                // Advance position first
+                pos++;
+                
+                if (pos < cpu_buf->prompt_lens[b])
                 {
-                    // Still processing prompt
-                    next_token = cpu_buf->prompt_tokens[b][pos + 1];
+                    // Still processing prompt - force next prompt token
+                    next_token = cpu_buf->prompt_tokens[b][pos];
                 }
                 else
                 {
@@ -1285,7 +1291,7 @@ long long batched_generate_gpu(GPUTransformer *gpu_t, Tokenizer *tokenizer,
 
                     // Save generated token
                     int *output_tokens = get_tok_gen_ptr(requests, req_idx);
-                    int gen_pos = pos - (cpu_buf->prompt_lens[b] - 1);
+                    int gen_pos = pos - cpu_buf->prompt_lens[b];
                     if (gen_pos >= 0 && gen_pos < requests->max_seq_len)
                     {
                         output_tokens[gen_pos] = next_token;
@@ -1299,7 +1305,7 @@ long long batched_generate_gpu(GPUTransformer *gpu_t, Tokenizer *tokenizer,
                     --alive;
                     cpu_buf->finished[b] = true;
                     int *output_tokens = get_tok_gen_ptr(requests, req_idx);
-                    int gen_pos = pos - (cpu_buf->prompt_lens[b] - 1) + 1;
+                    int gen_pos = pos - cpu_buf->prompt_lens[b] + 1;
                     if (gen_pos >= 0 && gen_pos < requests->max_seq_len)
                     {
                         output_tokens[gen_pos] = -1; // End marker
@@ -1308,7 +1314,7 @@ long long batched_generate_gpu(GPUTransformer *gpu_t, Tokenizer *tokenizer,
                 }
 
                 // Update for next iteration
-                cpu_buf->positions[b]++;
+                cpu_buf->positions[b] = pos;
                 cpu_buf->current_tokens[b] = next_token;
             }
         }
@@ -1349,7 +1355,7 @@ long long inference(Transformer *transformer, Tokenizer *tokenizer,
                     Sampler *sampler, Requests *requests)
 {
     // Use continuous batching for better throughput
-    return batched_generate_gpu(gpu_transformer, tokenizer, sampler, requests);
+    return continuous_batching_inference(gpu_transformer, tokenizer, sampler, requests);
 }
 
 /*
