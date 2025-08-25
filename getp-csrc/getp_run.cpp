@@ -1200,7 +1200,7 @@ long long continuous_batching_inference(GPUTransformer *gpu_t, Tokenizer *tokeni
         
         // Decode and print generated tokens
         int prev_token = last_prompt_token;
-        for (int i = 0;; ++i) {
+        for (int i = 0; i < max_steps; ++i) {
             int token = output_tokens[i];
             if (token == -1) break;
             
@@ -1327,7 +1327,7 @@ long long batched_generate_gpu(GPUTransformer *gpu_t, Tokenizer *tokenizer,
             // Decode and print generated tokens
             int last_prompt_token = cpu_buf->prompt_tokens[b][cpu_buf->prompt_lens[b] - 1];
             int prev_token = last_prompt_token;
-            for (int i = 0;; ++i)
+            for (int i = 0; i < max_steps; ++i)
             {
                 int token = output_tokens[i];
                 if (token == -1)
@@ -1349,7 +1349,7 @@ long long inference(Transformer *transformer, Tokenizer *tokenizer,
                     Sampler *sampler, Requests *requests)
 {
     // Use continuous batching for better throughput
-    return continuous_batching_inference(gpu_transformer, tokenizer, sampler, requests);
+    return batched_generate_gpu(gpu_transformer, tokenizer, sampler, requests);
 }
 
 /*
