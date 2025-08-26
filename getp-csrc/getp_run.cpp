@@ -27,8 +27,6 @@
 #ifndef GETP_RUN
 #define GETP_RUN
 
-
-
 // GPU Transformer Weights struct - stores all model weights on GPU in bfloat16 format
 typedef struct {
   // Embedding weights
@@ -164,10 +162,10 @@ void malloc_gpu_run_state(GPURunState *s, Config *p)
     size_t batch_hidden = BATCH_SIZE * p->hidden_dim * sizeof(float);
     size_t batch_qkv = BATCH_SIZE * p->head_dim * (p->n_attn_heads + 2 * p->n_kv_heads) * sizeof(float);
     // BF16 KV cache - 50% memory reduction compared to FP32
-    size_t kv_cache_size = BATCH_SIZE * p->n_layers * p->seq_len * kv_dim * sizeof(__hip_bfloat16);
+    size_t kv_cache_size = BATCH_SIZE * p->n_layers * MAX_SEQ_LEN * kv_dim * sizeof(__hip_bfloat16);
 
     printf("Allocating GPU memory: batch_size=%d, hidden_dim=%d, seq_len=%d\n",
-           BATCH_SIZE, p->hidden_dim, p->seq_len);
+           BATCH_SIZE, p->hidden_dim, MAX_SEQ_LEN);
     printf("KV cache size per batch (BF16): %zu MB (50%% reduction from FP32)\n", kv_cache_size / (1024 * 1024));
 
     // Allocate GPU memory with error checking
@@ -198,7 +196,7 @@ void malloc_gpu_run_state(GPURunState *s, Config *p)
     HIP_CHECK(hipMalloc((void **)&s->key_cache, kv_cache_size));
     HIP_CHECK(hipMalloc((void **)&s->value_cache, kv_cache_size));
 
-    HIP_CHECK(hipMalloc((void **)&s->att, BATCH_SIZE * p->n_attn_heads * p->seq_len * sizeof(float)));
+    HIP_CHECK(hipMalloc((void **)&s->att, BATCH_SIZE * p->n_attn_heads * MAX_SEQ_LEN * sizeof(float)));
     HIP_CHECK(hipMalloc((void **)&s->logits, BATCH_SIZE * p->vocab_size * sizeof(float)));
     HIP_CHECK(hipMalloc((void **)&s->router_score, BATCH_SIZE * p->n_experts * sizeof(float)));
     HIP_CHECK(hipMalloc((void **)&s->topk_v, BATCH_SIZE * p->experts_per_token * sizeof(float)));
@@ -210,8 +208,8 @@ void malloc_gpu_run_state(GPURunState *s, Config *p)
     HIP_CHECK(hipMalloc((void **)&s->e_agg, batch_hidden));
     HIP_CHECK(hipMalloc((void **)&s->current_tokens, BATCH_SIZE * sizeof(int)));
     HIP_CHECK(hipMalloc((void **)&s->positions, BATCH_SIZE * sizeof(int)));
-    HIP_CHECK(hipMalloc((void **)&s->cos_vals, (p->head_dim / 2) * p->seq_len * sizeof(float)));
-    HIP_CHECK(hipMalloc((void **)&s->sin_vals, (p->head_dim / 2) * p->seq_len * sizeof(float)));
+    HIP_CHECK(hipMalloc((void **)&s->cos_vals, (p->head_dim / 2) * MAX_SEQ_LEN * sizeof(float)));
+    HIP_CHECK(hipMalloc((void **)&s->sin_vals, (p->head_dim / 2) * MAX_SEQ_LEN * sizeof(float)));
     HIP_CHECK(hipMalloc((void **)&s->expert_input_buffer, batch_hidden * expert_per_token));
     HIP_CHECK(hipMalloc((void **)&s->temp_buffer, batch_hidden));
     
@@ -231,7 +229,7 @@ void malloc_gpu_run_state(GPURunState *s, Config *p)
     HIP_CHECK(hipMemset(s->v, 0, BATCH_SIZE * kv_dim * sizeof(float)));
     HIP_CHECK(hipMemset(s->key_cache, 0, kv_cache_size));
     HIP_CHECK(hipMemset(s->value_cache, 0, kv_cache_size));
-    HIP_CHECK(hipMemset(s->att, 0, BATCH_SIZE * p->n_attn_heads * p->seq_len * sizeof(float)));
+    HIP_CHECK(hipMemset(s->att, 0, BATCH_SIZE * p->n_attn_heads * MAX_SEQ_LEN * sizeof(float)));
     HIP_CHECK(hipMemset(s->logits, 0, BATCH_SIZE * p->vocab_size * sizeof(float)));
     
     // Initialize continuous batching fields
@@ -241,7 +239,7 @@ void malloc_gpu_run_state(GPURunState *s, Config *p)
 
     if (p->sliding_window > 0)
     {
-        size_t mask_size = p->seq_len * p->seq_len * sizeof(float);
+        size_t mask_size = MAX_SEQ_LEN * MAX_SEQ_LEN * sizeof(float);
         HIP_CHECK(hipMalloc((void **)&s->mask, mask_size));
 
         // Initialize mask on GPU if needed
@@ -252,11 +250,11 @@ void malloc_gpu_run_state(GPURunState *s, Config *p)
             exit(EXIT_FAILURE);
         }
 
-        for (int i = 0; i < p->seq_len; i++)
+        for (int i = 0; i < MAX_SEQ_LEN; i++)
         {
-            for (int j = 0; j < p->seq_len; j++)
+            for (int j = 0; j < MAX_SEQ_LEN; j++)
             {
-                h_mask[i * p->seq_len + j] = (i - j >= p->sliding_window) ? -INFINITY : 0.0f;
+                h_mask[i * MAX_SEQ_LEN + j] = (i - j >= p->sliding_window) ? -INFINITY : 0.0f;
             }
         }
         HIP_CHECK(hipMemcpy(s->mask, h_mask, mask_size, hipMemcpyHostToDevice));
@@ -419,15 +417,15 @@ void copy_weights_to_gpu(Transformer *transformer, GPUTransformerWeights *gpu_we
 void malloc_cpu_buffers(CPUBuffers *cpu_buf, Config *p)
 {
     // CPU allocation for RoPE values (used in warmup only)
-    cpu_buf->cos_vals = (float *)malloc((p->head_dim / 2) * p->seq_len * sizeof(float));
-    cpu_buf->sin_vals = (float *)malloc((p->head_dim / 2) * p->seq_len * sizeof(float));
+    cpu_buf->cos_vals = (float *)malloc((p->head_dim / 2) * MAX_SEQ_LEN * sizeof(float));
+    cpu_buf->sin_vals = (float *)malloc((p->head_dim / 2) * MAX_SEQ_LEN * sizeof(float));
 
     // CPU allocations for batch management
     cpu_buf->prompt_tokens = (int **)malloc(BATCH_SIZE * sizeof(int *));
     cpu_buf->current_tokens = (int *)malloc(BATCH_SIZE * sizeof(int));
     for (int b = 0; b < BATCH_SIZE; b++)
     {
-        cpu_buf->prompt_tokens[b] = (int *)malloc((p->seq_len + 3) * sizeof(int));
+        cpu_buf->prompt_tokens[b] = (int *)malloc((MAX_SEQ_LEN + 3) * sizeof(int));
     }
     cpu_buf->finished = (bool *)malloc(BATCH_SIZE * sizeof(bool));
     cpu_buf->positions = (int *)malloc(BATCH_SIZE * sizeof(int));
@@ -471,7 +469,7 @@ void warm_up(Transformer *transformer, Tokenizer *tokenizer)
     float ntk_beta = 32.0f;
     float ntk_alpha = 1.0f;
 
-    for (int pos = 0; pos < p->seq_len; ++pos)
+    for (int pos = 0; pos < MAX_SEQ_LEN; ++pos)
     {
         compute_cos_sin_getp(pos, p->rope_theta, p->head_dim, p->rope_scaling_factor,
                              p->initial_context_length, ntk_beta, ntk_alpha,
@@ -481,9 +479,9 @@ void warm_up(Transformer *transformer, Tokenizer *tokenizer)
 
     // Copy RoPE values to GPU
     HIP_CHECK(hipMemcpy(gpu_transformer->state.cos_vals, gpu_transformer->cpu_buffers.cos_vals, 
-                        (p->head_dim / 2) * p->seq_len * sizeof(float), hipMemcpyHostToDevice));
+                        (p->head_dim / 2) * MAX_SEQ_LEN * sizeof(float), hipMemcpyHostToDevice));
     HIP_CHECK(hipMemcpy(gpu_transformer->state.sin_vals, gpu_transformer->cpu_buffers.sin_vals, 
-                        (p->head_dim / 2) * p->seq_len * sizeof(float), hipMemcpyHostToDevice));
+                        (p->head_dim / 2) * MAX_SEQ_LEN * sizeof(float), hipMemcpyHostToDevice));
 }
 
 void free_gpu_weights(GPUTransformerWeights *w)
@@ -711,18 +709,18 @@ void attention_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size)
         TIME_SCOPE(update_kv_cache_timer);
         update_kv_cache_kernel<<<kv_grid, kv_block>>>(
             s->key_cache, s->value_cache, s->k, s->v, s->positions, batch_size,
-            p->n_layers, layer_idx, p->seq_len, kv_dim);
+            p->n_layers, layer_idx, MAX_SEQ_LEN, kv_dim);
         HIP_CHECK(hipGetLastError());
     }
 
     // Compute attention scores
-    dim3 att_grid(batch_size, p->n_attn_heads, (p->seq_len + 31) / 32);
+    dim3 att_grid(batch_size, p->n_attn_heads, (MAX_SEQ_LEN + 31) / 32);
     dim3 att_block(1, 1, 32);
     {
         TIME_SCOPE(attention_scores_kernel_timer);
         attention_scores_kernel<<<att_grid, att_block>>>(
             s->att, s->q, s->key_cache, s->mask, s->positions, batch_size, p->n_attn_heads,
-            head_dim, p->seq_len, p->n_layers, layer_idx, p->sliding_window > 0);
+            head_dim, MAX_SEQ_LEN, p->n_layers, layer_idx, p->sliding_window > 0);
         HIP_CHECK(hipGetLastError());
     }
 
@@ -732,7 +730,7 @@ void attention_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size)
         TIME_SCOPE(add_sinks_kernel_timer);
         add_sinks_kernel<<<sink_grid, sink_block>>>(
             s->att, w->attn_sinks + layer_idx * p->n_attn_heads, s->positions,
-            p->seq_len, p->n_attn_heads);
+            MAX_SEQ_LEN, p->n_attn_heads);
         HIP_CHECK(hipGetLastError());
     }
 
@@ -742,7 +740,7 @@ void attention_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size)
     {
         TIME_SCOPE(softmax_kernel_timer);
         softmax_kernel_variable_len<<<soft_grid, soft_block>>>(
-            s->att, s->positions, batch_size, p->n_attn_heads, p->seq_len);
+            s->att, s->positions, batch_size, p->n_attn_heads, MAX_SEQ_LEN);
         HIP_CHECK(hipGetLastError());
     }
 
@@ -753,7 +751,7 @@ void attention_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size)
         TIME_SCOPE(matmul_kernel_simple_timer);
         attention_weighted_sum_kernel<<<wsum_grid, wsum_block>>>(
             s->tb, s->att, s->value_cache, s->positions, batch_size, p->n_attn_heads,
-            head_dim, p->seq_len, p->n_layers, layer_idx);
+            head_dim, MAX_SEQ_LEN, p->n_layers, layer_idx);
         HIP_CHECK(hipGetLastError());
     }
     // Output projection - FIXED: Use GPU weight pointer
@@ -1139,7 +1137,7 @@ long long continuous_batching_inference(GPUTransformer *gpu_t, Tokenizer *tokeni
             
             // Check for completion
             bool completed = (next_token == 199999 || next_token == 200002 || 
-                            pos >= max_steps - 1 || pos >= p->seq_len - 2);
+                            pos >= max_steps - 1 || pos >= MAX_SEQ_LEN - 2);
             
             if (completed) {
                 if (next_token == 199999 || next_token == 200002){
@@ -1208,7 +1206,7 @@ long long continuous_batching_inference(GPUTransformer *gpu_t, Tokenizer *tokeni
         
         // Find last token of prompt for context
         int prompt_len = strlen(input_seq);
-        int *temp_tokens = (int *)malloc((p->seq_len + 3) * sizeof(int));
+        int *temp_tokens = (int *)malloc((MAX_SEQ_LEN + 3) * sizeof(int));
         int temp_len;
         encode(tokenizer, input_seq, -1, -1, temp_tokens, &temp_len, p->initial_context_length);
         int last_prompt_token = temp_tokens[temp_len - 1];
