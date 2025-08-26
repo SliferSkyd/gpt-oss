@@ -99,6 +99,12 @@ typedef struct {
   float *expert_weights;       // expert weights for scatter/gather (batch_size * experts_per_token)
   int *batch_count;            // batch count for expert processing
   
+  // Persistent expert routing buffers (avoid hipMalloc/hipFree in forward pass)
+  int *d_expert_counts;        // token counts per expert (n_experts)
+  int *d_expert_offsets;       // prefix sum of expert counts (n_experts)
+  int *d_expert_write_idx;     // write indices for expert gathering (n_experts)
+  int *d_total_tokens;         // total tokens across all experts (1 element)
+  
   // Token and position buffers
   int *current_tokens;         // current tokens (batch_size)
   int *positions;              // current positions (batch_size)
@@ -148,6 +154,10 @@ void malloc_gpu_run_state(GPURunState *s, Config *p)
 
     // Initialize pointers to NULL
     s->mask = NULL;
+    s->d_expert_counts = NULL;
+    s->d_expert_offsets = NULL;
+    s->d_expert_write_idx = NULL;
+    s->d_total_tokens = NULL;
 
     // Check memory requirements and print for debugging
     size_t total_memory = 0;
@@ -177,6 +187,12 @@ void malloc_gpu_run_state(GPURunState *s, Config *p)
     HIP_CHECK(hipMalloc((void **)&s->batch_count, sizeof(int)));
     // This buffer holds the expert's final output before scattering
     HIP_CHECK(hipMalloc((void **)&s->expert_output_buffer, BATCH_SIZE * p->hidden_dim * sizeof(float) * expert_per_token));
+    
+    // Persistent expert routing buffers to avoid hipMalloc/hipFree in forward pass
+    HIP_CHECK(hipMalloc((void **)&s->d_expert_counts, p->n_experts * sizeof(int)));
+    HIP_CHECK(hipMalloc((void **)&s->d_expert_offsets, p->n_experts * sizeof(int)));
+    HIP_CHECK(hipMalloc((void **)&s->d_expert_write_idx, p->n_experts * sizeof(int)));
+    HIP_CHECK(hipMalloc((void **)&s->d_total_tokens, sizeof(int)));
 
     // KV cache allocation - this is usually the largest allocation
     HIP_CHECK(hipMalloc((void **)&s->key_cache, kv_cache_size));
@@ -522,6 +538,10 @@ void free_gpu_run_state(GPURunState *s)
     if (s->expert_indices) HIP_CHECK(hipFree(s->expert_indices));
     if (s->expert_weights) HIP_CHECK(hipFree(s->expert_weights));
     if (s->batch_count) HIP_CHECK(hipFree(s->batch_count));
+    if (s->d_expert_counts) HIP_CHECK(hipFree(s->d_expert_counts));
+    if (s->d_expert_offsets) HIP_CHECK(hipFree(s->d_expert_offsets));
+    if (s->d_expert_write_idx) HIP_CHECK(hipFree(s->d_expert_write_idx));
+    if (s->d_total_tokens) HIP_CHECK(hipFree(s->d_total_tokens));
     if (s->current_tokens) HIP_CHECK(hipFree(s->current_tokens));
     if (s->positions) HIP_CHECK(hipFree(s->positions));
     if (s->logits) HIP_CHECK(hipFree(s->logits));
@@ -827,12 +847,7 @@ void moe_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size)
     HIP_CHECK(hipMemset(s->e_agg, 0, batch_size * hidden_dim * sizeof(float)));
 
     // --- 🚀 OPTIMIZED TWO-STAGE GATHER ALGORITHM 🚀 ---
-    int *d_expert_counts;
-    int *d_expert_offsets;
-    int *d_expert_write_idx;
-    HIP_CHECK(hipMalloc(&d_expert_counts, n_experts * sizeof(int)));
-    HIP_CHECK(hipMalloc(&d_expert_offsets, n_experts * sizeof(int)));
-    HIP_CHECK(hipMalloc(&d_expert_write_idx, n_experts * sizeof(int)));
+    // Use pre-allocated persistent buffers instead of dynamic allocation
 
     // **FIX:** Declare host-side arrays and total_tokens here, before the timed scope
     int h_expert_counts[n_experts];
@@ -843,28 +858,29 @@ void moe_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size)
         TIME_SCOPE(gather_expert_inputs_kernel_timer); // Timing the entire gather operation
 
         // === STAGE 1: COUNT TOKENS PER EXPERT ===
-        HIP_CHECK(hipMemset(d_expert_counts, 0, n_experts * sizeof(int)));
+        HIP_CHECK(hipMemset(s->d_expert_counts, 0, n_experts * sizeof(int)));
         dim3 count_grid((batch_size + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK);
         count_tokens_per_expert_kernel<<<count_grid, THREADS_PER_BLOCK>>>(
-            s->topk_i, d_expert_counts, batch_size, experts_per_token);
+            s->topk_i, s->d_expert_counts, batch_size, experts_per_token);
         HIP_CHECK(hipGetLastError());
 
         // === CALCULATE OFFSETS (PREFIX SUM ON CPU) ===
-        HIP_CHECK(hipMemcpy(h_expert_counts, d_expert_counts, n_experts * sizeof(int), hipMemcpyDeviceToHost));
+        HIP_CHECK(hipMemcpy(h_expert_counts, s->d_expert_counts, n_experts * sizeof(int), hipMemcpyDeviceToHost));
 
         for (int i = 0; i < n_experts; ++i)
         {
             h_expert_offsets[i] = total_tokens;
             total_tokens += h_expert_counts[i];
         }
-        HIP_CHECK(hipMemcpy(d_expert_offsets, h_expert_offsets, n_experts * sizeof(int), hipMemcpyHostToDevice));
+        HIP_CHECK(hipMemcpy(s->d_expert_offsets, h_expert_offsets, n_experts * sizeof(int), hipMemcpyHostToDevice));
 
         // === STAGE 2: PERMUTE INPUTS WITH COALESCED COPY ===
-        HIP_CHECK(hipMemset(d_expert_write_idx, 0, n_experts * sizeof(int)));
+        HIP_CHECK(hipMemset(s->d_expert_write_idx, 0, n_experts * sizeof(int)));
         dim3 permute_grid(batch_size); // One block per token
         dim3 permute_block(256);       // Block size for efficient copying
-        permute_expert_inputs_kernel<<<permute_grid, permute_block>>>(
-            s->t, s->topk_i, s->topk_v, d_expert_offsets, d_expert_write_idx,
+        int shared_mem_size = experts_per_token * sizeof(int); // For destination_indices
+        permute_expert_inputs_kernel<<<permute_grid, permute_block, shared_mem_size>>>(
+            s->t, s->topk_i, s->topk_v, s->d_expert_offsets, s->d_expert_write_idx,
             batch_size, hidden_dim, experts_per_token,
             s->expert_input_buffer, s->expert_indices, s->expert_weights);
         HIP_CHECK(hipGetLastError());
@@ -966,10 +982,7 @@ void moe_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size)
         HIP_CHECK(hipGetLastError());
     }
 
-    // Free the temporary buffers used in the gather operation
-    HIP_CHECK(hipFree(d_expert_counts));
-    HIP_CHECK(hipFree(d_expert_offsets));
-    HIP_CHECK(hipFree(d_expert_write_idx));
+    // No need to free buffers - they're persistent and reused across calls
 }
 
 float *forward_batch_gpu(GPUTransformer *gpu_t, int *tokens, int batch_size)
