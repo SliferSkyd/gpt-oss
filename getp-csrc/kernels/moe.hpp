@@ -241,8 +241,8 @@ __global__ void permute_expert_inputs_kernel(const float *d_t, const int *topk_i
     }
 
     // Use shared memory to communicate the calculated destination index to all threads in the block.
-    // Size must match experts_per_token.
-    __shared__ int destination_indices[2]; // Assumes experts_per_token <= 2
+    // Allocate enough space for all experts_per_token entries
+    extern __shared__ int destination_indices[];
 
     // The first few threads handle the logic for each of the token's expert choices
     if (threadIdx.x < experts_per_token)
