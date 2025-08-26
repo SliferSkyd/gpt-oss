@@ -22,6 +22,7 @@
 #include "kernels/swiglu.hpp"
 #include "kernels/rope.hpp"
 #include "memory/mxfp4.hpp"
+#include "paged_attention.hpp"
 
 
 #ifndef GETP_RUN
@@ -76,9 +77,7 @@ typedef struct {
   float *att;                  // attention scores (batch_size, n_attn_heads, seq_len)
   float *mask;                 // attention mask (seq_len, seq_len)
   
-  // KV cache - now using BF16 for 50% memory reduction
-  __hip_bfloat16 *key_cache;   // (batch_size, n_layers, seq_len, kv_dim)
-  __hip_bfloat16 *value_cache; // (batch_size, n_layers, seq_len, kv_dim)
+  // Note: Linear KV cache removed - using paged attention instead
   
   // RoPE buffers
   float *cos_vals;             // (head_dim/2, seq_len)
@@ -110,6 +109,9 @@ typedef struct {
   int *seq_lengths;            // Current sequence length for each slot [BATCH_SIZE]
   bool *slot_active;           // Whether slot is processing a request [BATCH_SIZE]
   int *request_mapping;        // Maps batch slot -> request index in Requests [BATCH_SIZE]
+  
+  // Paged attention manager
+  PagedAttentionManager **paged_managers;   // Manager for paged KV cache
 } GPURunState;
 
 // CPU buffers for warmup and host-side operations
@@ -153,12 +155,11 @@ void malloc_gpu_run_state(GPURunState *s, Config *p)
     size_t total_memory = 0;
     size_t batch_hidden = BATCH_SIZE * p->hidden_dim * sizeof(float);
     size_t batch_qkv = BATCH_SIZE * p->head_dim * (p->n_attn_heads + 2 * p->n_kv_heads) * sizeof(float);
-    // BF16 KV cache - 50% memory reduction compared to FP32
-    size_t kv_cache_size = BATCH_SIZE * p->n_layers * p->seq_len * kv_dim * sizeof(__hip_bfloat16);
+    // Note: Linear KV cache size calculation removed - using paged attention instead
 
     printf("Allocating GPU memory: batch_size=%d, hidden_dim=%d, seq_len=%d\n",
            BATCH_SIZE, p->hidden_dim, p->seq_len);
-    printf("KV cache size per batch (BF16): %zu MB (50%% reduction from FP32)\n", kv_cache_size / (1024 * 1024));
+    printf("Using paged attention instead of linear KV cache\n");
 
     // Allocate GPU memory with error checking
     HIP_CHECK(hipMalloc((void **)&s->x, batch_hidden));
@@ -178,9 +179,7 @@ void malloc_gpu_run_state(GPURunState *s, Config *p)
     // This buffer holds the expert's final output before scattering
     HIP_CHECK(hipMalloc((void **)&s->expert_output_buffer, BATCH_SIZE * p->hidden_dim * sizeof(float) * expert_per_token));
 
-    // KV cache allocation - this is usually the largest allocation
-    HIP_CHECK(hipMalloc((void **)&s->key_cache, kv_cache_size));
-    HIP_CHECK(hipMalloc((void **)&s->value_cache, kv_cache_size));
+    // Note: Linear KV cache allocation removed - using paged attention instead
 
     HIP_CHECK(hipMalloc((void **)&s->att, BATCH_SIZE * p->n_attn_heads * p->seq_len * sizeof(float)));
     HIP_CHECK(hipMalloc((void **)&s->logits, BATCH_SIZE * p->vocab_size * sizeof(float)));
@@ -213,8 +212,7 @@ void malloc_gpu_run_state(GPURunState *s, Config *p)
     HIP_CHECK(hipMemset(s->q, 0, BATCH_SIZE * p->n_attn_heads * p->head_dim * sizeof(float)));
     HIP_CHECK(hipMemset(s->k, 0, BATCH_SIZE * kv_dim * sizeof(float)));
     HIP_CHECK(hipMemset(s->v, 0, BATCH_SIZE * kv_dim * sizeof(float)));
-    HIP_CHECK(hipMemset(s->key_cache, 0, kv_cache_size));
-    HIP_CHECK(hipMemset(s->value_cache, 0, kv_cache_size));
+    // Note: Linear KV cache initialization removed - using paged attention instead
     HIP_CHECK(hipMemset(s->att, 0, BATCH_SIZE * p->n_attn_heads * p->seq_len * sizeof(float)));
     HIP_CHECK(hipMemset(s->logits, 0, BATCH_SIZE * p->vocab_size * sizeof(float)));
     
@@ -245,6 +243,12 @@ void malloc_gpu_run_state(GPURunState *s, Config *p)
         }
         HIP_CHECK(hipMemcpy(s->mask, h_mask, mask_size, hipMemcpyHostToDevice));
         free(h_mask);
+    }
+    
+    // Initialize paged attention manager
+    s->paged_managers = new PagedAttentionManager*[p->n_layers];
+    for (int i = 0; i < p->n_layers; i++) {
+        s->paged_managers[i] = new PagedAttentionManager(kv_dim);
     }
 }
 
@@ -505,8 +509,7 @@ void free_gpu_run_state(GPURunState *s)
     if (s->v) HIP_CHECK(hipFree(s->v));
     if (s->att) HIP_CHECK(hipFree(s->att));
     if (s->mask) HIP_CHECK(hipFree(s->mask));
-    if (s->key_cache) HIP_CHECK(hipFree(s->key_cache));
-    if (s->value_cache) HIP_CHECK(hipFree(s->value_cache));
+    // Note: Linear KV cache cleanup removed - using paged attention instead
     if (s->cos_vals) HIP_CHECK(hipFree(s->cos_vals));
     if (s->sin_vals) HIP_CHECK(hipFree(s->sin_vals));
     if (s->router_score) HIP_CHECK(hipFree(s->router_score));
@@ -684,57 +687,80 @@ void attention_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size)
         s->k, s->cos_vals, s->sin_vals, s->positions, batch_size, p->n_kv_heads, head_dim);
     HIP_CHECK(hipGetLastError());
 
-    // Update KV cache - NEW: Proper GPU kernel
-    dim3 kv_grid(batch_size, (kv_dim + 31) / 32);
-    dim3 kv_block(1, 32);
-    {
-        TIME_SCOPE(update_kv_cache_timer);
-        update_kv_cache_kernel<<<kv_grid, kv_block>>>(
-            s->key_cache, s->value_cache, s->k, s->v, s->positions, batch_size,
-            p->n_layers, layer_idx, p->seq_len, kv_dim);
-        HIP_CHECK(hipGetLastError());
+
+    for (int i = 0; i < batch_size; i++) {
+        s->paged_managers[layer_idx]->extend_new_block(i, s->positions[i]);
     }
 
-    // Compute attention scores
-    dim3 att_grid(batch_size, p->n_attn_heads, (p->seq_len + 31) / 32);
-    dim3 att_block(1, 1, 32);
-    {
-        TIME_SCOPE(attention_scores_kernel_timer);
-        attention_scores_kernel<<<att_grid, att_block>>>(
-            s->att, s->q, s->key_cache, s->mask, s->positions, batch_size, p->n_attn_heads,
-            head_dim, p->seq_len, p->n_layers, layer_idx, p->sliding_window > 0);
-        HIP_CHECK(hipGetLastError());
-    }
+    s->paged_managers[layer_idx]->sync_to_device();
 
-    dim3 sink_grid(batch_size, p->n_attn_heads);
-    dim3 sink_block(1);
+    // PAGED ATTENTION: Sequential kernel launches like original code
+    static Timer paged_attention_timer("PagedAttention", true);
     {
-        TIME_SCOPE(add_sinks_kernel_timer);
-        add_sinks_kernel<<<sink_grid, sink_block>>>(
-            s->att, w->attn_sinks + layer_idx * p->n_attn_heads, s->positions,
-            p->seq_len, p->n_attn_heads);
-        HIP_CHECK(hipGetLastError());
-    }
+        TIME_SCOPE(paged_attention_timer);
+        
+        // 1. Update paged KV cache
+        dim3 kv_grid(batch_size, (kv_dim + 31) / 32);
+        dim3 kv_block(1, 32);
+        {
+            TIME_SCOPE(update_kv_cache_timer);
+            paged_update_kv_cache_kernel<<<kv_grid, kv_block>>>(
+                s->paged_managers[layer_idx]->get_device_block_table(), 
+                s->k, s->v,
+                s->positions,
+                batch_size, kv_dim);
+            HIP_CHECK(hipGetLastError());
+        }
+        
+        // 2. Compute attention scores
+        dim3 scores_grid(batch_size, p->n_attn_heads, (p->seq_len + 31) / 32);
+        dim3 scores_block(1, 1, 32);
+        {
+            TIME_SCOPE(attention_scores_kernel_timer);
+            paged_attention_scores_kernel<<<scores_grid, scores_block>>>(
+                s->att, s->q,
+                s->paged_managers[layer_idx]->get_device_block_table(), 
+                s->mask,
+                s->positions,
+                batch_size, p->n_attn_heads, head_dim, kv_dim,
+                p->seq_len, (p->sliding_window > 0) && (layer_idx % 2 == 0));
+            HIP_CHECK(hipGetLastError());
+        }
 
-    // Softmax attention weights
-    dim3 soft_grid(batch_size * p->n_attn_heads);
-    dim3 soft_block(THREADS_PER_BLOCK);
-    {
-        TIME_SCOPE(softmax_kernel_timer);
-        softmax_kernel_variable_len<<<soft_grid, soft_block>>>(
-            s->att, s->positions, batch_size, p->n_attn_heads, p->seq_len);
-        HIP_CHECK(hipGetLastError());
-    }
+        // 3. Apply softmax to attention scores
+        dim3 sink_grid(batch_size, p->n_attn_heads);
+        dim3 sink_block(1);
+        {
+            TIME_SCOPE(add_sinks_kernel_timer);
+            add_sinks_kernel<<<sink_grid, sink_block>>>(
+                s->att, w->attn_sinks + layer_idx * p->n_attn_heads, s->positions,
+                p->seq_len, p->n_attn_heads);
+            HIP_CHECK(hipGetLastError());
+        }
 
-    // Weighted sum of values
-    dim3 wsum_grid(batch_size, p->n_attn_heads);
-    dim3 wsum_block(head_dim);
-    {
-        TIME_SCOPE(matmul_kernel_simple_timer);
-        attention_weighted_sum_kernel<<<wsum_grid, wsum_block>>>(
-            s->tb, s->att, s->value_cache, s->positions, batch_size, p->n_attn_heads,
-            head_dim, p->seq_len, p->n_layers, layer_idx);
-        HIP_CHECK(hipGetLastError());
+        // Softmax attention weights
+        dim3 soft_grid(batch_size * p->n_attn_heads);
+        dim3 soft_block(THREADS_PER_BLOCK);
+        {
+            TIME_SCOPE(softmax_kernel_timer);
+            softmax_kernel_variable_len<<<soft_grid, soft_block>>>(
+                s->att, s->positions, batch_size, p->n_attn_heads, p->seq_len);
+            HIP_CHECK(hipGetLastError());
+        }
+        
+        // 4. Compute weighted sum (attention output)
+        dim3 output_grid(batch_size, p->n_attn_heads);
+        dim3 output_block(head_dim);
+        {
+            TIME_SCOPE(attention_weighted_sum_kernel_timer);
+            paged_attention_weighted_sum_kernel<<<output_grid, output_block>>>(
+                s->tb, s->att,
+                s->paged_managers[layer_idx]->get_device_block_table(), 
+                s->positions,
+                batch_size, p->n_attn_heads, head_dim,
+                kv_dim, p->seq_len);
+            HIP_CHECK(hipGetLastError());
+        }
     }
     // Output projection - FIXED: Use GPU weight pointer
 
@@ -1076,6 +1102,10 @@ long long continuous_batching_inference(GPUTransformer *gpu_t, Tokenizer *tokeni
         cpu_buf->positions[slot] = 0;
         cpu_buf->finished[slot] = false;
         cpu_buf->current_tokens[slot] = cpu_buf->prompt_tokens[slot][0];
+        
+        // Allocate paged attention resources for this sequence
+        int prompt_pages = (cpu_buf->prompt_lens[slot] + PAGE_SIZE - 1) / PAGE_SIZE;
+        int total_pages = (p->seq_len + PAGE_SIZE - 1) / PAGE_SIZE;
     }
     
     // Copy initial state to GPU
@@ -1152,7 +1182,7 @@ long long continuous_batching_inference(GPUTransformer *gpu_t, Tokenizer *tokeni
                         cpu_buf->prompt_lens[slot] = 1;
                         cpu_buf->prompt_tokens[slot][0] = 1; // BOS token
                     }
-                    
+
                     // Reinitialize slot with new request
                     cpu_buf->request_mapping_cpu[slot] = req_idx;
                     cpu_buf->positions[slot] = 0;
@@ -1349,7 +1379,7 @@ long long inference(Transformer *transformer, Tokenizer *tokenizer,
                     Sampler *sampler, Requests *requests)
 {
     // Use continuous batching for better throughput
-    return batched_generate_gpu(gpu_transformer, tokenizer, sampler, requests);
+    return continuous_batching_inference(gpu_transformer, tokenizer, sampler, requests);
 }
 
 /*
