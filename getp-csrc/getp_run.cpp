@@ -3,6 +3,7 @@
 #include "../tokenizer.hpp"
 #include "getp_eval.cpp"
 #include <cassert>
+#include <cstdio>
 #include <hip/hip_runtime.h>
 #include <hip/hip_bf16.h>
 #include <iostream>
@@ -734,8 +735,6 @@ void attention_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size)
             head_dim, MAX_SEQ_LEN, p->n_layers, layer_idx);
         HIP_CHECK(hipGetLastError());
     }
-    // Output projection - FIXED: Use GPU weight pointer
-
     grid_dim.y = (hidden_dim + block_dim.y - 1) / block_dim.y; // Ceiling division
 
     int attn_out_offset = layer_idx * (head_dim * p->n_attn_heads) * hidden_dim;
@@ -764,9 +763,14 @@ void attention_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size)
     }
 }
 
+constexpr int N_MLP_STREAMS = 4;             // tune me (4–8 is usually good)
+static hipStream_t sGather = nullptr, sScatter = nullptr;
+static hipStream_t sMLP[N_MLP_STREAMS];
+static bool streams_inited = false;
+
 void moe_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size)
 {
-    // Timer declarations (assuming they are defined elsewhere)
+    // ===== timers =====
     static Timer rms_norm_timer("RMSNorm_moe", true);
     static Timer matmul_kernel_simple_timer("MatMulKernelSimple_moe", true);
     static Timer add_bias_timer("AddBias_moe", true);
@@ -782,193 +786,257 @@ void moe_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size)
     Config *p = &gpu_t->config;
     GPURunState *s = &gpu_t->state;
     GPUTransformerWeights *w = &gpu_t->weights;
-    
-    int hidden_dim = p->hidden_dim;
-    int intermediate_dim = p->intermediate_dim;
-    int n_experts = p->n_experts;
-    int experts_per_token = p->experts_per_token;
 
-    // FFN RMSNorm
-    dim3 norm_grid(batch_size);
-    dim3 norm_block(THREADS_PER_BLOCK);
+    const int hidden_dim = p->hidden_dim;
+    const int intermediate_dim = p->intermediate_dim;
+    const int n_experts = p->n_experts;
+    const int experts_per_token = p->experts_per_token;
+
+    // ===== init streams once =====
+    if (!streams_inited) {
+        HIP_CHECK(hipStreamCreateWithFlags(&sGather, hipStreamNonBlocking));
+        HIP_CHECK(hipStreamCreateWithFlags(&sScatter, hipStreamNonBlocking));
+        for (int i = 0; i < N_MLP_STREAMS; ++i)
+            HIP_CHECK(hipStreamCreateWithFlags(&sMLP[i], hipStreamNonBlocking));
+        streams_inited = true;
+    }
+
+    // ===== pinned host scratch (reused across calls) =====
+    static int *h_expert_counts_pinned = nullptr;
+    static int *h_expert_offsets_pinned = nullptr;
+    if (!h_expert_counts_pinned) {
+        HIP_CHECK(hipHostMalloc((void**)&h_expert_counts_pinned, n_experts * sizeof(int)));
+        HIP_CHECK(hipHostMalloc((void**)&h_expert_offsets_pinned, n_experts * sizeof(int)));
+    }
+
+    // ===== per-call events =====
+    hipEvent_t evRouterDone, evPermuteDone;
+    HIP_CHECK(hipEventCreateWithFlags(&evRouterDone, hipEventDisableTiming));
+    HIP_CHECK(hipEventCreateWithFlags(&evPermuteDone, hipEventDisableTiming));
+
+    hipEvent_t evExpertsDone[N_MLP_STREAMS];
+    for (int i = 0; i < N_MLP_STREAMS; ++i)
+        HIP_CHECK(hipEventCreateWithFlags(&evExpertsDone[i], hipEventDisableTiming));
+
+    // ===== 1) FFN RMSNorm + Router on sGather =====
     {
+        dim3 norm_grid(batch_size);
+        dim3 norm_block(THREADS_PER_BLOCK);
         TIME_SCOPE(rms_norm_timer);
-        rmsnorm_kernel<<<norm_grid, norm_block>>>(s->t, s->x, w->rms_ffn_w + layer_idx * hidden_dim, batch_size, hidden_dim);
+        rmsnorm_kernel<<<norm_grid, norm_block, 0, sGather>>>(
+            s->t, s->x, w->rms_ffn_w + (size_t)layer_idx * hidden_dim,
+            batch_size, hidden_dim);
     }
     HIP_CHECK(hipGetLastError());
 
-    // Router computation & bias
     {
         TIME_SCOPE(matmul_kernel_simple_timer);
-        matmul(s->router_score, s->t, w->w_router + layer_idx * hidden_dim * n_experts, batch_size, hidden_dim, n_experts);
+        // [B,H] x [H,E] -> [B,E]
+        matmul(s->router_score, s->t,
+               w->w_router + (size_t)layer_idx * hidden_dim * n_experts,
+               batch_size, hidden_dim, n_experts, sGather);
     }
     {
         TIME_SCOPE(add_bias_timer);
-        add_bias_kernel<<<(batch_size * n_experts + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK, THREADS_PER_BLOCK>>>(
-            s->router_score, w->b_router + layer_idx * n_experts, batch_size, n_experts);
+        const int elems = batch_size * n_experts;
+        add_bias_kernel<<<(elems + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK,
+                          THREADS_PER_BLOCK, 0, sGather>>>(
+            s->router_score, w->b_router + (size_t)layer_idx * n_experts,
+            batch_size, n_experts);
     }
-
-    // Top-k expert selection
     {
         TIME_SCOPE(topk_kernel_timer);
-        topk_kernel<<<batch_size, 1>>>(s->topk_v, s->topk_i, s->router_score, batch_size, n_experts, experts_per_token);
+        topk_kernel<<<batch_size, 1, 0, sGather>>>(
+            s->topk_v, s->topk_i, s->router_score,
+            batch_size, n_experts, experts_per_token);
     }
-
-    // Softmax on top-k values to get weights
     {
         TIME_SCOPE(softmax_kernel_timer);
-        softmax_kernel<<<batch_size, norm_block>>>(s->topk_v, batch_size, experts_per_token);
+        dim3 norm_block(THREADS_PER_BLOCK);
+        softmax_kernel<<<batch_size, norm_block, 0, sGather>>>(
+            s->topk_v, batch_size, experts_per_token);
     }
-    HIP_CHECK(hipGetLastError());
+    HIP_CHECK(hipEventRecord(evRouterDone, sGather));
 
-    // Initialize final aggregation buffer
-    HIP_CHECK(hipMemset(s->e_agg, 0, batch_size * hidden_dim * sizeof(float)));
+    // ===== zero final aggregation buffer on sScatter (to order before scatter) =====
+    HIP_CHECK(hipMemsetAsync(s->e_agg, 0,
+                             (size_t)batch_size * hidden_dim * sizeof(float),
+                             sScatter));
 
-    // --- 🚀 OPTIMIZED TWO-STAGE GATHER ALGORITHM 🚀 ---
-    int *d_expert_counts;
-    int *d_expert_offsets;
-    int *d_expert_write_idx;
-    HIP_CHECK(hipMalloc(&d_expert_counts, n_experts * sizeof(int)));
+    // ===== device scratch for gather =====
+    int *d_expert_counts = nullptr, *d_expert_offsets = nullptr, *d_expert_write_idx = nullptr;
+    HIP_CHECK(hipMalloc(&d_expert_counts,  n_experts * sizeof(int)));
     HIP_CHECK(hipMalloc(&d_expert_offsets, n_experts * sizeof(int)));
     HIP_CHECK(hipMalloc(&d_expert_write_idx, n_experts * sizeof(int)));
 
-    // **FIX:** Declare host-side arrays and total_tokens here, before the timed scope
-    int h_expert_counts[n_experts];
-    int h_expert_offsets[n_experts];
     int total_tokens = 0;
 
+    // ===== 2) GATHER on sGather: count -> prefix-sum(host) -> offsets H2D -> permute =====
     {
-        TIME_SCOPE(gather_expert_inputs_kernel_timer); // Timing the entire gather operation
+        TIME_SCOPE(gather_expert_inputs_kernel_timer);
 
-        // === STAGE 1: COUNT TOKENS PER EXPERT ===
-        HIP_CHECK(hipMemset(d_expert_counts, 0, n_experts * sizeof(int)));
-        dim3 count_grid((batch_size + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK);
-        count_tokens_per_expert_kernel<<<count_grid, THREADS_PER_BLOCK>>>(
+        HIP_CHECK(hipStreamWaitEvent(sGather, evRouterDone, 0));
+
+        HIP_CHECK(hipMemsetAsync(d_expert_counts, 0, n_experts * sizeof(int), sGather));
+        const dim3 count_grid((batch_size + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK);
+        count_tokens_per_expert_kernel<<<count_grid, THREADS_PER_BLOCK, 0, sGather>>>(
             s->topk_i, d_expert_counts, batch_size, experts_per_token);
         HIP_CHECK(hipGetLastError());
 
-        // === CALCULATE OFFSETS (PREFIX SUM ON CPU) ===
-        HIP_CHECK(hipMemcpy(h_expert_counts, d_expert_counts, n_experts * sizeof(int), hipMemcpyDeviceToHost));
+        // counts D2H (async), then sync sGather to use them on CPU
+        HIP_CHECK(hipMemcpyAsync(h_expert_counts_pinned, d_expert_counts,
+                                 n_experts * sizeof(int), hipMemcpyDeviceToHost, sGather));
+        HIP_CHECK(hipStreamSynchronize(sGather));  // ensure counts available on host
 
-        for (int i = 0; i < n_experts; ++i)
-        {
-            h_expert_offsets[i] = total_tokens;
-            total_tokens += h_expert_counts[i];
+        // host prefix-sum -> offsets
+        total_tokens = 0;
+        for (int i = 0; i < n_experts; ++i) {
+            h_expert_offsets_pinned[i] = total_tokens;
+            total_tokens += h_expert_counts_pinned[i];
         }
-        HIP_CHECK(hipMemcpy(d_expert_offsets, h_expert_offsets, n_experts * sizeof(int), hipMemcpyHostToDevice));
 
-        // === STAGE 2: PERMUTE INPUTS WITH COALESCED COPY ===
-        HIP_CHECK(hipMemset(d_expert_write_idx, 0, n_experts * sizeof(int)));
-        dim3 permute_grid(batch_size); // One block per token
-        dim3 permute_block(256);       // Block size for efficient copying
-        permute_expert_inputs_kernel<<<permute_grid, permute_block>>>(
+        // offsets H2D (async)
+        HIP_CHECK(hipMemcpyAsync(d_expert_offsets, h_expert_offsets_pinned,
+                                 n_experts * sizeof(int), hipMemcpyHostToDevice, sGather));
+
+        // permute
+        HIP_CHECK(hipMemsetAsync(d_expert_write_idx, 0, n_experts * sizeof(int), sGather));
+        const dim3 permute_grid(batch_size);
+        const dim3 permute_block(256);
+        permute_expert_inputs_kernel<<<permute_grid, permute_block, 0, sGather>>>(
             s->t, s->topk_i, s->topk_v, d_expert_offsets, d_expert_write_idx,
             batch_size, hidden_dim, experts_per_token,
             s->expert_input_buffer, s->expert_indices, s->expert_weights);
         HIP_CHECK(hipGetLastError());
-    } // End of gather timer scope
 
-    // --- 2. COMPUTE STEP (EXPERT MLPS) ---
-    // Loop through each expert to run its MLP on its dedicated slice of the compact buffer.
-    for (int expert_id = 0; expert_id < n_experts; expert_id++)
+        HIP_CHECK(hipEventRecord(evPermuteDone, sGather));
+    }
+
+    // ===== 3) EXPERT MLPs on multiple streams, each waits on permute =====
+    for (int expert_id = 0; expert_id < n_experts; ++expert_id)
     {
-        int h_batch_count = h_expert_counts[expert_id];
-        if (h_batch_count == 0)
-        {
-            continue; // Skip experts with no tokens
-        }
+        const int h_batch_count = h_expert_counts_pinned[expert_id];
+        if (h_batch_count == 0) continue;
 
-        // Calculate pointers to this expert's slice of the data
-        int expert_offset = h_expert_offsets[expert_id];
-        float *expert_input_ptr = s->expert_input_buffer + expert_offset * hidden_dim;
-        float *mlp1_out_ptr = s->mlp1_out + expert_offset * 2 * intermediate_dim;
-        float *gate_ptr = s->gate + expert_offset * intermediate_dim;
-        float *up_ptr = s->up + expert_offset * intermediate_dim;
-        float *gate_up_ptr = s->gate_up + expert_offset * intermediate_dim;
-        float *expert_output_ptr = s->expert_output_buffer + expert_offset * hidden_dim;
+        hipStream_t st = sMLP[expert_id % N_MLP_STREAMS];
+        HIP_CHECK(hipStreamWaitEvent(st, evPermuteDone, 0));
 
-        // MLP1 (Gate/Up projections)
+        const int expert_tok_off = h_expert_offsets_pinned[expert_id];
+
+        float *expert_input_ptr   = s->expert_input_buffer   + (size_t)expert_tok_off * hidden_dim;
+        float *mlp1_out_ptr       = s->mlp1_out              + (size_t)expert_tok_off * (2 * intermediate_dim);
+        float *gate_ptr           = s->gate                  + (size_t)expert_tok_off * intermediate_dim;
+        float *up_ptr             = s->up                    + (size_t)expert_tok_off * intermediate_dim;
+        float *gate_up_ptr        = s->gate_up               + (size_t)expert_tok_off * intermediate_dim;
+        float *expert_output_ptr  = s->expert_output_buffer  + (size_t)expert_tok_off * hidden_dim;
+
+        // MLP1 (Gate/Up) — MXFP4
         {
-           TIME_SCOPE(matmul_kernel_simple_timer);
-            // Calculate offset for this expert's MXFP4 weights
-            size_t expert_offset = (layer_idx * n_experts + expert_id) * (2 * intermediate_dim) * hidden_dim;
-            size_t expert_packed_offset = expert_offset / 2;  // 2 FP4 values per byte
-            size_t expert_scale_offset = expert_offset / MXFP4_BLOCK_SIZE;
-            size_t total_elements = (2 * intermediate_dim) * hidden_dim;
-            
+            TIME_SCOPE(matmul_kernel_simple_timer);
+            const size_t w_off1         = ((size_t)layer_idx * n_experts + expert_id)
+                                          * (size_t)(2 * intermediate_dim) * hidden_dim;
+            const size_t w_packed_off1  = w_off1 / 2; // 2 FP4 / byte
+            const size_t w_scale_off1   = w_off1 / MXFP4_BLOCK_SIZE;
+            const size_t total_elems1   = (size_t)(2 * intermediate_dim) * hidden_dim;
+
             matmul_mxfp4(mlp1_out_ptr, expert_input_ptr,
-                        w->w_mlp1_mxfp4 + expert_packed_offset,
-                        w->w_mlp1_scales + expert_scale_offset,
-                        h_batch_count, hidden_dim, 2 * intermediate_dim,
-                        total_elements);
+                         w->w_mlp1_mxfp4 + w_packed_off1,
+                         w->w_mlp1_scales + w_scale_off1,
+                         h_batch_count, hidden_dim, 2 * intermediate_dim,
+                         total_elems1, st);
         }
 
-        // Split, add bias, and apply SwiGLU
-        dim3 expert_grid((h_batch_count * intermediate_dim + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK);
+        // split + swiglu
         {
             TIME_SCOPE(split_gate_up_kernel_timer);
-            split_gate_up_kernel<<<expert_grid, THREADS_PER_BLOCK>>>(gate_ptr, up_ptr, mlp1_out_ptr,
-                                                                     w->b_mlp1 + (layer_idx * n_experts + expert_id) * (2 * intermediate_dim), h_batch_count, intermediate_dim);
+            const int elems = h_batch_count * intermediate_dim;
+            const dim3 grid((elems + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK);
+            split_gate_up_kernel<<<grid, THREADS_PER_BLOCK, 0, st>>>(
+                gate_ptr, up_ptr, mlp1_out_ptr,
+                w->b_mlp1 + ((size_t)layer_idx * n_experts + expert_id) * (size_t)(2 * intermediate_dim),
+                h_batch_count, intermediate_dim);
         }
         {
             TIME_SCOPE(swiglu_kernel_timer);
-            swiglu_kernel<<<expert_grid, THREADS_PER_BLOCK>>>(gate_ptr, up_ptr, gate_up_ptr,
-                                                              h_batch_count, intermediate_dim, p->swiglu_limit);
+            const int elems = h_batch_count * intermediate_dim;
+            const dim3 grid((elems + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK);
+            swiglu_kernel<<<grid, THREADS_PER_BLOCK, 0, st>>>(
+                gate_ptr, up_ptr, gate_up_ptr,
+                h_batch_count, intermediate_dim, p->swiglu_limit);
         }
 
-        // MLP2 (Down projection)
+        // MLP2 (Down) — MXFP4
         {
-             TIME_SCOPE(matmul_kernel_simple_timer);
-            // Calculate offset for this expert's MXFP4 weights
-            size_t expert_offset_mlp2 = (layer_idx * n_experts + expert_id) * hidden_dim * intermediate_dim;
-            size_t expert_packed_offset_mlp2 = expert_offset_mlp2 / 2;  // 2 FP4 values per byte
-            size_t expert_scale_offset_mlp2 = expert_offset_mlp2 / MXFP4_BLOCK_SIZE;
-            size_t total_elements_mlp2 = hidden_dim * intermediate_dim;
-            
+            TIME_SCOPE(matmul_kernel_simple_timer);
+            const size_t w_off2         = ((size_t)layer_idx * n_experts + expert_id)
+                                          * (size_t)hidden_dim * intermediate_dim;
+            const size_t w_packed_off2  = w_off2 / 2;
+            const size_t w_scale_off2   = w_off2 / MXFP4_BLOCK_SIZE;
+            const size_t total_elems2   = (size_t)hidden_dim * intermediate_dim;
+
             matmul_mxfp4(expert_output_ptr, gate_up_ptr,
-                        w->w_mlp2_mxfp4 + expert_packed_offset_mlp2,
-                        w->w_mlp2_scales + expert_scale_offset_mlp2,
-                        h_batch_count, intermediate_dim, hidden_dim,
-                        total_elements_mlp2);
+                         w->w_mlp2_mxfp4 + w_packed_off2,
+                         w->w_mlp2_scales + w_scale_off2,
+                         h_batch_count, intermediate_dim, hidden_dim,
+                         total_elems2, st);
         }
 
-        // Add MLP2 bias
+        // bias
         {
             TIME_SCOPE(add_bias_timer);
-            dim3 bias_grid((1LL*h_batch_count * hidden_dim + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK);
-            add_bias_kernel<<<bias_grid, THREADS_PER_BLOCK>>>(
-                expert_output_ptr, w->b_mlp2 + (layer_idx * n_experts + expert_id) * hidden_dim, h_batch_count, hidden_dim);
+            const int elems = h_batch_count * hidden_dim;
+            const dim3 grid((elems + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK);
+            add_bias_kernel<<<grid, THREADS_PER_BLOCK, 0, st>>>(
+                expert_output_ptr,
+                w->b_mlp2 + ((size_t)layer_idx * n_experts + expert_id) * (size_t)hidden_dim,
+                h_batch_count, hidden_dim);
             HIP_CHECK(hipGetLastError());
         }
     }
 
-    // --- 3. SCATTER STEP ---
-    // The scatter kernel works as before, but we launch it over the total number of processed tokens.
-    if (total_tokens > 0)
-    {
-        dim3 scatter_grid((total_tokens * hidden_dim + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK);
-        {
-            TIME_SCOPE(scatter_expert_outputs_kernel_timer);
-            scatter_expert_outputs_kernel<<<scatter_grid, THREADS_PER_BLOCK>>>(
-                s->e_agg, s->expert_output_buffer, s->expert_indices, s->expert_weights,
-                total_tokens, hidden_dim);
-            HIP_CHECK(hipGetLastError());
-        }
+    // record one "done" event per MLP stream (tail of each queue)
+    for (int i = 0; i < N_MLP_STREAMS; ++i)
+        HIP_CHECK(hipEventRecord(evExpertsDone[i], sMLP[i]));
+
+    // ===== 4) SCATTER on sScatter, after all MLP streams =====
+    for (int i = 0; i < N_MLP_STREAMS; ++i)
+        HIP_CHECK(hipStreamWaitEvent(sScatter, evExpertsDone[i], 0));
+
+    if (total_tokens > 0) {
+        TIME_SCOPE(scatter_expert_outputs_kernel_timer);
+        const int elems = total_tokens * hidden_dim;
+        const dim3 grid((elems + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK);
+        scatter_expert_outputs_kernel<<<grid, THREADS_PER_BLOCK, 0, sScatter>>>(
+            s->e_agg, s->expert_output_buffer, s->expert_indices, s->expert_weights,
+            total_tokens, hidden_dim);
+        HIP_CHECK(hipGetLastError());
     }
 
-    // --- FINAL RESIDUAL CONNECTION ---
+    // ===== 5) Residual on sScatter =====
     {
         TIME_SCOPE(accumulate_kernel_timer);
-        accumulate_kernel<<<(batch_size * hidden_dim + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK, THREADS_PER_BLOCK>>>(
+        const int elems = batch_size * hidden_dim;
+        accumulate_kernel<<<(elems + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK,
+                            THREADS_PER_BLOCK, 0, sScatter>>>(
             s->x, s->e_agg, 1.0f, batch_size, hidden_dim);
         HIP_CHECK(hipGetLastError());
     }
 
-    // Free the temporary buffers used in the gather operation
+    // If you must read results now:
+    // HIP_CHECK(hipStreamSynchronize(sScatter));
+
+    // ===== free per-call device scratch =====
     HIP_CHECK(hipFree(d_expert_counts));
     HIP_CHECK(hipFree(d_expert_offsets));
     HIP_CHECK(hipFree(d_expert_write_idx));
+
+    // destroy events
+    HIP_CHECK(hipEventDestroy(evRouterDone));
+    HIP_CHECK(hipEventDestroy(evPermuteDone));
+    for (int i = 0; i < N_MLP_STREAMS; ++i)
+        HIP_CHECK(hipEventDestroy(evExpertsDone[i]));
 }
+
 
 float *forward_batch_gpu(GPUTransformer *gpu_t, int *tokens, int batch_size)
 {
