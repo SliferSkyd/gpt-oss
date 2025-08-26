@@ -1,5 +1,3 @@
-// TODO: Modify this file to optimize end-to-end throughput with HIP GPU acceleration
-
 #include "../tokenizer.hpp"
 #include "getp_eval.cpp"
 #include <cassert>
@@ -11,6 +9,7 @@
 #include <string>
 #include <chrono>
 #include <iomanip>
+#include <unistd.h>
 #include "config.hpp"
 #include "utils.hpp"
 #include "kernels/attention.hpp"
@@ -22,572 +21,53 @@
 #include "kernels/swiglu.hpp"
 #include "kernels/rope.hpp"
 #include "memory/mxfp4.hpp"
+#include "memory/multi_gpu.hpp"
 
 
 #ifndef GETP_RUN
 #define GETP_RUN
 
-// GPU Transformer Weights struct - stores all model weights on GPU in bfloat16 format
-typedef struct {
-  // Embedding weights
-  __hip_bfloat16 *token_embedding_table; // (vocab_size, hidden_dim)
-  
-  // RMSNorm weights  
-  __hip_bfloat16 *rms_attn_w; // (n_layers, hidden_dim)
-  __hip_bfloat16 *rms_ffn_w;  // (n_layers, hidden_dim)
-  __hip_bfloat16 *rms_out_w;  // (hidden_dim,)
-  
-  // Attention weights
-  __hip_bfloat16 *w_qkv;      // (n_layers, head_dim * (n_attn_heads + 2 * n_kv_heads), hidden_dim)
-  __hip_bfloat16 *b_qkv;      // (n_layers, head_dim * (n_attn_heads + 2 * n_kv_heads))
-  __hip_bfloat16 *w_o;        // (n_layers, hidden_dim, head_dim * n_attn_heads)
-  __hip_bfloat16 *b_o;        // (n_layers, hidden_dim)
-  __hip_bfloat16 *attn_sinks; // (n_layers, n_attn_heads)
-  
-  // MoE router weights
-  __hip_bfloat16 *w_router;   // (n_layers, hidden_dim, n_experts)
-  __hip_bfloat16 *b_router;   // (n_layers, n_experts)
-  
-  // MoE weights now use MXFP4 quantization
-  uint8_t *w_mlp1_mxfp4, *w_mlp2_mxfp4;  // Packed MXFP4 indices
-  float *w_mlp1_scales, *w_mlp2_scales;   // MXFP4 block scales
-  __hip_bfloat16 *b_mlp1, *b_mlp2;        // Biases remain in bfloat16
-  __hip_bfloat16 *out_w;
-  // Output weights
-  __hip_bfloat16 *out;        // (vocab_size, hidden_dim)
-} GPUTransformerWeights;
-
-// GPU Run State struct - stores all activation buffers on GPU
-typedef struct {
-  // Basic activation buffers
-  float *x;                    // activation at current time stamp (batch_size, hidden_dim)
-  float *t;                    // residual branch buffer (batch_size, hidden_dim)
-  float *tb;                   // temp buffer (batch_size, head_dim * n_attn_heads)
-  float *tb2;                  // temp buffer (batch_size, hidden_dim)
-  float *temp_buffer;          // general purpose temp buffer (batch_size, hidden_dim)
-  
-  // Attention buffers
-  float *qkv;                  // QKV buffer (batch_size, head_dim * (n_attn_heads + 2 * n_kv_heads))
-  float *q;                    // query buffer (batch_size, n_attn_heads * head_dim)
-  float *k;                    // key buffer (batch_size, n_kv_heads * head_dim)
-  float *v;                    // value buffer (batch_size, n_kv_heads * head_dim)
-  float *att;                  // attention scores (batch_size, n_attn_heads, seq_len)
-  float *mask;                 // attention mask (seq_len, seq_len)
-  
-  // KV cache - now using BF16 for 50% memory reduction
-  __hip_bfloat16 *key_cache;   // (batch_size, n_layers, seq_len, kv_dim)
-  __hip_bfloat16 *value_cache; // (batch_size, n_layers, seq_len, kv_dim)
-  
-  // RoPE buffers
-  float *cos_vals;             // (head_dim/2, seq_len)
-  float *sin_vals;             // (head_dim/2, seq_len)
-  
-  // MoE buffers
-  float *router_score;         // router scores (batch_size, n_experts)
-  float *topk_v;               // top-k expert weights (batch_size, experts_per_token)
-  int *topk_i;                 // top-k expert indices (batch_size, experts_per_token)
-  float *mlp1_out;             // MLP1 output (batch_size * experts_per_token, 2 * intermediate_dim)
-  float *gate;                 // gate values (batch_size * experts_per_token, intermediate_dim)
-  float *up;                   // up projection (batch_size * experts_per_token, intermediate_dim)
-  float *gate_up;              // gate * up (batch_size * experts_per_token, intermediate_dim)
-  float *e_agg;                // expert aggregation buffer (batch_size, hidden_dim)
-  float *expert_input_buffer;  // input buffer for experts (batch_size * experts_per_token, hidden_dim)
-  float *expert_output_buffer; // output buffer for experts (batch_size * experts_per_token, hidden_dim)
-  int *expert_indices;         // expert indices for scatter/gather (batch_size * experts_per_token)
-  float *expert_weights;       // expert weights for scatter/gather (batch_size * experts_per_token)
-  int *batch_count;            // batch count for expert processing
-  
-  // Persistent expert routing buffers (avoid hipMalloc/hipFree in forward pass)
-  int *d_expert_counts;        // token counts per expert (n_experts)
-  int *d_expert_offsets;       // prefix sum of expert counts (n_experts)
-  int *d_expert_write_idx;     // write indices for expert gathering (n_experts)
-  int *d_total_tokens;         // total tokens across all experts (1 element)
-  
-  // Token and position buffers
-  int *current_tokens;         // current tokens (batch_size)
-  int *positions;              // current positions (batch_size)
-  
-  // Output buffer
-  float *logits;               // output logits (batch_size, vocab_size)
-  
-  // Continuous batching fields
-  int *seq_lengths;            // Current sequence length for each slot [BATCH_SIZE]
-  bool *slot_active;           // Whether slot is processing a request [BATCH_SIZE]
-  int *request_mapping;        // Maps batch slot -> request index in Requests [BATCH_SIZE]
-} GPURunState;
-
-// CPU buffers for warmup and host-side operations
-typedef struct {
-  float *cos_vals;             // RoPE cosine values (CPU)
-  float *sin_vals;             // RoPE sine values (CPU)
-  int **prompt_tokens;         // prompt tokens for each sequence
-  int *current_tokens;         // current tokens (CPU copy)
-  bool *finished;              // finished flags for each sequence
-  int *positions;              // current positions (CPU copy)
-  int *prompt_lens;            // prompt lengths
-  
-  // Continuous batching fields
-  int next_request_idx;        // Index of next unprocessed request (0 to num_reqs-1)
-  bool *slot_active_cpu;       // CPU mirror of slot_active for quick access
-  int *seq_lengths_cpu;        // CPU mirror of seq_lengths
-  int *request_mapping_cpu;   // CPU mirror of request_mapping
-} CPUBuffers;
-
-// Main GPU Transformer struct
-typedef struct {
-  Config config;                // model configuration
-  GPUTransformerWeights weights; // GPU weights
-  GPURunState state;            // GPU run state buffers
-  CPUBuffers cpu_buffers;       // CPU buffers for host operations
-} GPUTransformer;
-
-// Global variables for direct access in batched_generate_gpu
-static GPUTransformer* gpu_transformer;
-
-// Memory allocation functions
-void malloc_gpu_run_state(GPURunState *s, Config *p)
-{
-    int kv_dim = p->head_dim * p->n_kv_heads;
-    int expert_per_token = p->experts_per_token;
-
-    // Initialize pointers to NULL
-    s->mask = NULL;
-    s->d_expert_counts = NULL;
-    s->d_expert_offsets = NULL;
-    s->d_expert_write_idx = NULL;
-    s->d_total_tokens = NULL;
-
-    // Check memory requirements and print for debugging
-    size_t total_memory = 0;
-    size_t batch_hidden = BATCH_SIZE * p->hidden_dim * sizeof(float);
-    size_t batch_qkv = BATCH_SIZE * p->head_dim * (p->n_attn_heads + 2 * p->n_kv_heads) * sizeof(float);
-    // BF16 KV cache - 50% memory reduction compared to FP32
-    size_t kv_cache_size = BATCH_SIZE * p->n_layers * MAX_SEQ_LEN * kv_dim * sizeof(__hip_bfloat16);
-
-    printf("Allocating GPU memory: batch_size=%d, hidden_dim=%d, seq_len=%d\n",
-           BATCH_SIZE, p->hidden_dim, MAX_SEQ_LEN);
-    printf("KV cache size per batch (BF16): %zu MB (50%% reduction from FP32)\n", kv_cache_size / (1024 * 1024));
-
-    // Allocate GPU memory with error checking
-    HIP_CHECK(hipMalloc((void **)&s->x, batch_hidden));
-    HIP_CHECK(hipMalloc((void **)&s->t, batch_hidden));
-    HIP_CHECK(hipMalloc((void **)&s->tb, BATCH_SIZE * p->head_dim * p->n_attn_heads * sizeof(float)));
-    HIP_CHECK(hipMalloc((void **)&s->tb2, batch_hidden));
-    HIP_CHECK(hipMalloc((void **)&s->qkv, batch_qkv));
-    HIP_CHECK(hipMalloc((void **)&s->q, BATCH_SIZE * p->n_attn_heads * p->head_dim * sizeof(float)));
-    HIP_CHECK(hipMalloc((void **)&s->k, BATCH_SIZE * kv_dim * sizeof(float)));
-    HIP_CHECK(hipMalloc((void **)&s->v, BATCH_SIZE * kv_dim * sizeof(float)));
-
-    // NEW: Buffers for GPU scatter-gather MoE
-    // Max possible items for one expert is the entire batch
-    HIP_CHECK(hipMalloc((void **)&s->expert_indices, BATCH_SIZE * p->experts_per_token * sizeof(int)));
-    HIP_CHECK(hipMalloc((void **)&s->expert_weights, BATCH_SIZE * p->experts_per_token * sizeof(float)));
-    HIP_CHECK(hipMalloc((void **)&s->batch_count, sizeof(int)));
-    // This buffer holds the expert's final output before scattering
-    HIP_CHECK(hipMalloc((void **)&s->expert_output_buffer, BATCH_SIZE * p->hidden_dim * sizeof(float) * expert_per_token));
-    
-    // Persistent expert routing buffers to avoid hipMalloc/hipFree in forward pass
-    HIP_CHECK(hipMalloc((void **)&s->d_expert_counts, p->n_experts * sizeof(int)));
-    HIP_CHECK(hipMalloc((void **)&s->d_expert_offsets, p->n_experts * sizeof(int)));
-    HIP_CHECK(hipMalloc((void **)&s->d_expert_write_idx, p->n_experts * sizeof(int)));
-    HIP_CHECK(hipMalloc((void **)&s->d_total_tokens, sizeof(int)));
-
-    // KV cache allocation - this is usually the largest allocation
-    HIP_CHECK(hipMalloc((void **)&s->key_cache, kv_cache_size));
-    HIP_CHECK(hipMalloc((void **)&s->value_cache, kv_cache_size));
-
-    HIP_CHECK(hipMalloc((void **)&s->att, BATCH_SIZE * p->n_attn_heads * MAX_SEQ_LEN * sizeof(float)));
-    HIP_CHECK(hipMalloc((void **)&s->logits, BATCH_SIZE * p->vocab_size * sizeof(float)));
-    HIP_CHECK(hipMalloc((void **)&s->router_score, BATCH_SIZE * p->n_experts * sizeof(float)));
-    HIP_CHECK(hipMalloc((void **)&s->topk_v, BATCH_SIZE * p->experts_per_token * sizeof(float)));
-    HIP_CHECK(hipMalloc((void **)&s->topk_i, BATCH_SIZE * p->experts_per_token * sizeof(int)));
-    HIP_CHECK(hipMalloc((void **)&s->mlp1_out, BATCH_SIZE * 2 * p->intermediate_dim * sizeof(float) * expert_per_token));
-    HIP_CHECK(hipMalloc((void **)&s->gate, BATCH_SIZE * p->intermediate_dim * sizeof(float) * expert_per_token));
-    HIP_CHECK(hipMalloc((void **)&s->up, BATCH_SIZE * p->intermediate_dim * sizeof(float) * expert_per_token));
-    HIP_CHECK(hipMalloc((void **)&s->gate_up, BATCH_SIZE * p->intermediate_dim * sizeof(float) * expert_per_token));
-    HIP_CHECK(hipMalloc((void **)&s->e_agg, batch_hidden));
-    HIP_CHECK(hipMalloc((void **)&s->current_tokens, BATCH_SIZE * sizeof(int)));
-    HIP_CHECK(hipMalloc((void **)&s->positions, BATCH_SIZE * sizeof(int)));
-    HIP_CHECK(hipMalloc((void **)&s->cos_vals, (p->head_dim / 2) * MAX_SEQ_LEN * sizeof(float)));
-    HIP_CHECK(hipMalloc((void **)&s->sin_vals, (p->head_dim / 2) * MAX_SEQ_LEN * sizeof(float)));
-    HIP_CHECK(hipMalloc((void **)&s->expert_input_buffer, batch_hidden * expert_per_token));
-    HIP_CHECK(hipMalloc((void **)&s->temp_buffer, batch_hidden));
-    
-    // Allocate continuous batching fields
-    HIP_CHECK(hipMalloc((void **)&s->seq_lengths, BATCH_SIZE * sizeof(int)));
-    HIP_CHECK(hipMalloc((void **)&s->slot_active, BATCH_SIZE * sizeof(bool)));
-    HIP_CHECK(hipMalloc((void **)&s->request_mapping, BATCH_SIZE * sizeof(int)));
-
-    // Initialize all allocated memory to zero
-    HIP_CHECK(hipMemset(s->x, 0, batch_hidden));
-    HIP_CHECK(hipMemset(s->t, 0, batch_hidden));
-    HIP_CHECK(hipMemset(s->tb, 0, BATCH_SIZE * p->head_dim * p->n_attn_heads * sizeof(float)));
-    HIP_CHECK(hipMemset(s->tb2, 0, batch_hidden));
-    HIP_CHECK(hipMemset(s->qkv, 0, batch_qkv));
-    HIP_CHECK(hipMemset(s->q, 0, BATCH_SIZE * p->n_attn_heads * p->head_dim * sizeof(float)));
-    HIP_CHECK(hipMemset(s->k, 0, BATCH_SIZE * kv_dim * sizeof(float)));
-    HIP_CHECK(hipMemset(s->v, 0, BATCH_SIZE * kv_dim * sizeof(float)));
-    HIP_CHECK(hipMemset(s->key_cache, 0, kv_cache_size));
-    HIP_CHECK(hipMemset(s->value_cache, 0, kv_cache_size));
-    HIP_CHECK(hipMemset(s->att, 0, BATCH_SIZE * p->n_attn_heads * MAX_SEQ_LEN * sizeof(float)));
-    HIP_CHECK(hipMemset(s->logits, 0, BATCH_SIZE * p->vocab_size * sizeof(float)));
-    
-    // Initialize continuous batching fields
-    HIP_CHECK(hipMemset(s->seq_lengths, 0, BATCH_SIZE * sizeof(int)));
-    HIP_CHECK(hipMemset(s->slot_active, 0, BATCH_SIZE * sizeof(bool)));
-    HIP_CHECK(hipMemset(s->request_mapping, -1, BATCH_SIZE * sizeof(int)));
-
-    if (p->sliding_window > 0)
-    {
-        size_t mask_size = MAX_SEQ_LEN * MAX_SEQ_LEN * sizeof(float);
-        HIP_CHECK(hipMalloc((void **)&s->mask, mask_size));
-
-        // Initialize mask on GPU if needed
-        float *h_mask = (float *)malloc(mask_size);
-        if (!h_mask)
-        {
-            fprintf(stderr, "Failed to allocate host memory for mask\n");
-            exit(EXIT_FAILURE);
-        }
-
-        for (int i = 0; i < MAX_SEQ_LEN; i++)
-        {
-            for (int j = 0; j < MAX_SEQ_LEN; j++)
-            {
-                h_mask[i * MAX_SEQ_LEN + j] = (i - j >= p->sliding_window) ? -INFINITY : 0.0f;
-            }
-        }
-        HIP_CHECK(hipMemcpy(s->mask, h_mask, mask_size, hipMemcpyHostToDevice));
-        free(h_mask);
-    }
-}
-
-void malloc_gpu_weights(GPUTransformerWeights *w, Config *p)
-{
-    // Allocate GPU memory for all weights in bfloat16 format
-    HIP_CHECK(hipMalloc((void **)&w->token_embedding_table, p->vocab_size * p->hidden_dim * sizeof(__hip_bfloat16)));
-    HIP_CHECK(hipMalloc((void **)&w->rms_attn_w, p->n_layers * p->hidden_dim * sizeof(__hip_bfloat16)));
-    HIP_CHECK(hipMalloc((void **)&w->rms_ffn_w, p->n_layers * p->hidden_dim * sizeof(__hip_bfloat16)));
-    HIP_CHECK(hipMalloc((void **)&w->rms_out_w, p->hidden_dim * sizeof(__hip_bfloat16)));
-
-    int qkv_size = p->n_layers * p->hidden_dim * (p->n_attn_heads + 2 * p->n_kv_heads) * p->head_dim;
-    HIP_CHECK(hipMalloc((void **)&w->w_qkv, qkv_size * sizeof(__hip_bfloat16)));
-    HIP_CHECK(hipMalloc((void **)&w->b_qkv, p->n_layers * (p->n_attn_heads + 2 * p->n_kv_heads) * p->head_dim * sizeof(__hip_bfloat16)));
-
-    int attn_out_size = p->n_layers * (p->n_attn_heads * p->head_dim) * p->hidden_dim;
-    HIP_CHECK(hipMalloc((void **)&w->w_o, attn_out_size * sizeof(__hip_bfloat16)));
-    HIP_CHECK(hipMalloc((void **)&w->b_o, p->n_layers * p->hidden_dim * sizeof(__hip_bfloat16)));
-
-    HIP_CHECK(hipMalloc((void **)&w->w_router, p->n_layers * p->hidden_dim * p->n_experts * sizeof(__hip_bfloat16)));
-    HIP_CHECK(hipMalloc((void **)&w->b_router, p->n_layers * p->n_experts * sizeof(__hip_bfloat16)));
-
-     // MoE weights allocation with MXFP4 quantization
-    size_t mlp1_size = p->n_layers * p->n_experts * (2 * p->intermediate_dim) * p->hidden_dim;
-    size_t mlp1_packed_size = (mlp1_size + 1) / 2;  // 2 FP4 values per byte
-    size_t mlp1_num_blocks = (mlp1_size + MXFP4_BLOCK_SIZE - 1) / MXFP4_BLOCK_SIZE;
-    HIP_CHECK(hipMalloc((void **)&w->w_mlp1_mxfp4, mlp1_packed_size));
-    HIP_CHECK(hipMalloc((void **)&w->w_mlp1_scales, mlp1_num_blocks * sizeof(float)));
-    HIP_CHECK(hipMalloc((void **)&w->b_mlp1, p->n_layers * p->n_experts * (2 * p->intermediate_dim) * sizeof(__hip_bfloat16)));
-
-    size_t mlp2_size = p->n_layers * p->n_experts * p->hidden_dim * p->intermediate_dim;
-    size_t mlp2_packed_size = (mlp2_size + 1) / 2;  // 2 FP4 values per byte
-    size_t mlp2_num_blocks = (mlp2_size + MXFP4_BLOCK_SIZE - 1) / MXFP4_BLOCK_SIZE;
-    HIP_CHECK(hipMalloc((void **)&w->w_mlp2_mxfp4, mlp2_packed_size));
-    HIP_CHECK(hipMalloc((void **)&w->w_mlp2_scales, mlp2_num_blocks * sizeof(float)));
-    HIP_CHECK(hipMalloc((void **)&w->b_mlp2, p->n_layers * p->n_experts * p->hidden_dim * sizeof(__hip_bfloat16)));
-
-    HIP_CHECK(hipMalloc((void **)&w->out, p->hidden_dim * p->vocab_size * sizeof(__hip_bfloat16)));
-    HIP_CHECK(hipMalloc((void **)&w->attn_sinks, p->n_layers * p->n_attn_heads * sizeof(__hip_bfloat16)));
-}
-
-void copy_weights_to_gpu(Transformer *transformer, GPUTransformerWeights *gpu_weights)
-{
-    Config *p = &transformer->config;
-    TransformerWeights *w = &transformer->weights;
-
-    // Convert and copy embedding weights
-    size_t embedding_size = p->vocab_size * p->hidden_dim;
-    __hip_bfloat16 *h_embedding_bf16 = (__hip_bfloat16 *)malloc(embedding_size * sizeof(__hip_bfloat16));
-    convert_float_array_to_bfloat16(w->token_embedding_table, h_embedding_bf16, embedding_size);
-    HIP_CHECK(hipMemcpy(gpu_weights->token_embedding_table, h_embedding_bf16, embedding_size * sizeof(__hip_bfloat16), hipMemcpyHostToDevice));
-    free(h_embedding_bf16);
-
-    // Convert and copy normalization weights
-    size_t rms_attn_size = p->n_layers * p->hidden_dim;
-    __hip_bfloat16 *h_rms_attn_bf16 = (__hip_bfloat16 *)malloc(rms_attn_size * sizeof(__hip_bfloat16));
-    convert_float_array_to_bfloat16(w->rms_attn_w, h_rms_attn_bf16, rms_attn_size);
-    HIP_CHECK(hipMemcpy(gpu_weights->rms_attn_w, h_rms_attn_bf16, rms_attn_size * sizeof(__hip_bfloat16), hipMemcpyHostToDevice));
-    free(h_rms_attn_bf16);
-
-    size_t rms_ffn_size = p->n_layers * p->hidden_dim;
-    __hip_bfloat16 *h_rms_ffn_bf16 = (__hip_bfloat16 *)malloc(rms_ffn_size * sizeof(__hip_bfloat16));
-    convert_float_array_to_bfloat16(w->rms_ffn_w, h_rms_ffn_bf16, rms_ffn_size);
-    HIP_CHECK(hipMemcpy(gpu_weights->rms_ffn_w, h_rms_ffn_bf16, rms_ffn_size * sizeof(__hip_bfloat16), hipMemcpyHostToDevice));
-    free(h_rms_ffn_bf16);
-
-    size_t rms_out_size = p->hidden_dim;
-    __hip_bfloat16 *h_rms_out_bf16 = (__hip_bfloat16 *)malloc(rms_out_size * sizeof(__hip_bfloat16));
-    convert_float_array_to_bfloat16(w->rms_out_w, h_rms_out_bf16, rms_out_size);
-    HIP_CHECK(hipMemcpy(gpu_weights->rms_out_w, h_rms_out_bf16, rms_out_size * sizeof(__hip_bfloat16), hipMemcpyHostToDevice));
-    free(h_rms_out_bf16);
-
-    // Convert and copy attention weights
-    size_t qkv_size = p->n_layers * p->hidden_dim * (p->n_attn_heads + 2 * p->n_kv_heads) * p->head_dim;
-    __hip_bfloat16 *h_w_qkv_bf16 = (__hip_bfloat16 *)malloc(qkv_size * sizeof(__hip_bfloat16));
-    convert_float_array_to_bfloat16(w->w_qkv, h_w_qkv_bf16, qkv_size);
-    HIP_CHECK(hipMemcpy(gpu_weights->w_qkv, h_w_qkv_bf16, qkv_size * sizeof(__hip_bfloat16), hipMemcpyHostToDevice));
-    free(h_w_qkv_bf16);
-
-    size_t b_qkv_size = p->n_layers * (p->n_attn_heads + 2 * p->n_kv_heads) * p->head_dim;
-    __hip_bfloat16 *h_b_qkv_bf16 = (__hip_bfloat16 *)malloc(b_qkv_size * sizeof(__hip_bfloat16));
-    convert_float_array_to_bfloat16(w->b_qkv, h_b_qkv_bf16, b_qkv_size);
-    HIP_CHECK(hipMemcpy(gpu_weights->b_qkv, h_b_qkv_bf16, b_qkv_size * sizeof(__hip_bfloat16), hipMemcpyHostToDevice));
-    free(h_b_qkv_bf16);
-
-    size_t attn_out_size = p->n_layers * (p->n_attn_heads * p->head_dim) * p->hidden_dim;
-    __hip_bfloat16 *h_w_o_bf16 = (__hip_bfloat16 *)malloc(attn_out_size * sizeof(__hip_bfloat16));
-    convert_float_array_to_bfloat16(w->w_o, h_w_o_bf16, attn_out_size);
-    HIP_CHECK(hipMemcpy(gpu_weights->w_o, h_w_o_bf16, attn_out_size * sizeof(__hip_bfloat16), hipMemcpyHostToDevice));
-    free(h_w_o_bf16);
-
-    size_t b_o_size = p->n_layers * p->hidden_dim;
-    __hip_bfloat16 *h_b_o_bf16 = (__hip_bfloat16 *)malloc(b_o_size * sizeof(__hip_bfloat16));
-    convert_float_array_to_bfloat16(w->b_o, h_b_o_bf16, b_o_size);
-    HIP_CHECK(hipMemcpy(gpu_weights->b_o, h_b_o_bf16, b_o_size * sizeof(__hip_bfloat16), hipMemcpyHostToDevice));
-    free(h_b_o_bf16);
-
-    // Convert and copy attention sinks
-    size_t attn_sinks_size = p->n_layers * p->n_attn_heads;
-    __hip_bfloat16 *h_attn_sinks_bf16 = (__hip_bfloat16 *)malloc(attn_sinks_size * sizeof(__hip_bfloat16));
-    convert_float_array_to_bfloat16(w->attn_sinks, h_attn_sinks_bf16, attn_sinks_size);
-    HIP_CHECK(hipMemcpy(gpu_weights->attn_sinks, h_attn_sinks_bf16, attn_sinks_size * sizeof(__hip_bfloat16), hipMemcpyHostToDevice));
-    free(h_attn_sinks_bf16);
-
-    // Convert and copy MoE weights
-    size_t w_router_size = p->n_layers * p->hidden_dim * p->n_experts;
-    __hip_bfloat16 *h_w_router_bf16 = (__hip_bfloat16 *)malloc(w_router_size * sizeof(__hip_bfloat16));
-    convert_float_array_to_bfloat16(w->w_router, h_w_router_bf16, w_router_size);
-    HIP_CHECK(hipMemcpy(gpu_weights->w_router, h_w_router_bf16, w_router_size * sizeof(__hip_bfloat16), hipMemcpyHostToDevice));
-    free(h_w_router_bf16);
-
-    size_t b_router_size = p->n_layers * p->n_experts;
-    __hip_bfloat16 *h_b_router_bf16 = (__hip_bfloat16 *)malloc(b_router_size * sizeof(__hip_bfloat16));
-    convert_float_array_to_bfloat16(w->b_router, h_b_router_bf16, b_router_size);
-    HIP_CHECK(hipMemcpy(gpu_weights->b_router, h_b_router_bf16, b_router_size * sizeof(__hip_bfloat16), hipMemcpyHostToDevice));
-    free(h_b_router_bf16);
-
-    size_t mlp1_size = p->n_layers * p->n_experts * (2 * p->intermediate_dim) * p->hidden_dim;
-    MXFP4Weights mlp1_mxfp4;
-    quantize_to_mxfp4(w->w_mlp1, mlp1_mxfp4, mlp1_size);
-    size_t mlp1_packed_size = (mlp1_size + 1) / 2;
-    HIP_CHECK(hipMemcpy(gpu_weights->w_mlp1_mxfp4, mlp1_mxfp4.packed_values, mlp1_packed_size, hipMemcpyHostToDevice));
-    HIP_CHECK(hipMemcpy(gpu_weights->w_mlp1_scales, mlp1_mxfp4.scales, mlp1_mxfp4.num_blocks * sizeof(float), hipMemcpyHostToDevice));
-    free_mxfp4_weights(mlp1_mxfp4);
-
-    size_t b_mlp1_size = p->n_layers * p->n_experts * (2 * p->intermediate_dim);
-    __hip_bfloat16 *h_b_mlp1_bf16 = (__hip_bfloat16 *)malloc(b_mlp1_size * sizeof(__hip_bfloat16));
-    convert_float_array_to_bfloat16(w->b_mlp1, h_b_mlp1_bf16, b_mlp1_size);
-    HIP_CHECK(hipMemcpy(gpu_weights->b_mlp1, h_b_mlp1_bf16, b_mlp1_size * sizeof(__hip_bfloat16), hipMemcpyHostToDevice));
-    free(h_b_mlp1_bf16);
-
-    size_t mlp2_size = p->n_layers * p->n_experts * p->hidden_dim * p->intermediate_dim;
-    MXFP4Weights mlp2_mxfp4;
-    quantize_to_mxfp4(w->w_mlp2, mlp2_mxfp4, mlp2_size);
-    size_t mlp2_packed_size = (mlp2_size + 1) / 2;
-    HIP_CHECK(hipMemcpy(gpu_weights->w_mlp2_mxfp4, mlp2_mxfp4.packed_values, mlp2_packed_size, hipMemcpyHostToDevice));
-    HIP_CHECK(hipMemcpy(gpu_weights->w_mlp2_scales, mlp2_mxfp4.scales, mlp2_mxfp4.num_blocks * sizeof(float), hipMemcpyHostToDevice));
-    free_mxfp4_weights(mlp2_mxfp4);
-
-    size_t b_mlp2_size = p->n_layers * p->n_experts * p->hidden_dim;
-    __hip_bfloat16 *h_b_mlp2_bf16 = (__hip_bfloat16 *)malloc(b_mlp2_size * sizeof(__hip_bfloat16));
-    convert_float_array_to_bfloat16(w->b_mlp2, h_b_mlp2_bf16, b_mlp2_size);
-    HIP_CHECK(hipMemcpy(gpu_weights->b_mlp2, h_b_mlp2_bf16, b_mlp2_size * sizeof(__hip_bfloat16), hipMemcpyHostToDevice));
-    free(h_b_mlp2_bf16);
-
-    // Convert and copy output weights
-    size_t out_size = p->hidden_dim * p->vocab_size;
-    __hip_bfloat16 *h_out_bf16 = (__hip_bfloat16 *)malloc(out_size * sizeof(__hip_bfloat16));
-    convert_float_array_to_bfloat16(w->out, h_out_bf16, out_size);
-    HIP_CHECK(hipMemcpy(gpu_weights->out, h_out_bf16, out_size * sizeof(__hip_bfloat16), hipMemcpyHostToDevice));
-    free(h_out_bf16);
-
-    printf("Weight conversion and copying completed successfully\n");
-}
-
-void malloc_cpu_buffers(CPUBuffers *cpu_buf, Config *p)
-{
-    // CPU allocation for RoPE values (used in warmup only)
-    cpu_buf->cos_vals = (float *)malloc((p->head_dim / 2) * MAX_SEQ_LEN * sizeof(float));
-    cpu_buf->sin_vals = (float *)malloc((p->head_dim / 2) * MAX_SEQ_LEN * sizeof(float));
-
-    // CPU allocations for batch management
-    cpu_buf->prompt_tokens = (int **)malloc(BATCH_SIZE * sizeof(int *));
-    cpu_buf->current_tokens = (int *)malloc(BATCH_SIZE * sizeof(int));
-    for (int b = 0; b < BATCH_SIZE; b++)
-    {
-        cpu_buf->prompt_tokens[b] = (int *)malloc((MAX_SEQ_LEN + 3) * sizeof(int));
-    }
-    cpu_buf->finished = (bool *)malloc(BATCH_SIZE * sizeof(bool));
-    cpu_buf->positions = (int *)malloc(BATCH_SIZE * sizeof(int));
-    cpu_buf->prompt_lens = (int *)malloc(BATCH_SIZE * sizeof(int));
-    
-    // Allocate continuous batching fields
-    cpu_buf->slot_active_cpu = (bool *)calloc(BATCH_SIZE, sizeof(bool));
-    cpu_buf->seq_lengths_cpu = (int *)calloc(BATCH_SIZE, sizeof(int));
-    cpu_buf->request_mapping_cpu = (int *)malloc(BATCH_SIZE * sizeof(int));
-    for (int i = 0; i < BATCH_SIZE; i++) {
-        cpu_buf->request_mapping_cpu[i] = -1; // Initialize to -1 (no request)
-    }
-    cpu_buf->next_request_idx = 0;
-}
-
-void build_gpu_transformer(GPUTransformer *gpu_t, Transformer *cpu_t)
-{
-    // Copy config
-    gpu_t->config = cpu_t->config;
-    
-    // Allocate GPU memory
-    malloc_gpu_weights(&gpu_t->weights, &gpu_t->config);
-    malloc_gpu_run_state(&gpu_t->state, &gpu_t->config);
-    malloc_cpu_buffers(&gpu_t->cpu_buffers, &gpu_t->config);
-    
-    // Copy weights to GPU
-    copy_weights_to_gpu(cpu_t, &gpu_t->weights);
-}
+static MultiGPUSystem *multi_gpu_system;
 
 void warm_up(Transformer *transformer, Tokenizer *tokenizer)
 {
     Config *p = &transformer->config;
-    // Create GPU transformer
-    gpu_transformer = (GPUTransformer *)malloc(sizeof(GPUTransformer));
-    assert(gpu_transformer != NULL);
-    gpu_transformer->config = transformer->config;
-
-    // Build GPU transformer
-    build_gpu_transformer(gpu_transformer, transformer);
-
+    multi_gpu_system = (MultiGPUSystem *)malloc(sizeof(MultiGPUSystem));
+    build_multi_gpu_system(multi_gpu_system, transformer);
     float ntk_beta = 32.0f;
     float ntk_alpha = 1.0f;
 
+    auto gpu_transformer_0 = multi_gpu_system->gpu_transformers[0];
     for (int pos = 0; pos < MAX_SEQ_LEN; ++pos)
     {
         compute_cos_sin_getp(pos, p->rope_theta, p->head_dim, p->rope_scaling_factor,
                              p->initial_context_length, ntk_beta, ntk_alpha,
-                             gpu_transformer->cpu_buffers.cos_vals + (pos * p->head_dim / 2),
-                             gpu_transformer->cpu_buffers.sin_vals + (pos * p->head_dim / 2));
+                             gpu_transformer_0->cpu_buffers.cos_vals + (pos * p->head_dim / 2),
+                             gpu_transformer_0->cpu_buffers.sin_vals + (pos * p->head_dim / 2));
     }
 
-    // Copy RoPE values to GPU
-    HIP_CHECK(hipMemcpy(gpu_transformer->state.cos_vals, gpu_transformer->cpu_buffers.cos_vals, 
-                        (p->head_dim / 2) * MAX_SEQ_LEN * sizeof(float), hipMemcpyHostToDevice));
-    HIP_CHECK(hipMemcpy(gpu_transformer->state.sin_vals, gpu_transformer->cpu_buffers.sin_vals, 
-                        (p->head_dim / 2) * MAX_SEQ_LEN * sizeof(float), hipMemcpyHostToDevice));
-}
-
-void free_gpu_weights(GPUTransformerWeights *w)
-{
-    if (w->token_embedding_table) HIP_CHECK(hipFree(w->token_embedding_table));
-    if (w->rms_attn_w) HIP_CHECK(hipFree(w->rms_attn_w));
-    if (w->rms_ffn_w) HIP_CHECK(hipFree(w->rms_ffn_w));
-    if (w->rms_out_w) HIP_CHECK(hipFree(w->rms_out_w));
-    if (w->w_qkv) HIP_CHECK(hipFree(w->w_qkv));
-    if (w->b_qkv) HIP_CHECK(hipFree(w->b_qkv));
-    if (w->w_o) HIP_CHECK(hipFree(w->w_o));
-    if (w->b_o) HIP_CHECK(hipFree(w->b_o));
-    if (w->attn_sinks) HIP_CHECK(hipFree(w->attn_sinks));
-    if (w->w_router) HIP_CHECK(hipFree(w->w_router));
-    if (w->b_router) HIP_CHECK(hipFree(w->b_router));
-    if (w->w_mlp1_mxfp4) HIP_CHECK(hipFree(w->w_mlp1_mxfp4));
-    if (w->w_mlp1_scales) HIP_CHECK(hipFree(w->w_mlp1_scales));
-    if (w->b_mlp1) HIP_CHECK(hipFree(w->b_mlp1));
-    if (w->w_mlp2_mxfp4) HIP_CHECK(hipFree(w->w_mlp2_mxfp4));
-    if (w->w_mlp2_scales) HIP_CHECK(hipFree(w->w_mlp2_scales));
-    if (w->b_mlp2) HIP_CHECK(hipFree(w->b_mlp2));
-    if (w->out) HIP_CHECK(hipFree(w->out));
-}
-
-void free_gpu_run_state(GPURunState *s)
-{
-    if (s->x) HIP_CHECK(hipFree(s->x));
-    if (s->t) HIP_CHECK(hipFree(s->t));
-    if (s->tb) HIP_CHECK(hipFree(s->tb));
-    if (s->tb2) HIP_CHECK(hipFree(s->tb2));
-    if (s->temp_buffer) HIP_CHECK(hipFree(s->temp_buffer));
-    if (s->qkv) HIP_CHECK(hipFree(s->qkv));
-    if (s->q) HIP_CHECK(hipFree(s->q));
-    if (s->k) HIP_CHECK(hipFree(s->k));
-    if (s->v) HIP_CHECK(hipFree(s->v));
-    if (s->att) HIP_CHECK(hipFree(s->att));
-    if (s->mask) HIP_CHECK(hipFree(s->mask));
-    if (s->key_cache) HIP_CHECK(hipFree(s->key_cache));
-    if (s->value_cache) HIP_CHECK(hipFree(s->value_cache));
-    if (s->cos_vals) HIP_CHECK(hipFree(s->cos_vals));
-    if (s->sin_vals) HIP_CHECK(hipFree(s->sin_vals));
-    if (s->router_score) HIP_CHECK(hipFree(s->router_score));
-    if (s->topk_v) HIP_CHECK(hipFree(s->topk_v));
-    if (s->topk_i) HIP_CHECK(hipFree(s->topk_i));
-    if (s->mlp1_out) HIP_CHECK(hipFree(s->mlp1_out));
-    if (s->gate) HIP_CHECK(hipFree(s->gate));
-    if (s->up) HIP_CHECK(hipFree(s->up));
-    if (s->gate_up) HIP_CHECK(hipFree(s->gate_up));
-    if (s->e_agg) HIP_CHECK(hipFree(s->e_agg));
-    if (s->expert_input_buffer) HIP_CHECK(hipFree(s->expert_input_buffer));
-    if (s->expert_output_buffer) HIP_CHECK(hipFree(s->expert_output_buffer));
-    if (s->expert_indices) HIP_CHECK(hipFree(s->expert_indices));
-    if (s->expert_weights) HIP_CHECK(hipFree(s->expert_weights));
-    if (s->batch_count) HIP_CHECK(hipFree(s->batch_count));
-    if (s->d_expert_counts) HIP_CHECK(hipFree(s->d_expert_counts));
-    if (s->d_expert_offsets) HIP_CHECK(hipFree(s->d_expert_offsets));
-    if (s->d_expert_write_idx) HIP_CHECK(hipFree(s->d_expert_write_idx));
-    if (s->d_total_tokens) HIP_CHECK(hipFree(s->d_total_tokens));
-    if (s->current_tokens) HIP_CHECK(hipFree(s->current_tokens));
-    if (s->positions) HIP_CHECK(hipFree(s->positions));
-    if (s->logits) HIP_CHECK(hipFree(s->logits));
-    
-    // Free continuous batching fields
-    if (s->seq_lengths) HIP_CHECK(hipFree(s->seq_lengths));
-    if (s->slot_active) HIP_CHECK(hipFree(s->slot_active));
-    if (s->request_mapping) HIP_CHECK(hipFree(s->request_mapping));
-}
-
-void free_cpu_buffers(CPUBuffers *cpu_buf)
-{
-    if (cpu_buf->cos_vals) free(cpu_buf->cos_vals);
-    if (cpu_buf->sin_vals) free(cpu_buf->sin_vals);
-    if (cpu_buf->current_tokens) free(cpu_buf->current_tokens);
-    if (cpu_buf->finished) free(cpu_buf->finished);
-    if (cpu_buf->positions) free(cpu_buf->positions);
-    if (cpu_buf->prompt_lens) free(cpu_buf->prompt_lens);
-    
-    // Free continuous batching fields
-    if (cpu_buf->slot_active_cpu) free(cpu_buf->slot_active_cpu);
-    if (cpu_buf->seq_lengths_cpu) free(cpu_buf->seq_lengths_cpu);
-    if (cpu_buf->request_mapping_cpu) free(cpu_buf->request_mapping_cpu);
-    
-    if (cpu_buf->prompt_tokens) {
-        for (int b = 0; b < BATCH_SIZE; b++) {
-            if (cpu_buf->prompt_tokens[b]) free(cpu_buf->prompt_tokens[b]);
-        }
-        free(cpu_buf->prompt_tokens);
+    for (int i = 0; i < NUM_GPUS; i++)
+    {        
+        auto local_gpu_transformer = multi_gpu_system->gpu_transformers[i];
+        HIP_CHECK(hipMemcpy(local_gpu_transformer->state.cos_vals, gpu_transformer_0->cpu_buffers.cos_vals,
+                            (p->head_dim / 2) * MAX_SEQ_LEN * sizeof(float), hipMemcpyHostToDevice));
+        HIP_CHECK(hipMemcpy(local_gpu_transformer->state.sin_vals, gpu_transformer_0->cpu_buffers.sin_vals,
+                            (p->head_dim / 2) * MAX_SEQ_LEN * sizeof(float), hipMemcpyHostToDevice));
     }
+    
+    printf("Multi-GPU system initialized successfully with %d GPUs\n", NUM_GPUS);
 }
 
-void free_gpu_transformer(GPUTransformer *gpu_t)
-{
-    free_gpu_weights(&gpu_t->weights);
-    free_gpu_run_state(&gpu_t->state);
-    free_cpu_buffers(&gpu_t->cpu_buffers);
-}
 
 void finish(Transformer *transformer, Tokenizer *tokenizer)
 {
-    // Free GPU transformer
-    free_gpu_transformer(gpu_transformer);
-    free(gpu_transformer);
+    // Free multi-GPU system safely
+    if (multi_gpu_system) {
+        free_multi_gpu_system(multi_gpu_system);
+        free(multi_gpu_system);
+        multi_gpu_system = NULL;
+    }
 }
-
-
-
 
 // GPU-accelerated neural network functions
 void attention_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size)
@@ -596,17 +76,17 @@ void attention_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size)
     GPURunState *s = &gpu_t->state;
     GPUTransformerWeights *w = &gpu_t->weights;
     
-    static Timer rms_norm_timer("RMSNorm_attention", true);
-    static Timer matmul_timer("MatMul_attention", true);
-    static Timer add_bias_timer("AddBias_attention", true);
-    static Timer apply_rope_timer("ApplyRoPE_attention", true);
-    static Timer update_kv_cache_timer("UpdateKVCache_attention", true);
-    static Timer attention_scores_kernel_timer("AttentionScoresKernel_attention", true);
-    static Timer add_sinks_kernel_timer("AddSinksKernel_attention", true);
-    static Timer softmax_kernel_timer("SoftmaxKernel_attention", true);
-    static Timer matmul_kernel_simple_timer("MatMulKernelSimple_attention", true);
-    static Timer attention_weighted_sum_kernel_timer("AttentionWeightedSumKernel_attention", true);
-    static Timer accumulate_kernel_timer("AccumulateKernel_attention", true);
+    Timer rms_norm_timer("RMSNorm_attention", true);
+    Timer matmul_timer("MatMul_attention", true);
+    Timer add_bias_timer("AddBias_attention", true);
+    Timer apply_rope_timer("ApplyRoPE_attention", true);
+    Timer update_kv_cache_timer("UpdateKVCache_attention", true);
+    Timer attention_scores_kernel_timer("AttentionScoresKernel_attention", true);
+    Timer add_sinks_kernel_timer("AddSinksKernel_attention", true);
+    Timer softmax_kernel_timer("SoftmaxKernel_attention", true);
+    Timer matmul_kernel_simple_timer("MatMulKernelSimple_attention", true);
+    Timer attention_weighted_sum_kernel_timer("AttentionWeightedSumKernel_attention", true);
+    Timer accumulate_kernel_timer("AccumulateKernel_attention", true);
 
     int head_dim = p->head_dim;
     int hidden_dim = p->hidden_dim;
@@ -661,8 +141,8 @@ void attention_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size)
     int k_size = p->n_kv_heads * head_dim;
     int v_size = p->n_kv_heads * head_dim;
 
-    // Copy Q: shape [batch_size, n_attn_heads * head_dim]
-    for (int b = 0; b < BATCH_SIZE; b++)
+        // Copy Q: shape [batch_size, n_attn_heads * head_dim]
+    for (int b = 0; b < batch_size; b++)
     {
         float *src = s->qkv + 1LL*b * (p->n_attn_heads + 2 * p->n_kv_heads) * head_dim;
         float *dst = s->q + 1LL*b * q_size;
@@ -671,7 +151,7 @@ void attention_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size)
 
     // Copy K: shape [batch_size, n_kv_heads * head_dim]
     int k_offset = p->n_attn_heads * head_dim;
-    for (int b = 0; b < BATCH_SIZE; b++)
+    for (int b = 0; b < batch_size; b++)
     {
         float *src = s->qkv + 1LL*b * (p->n_attn_heads + 2 * p->n_kv_heads) * head_dim + k_offset;
         float *dst = s->k + 1LL*b * k_size;
@@ -680,7 +160,7 @@ void attention_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size)
 
     // Copy V: shape [batch_size, n_kv_heads * head_dim]
     int v_offset = (p->n_attn_heads + p->n_kv_heads) * head_dim;
-    for (int b = 0; b < BATCH_SIZE; b++)
+    for (int b = 0; b < batch_size; b++)
     {
         float *src = s->qkv + 1LL*b * (p->n_attn_heads + 2 * p->n_kv_heads) * head_dim + v_offset;
         float *dst = s->v + 1LL*b * v_size;
@@ -787,17 +267,17 @@ void attention_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size)
 void moe_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size)
 {
     // Timer declarations (assuming they are defined elsewhere)
-    static Timer rms_norm_timer("RMSNorm_moe", true);
-    static Timer matmul_kernel_simple_timer("MatMulKernelSimple_moe", true);
-    static Timer add_bias_timer("AddBias_moe", true);
-    static Timer topk_kernel_timer("TopKKernel_moe", true);
-    static Timer softmax_kernel_timer("SoftmaxKernel_moe", true);
-    static Timer gather_expert_inputs_kernel_timer("GatherExpertInputsKernel_moe", true);
-    static Timer expert_agg_kernel_timer("ExpertAggKernel_moe", true);
-    static Timer scatter_expert_outputs_kernel_timer("ScatterExpertOutputsKernel_moe", true);
-    static Timer accumulate_kernel_timer("AccumulateKernel_moe", true);
-    static Timer split_gate_up_kernel_timer("SplitGateUpKernel_moe", true);
-    static Timer swiglu_kernel_timer("SwigluKernel_moe", true);
+    Timer rms_norm_timer("RMSNorm_moe", true);
+    Timer matmul_kernel_simple_timer("MatMulKernelSimple_moe", true);
+    Timer add_bias_timer("AddBias_moe", true);
+    Timer topk_kernel_timer("TopKKernel_moe", true);
+    Timer softmax_kernel_timer("SoftmaxKernel_moe", true);
+    Timer gather_expert_inputs_kernel_timer("GatherExpertInputsKernel_moe", true);
+    Timer expert_agg_kernel_timer("ExpertAggKernel_moe", true);
+    Timer scatter_expert_outputs_kernel_timer("ScatterExpertOutputsKernel_moe", true);
+    Timer accumulate_kernel_timer("AccumulateKernel_moe", true);
+    Timer split_gate_up_kernel_timer("SplitGateUpKernel_moe", true);
+    Timer swiglu_kernel_timer("SwigluKernel_moe", true);
 
     Config *p = &gpu_t->config;
     GPURunState *s = &gpu_t->state;
@@ -985,9 +465,9 @@ void moe_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size)
 
 float *forward_batch_gpu(GPUTransformer *gpu_t, int *tokens, int batch_size)
 {
-    static Timer copy_embed_timer("copy_embeddings_forward", true);
-    static Timer rms_norm_timer("RMSNorm_forward", true);
-    static Timer matmul_kernel_simple_timer("MatMulKernelSimple_forward", true);
+    Timer copy_embed_timer("copy_embeddings_forward", true);
+    Timer rms_norm_timer("RMSNorm_forward", true);
+    Timer matmul_kernel_simple_timer("MatMulKernelSimple_forward", true);
     
     Config *p = &gpu_t->config;
     GPURunState *s = &gpu_t->state;
@@ -1036,7 +516,7 @@ float *forward_batch_gpu(GPUTransformer *gpu_t, int *tokens, int batch_size)
             s->logits, s->x, w->out, batch_size, hidden_dim, p->vocab_size);
     }
     // Copy logits back to CPU (you might want to keep this on GPU for sampling)
-    static float *h_logits = nullptr;
+    float *h_logits = nullptr;
     if (!h_logits)
     {
         h_logits = (float *)malloc(batch_size * p->vocab_size * sizeof(float));
@@ -1362,11 +842,218 @@ long long batched_generate_gpu(GPUTransformer *gpu_t, Tokenizer *tokenizer,
     return total_tokens_generated;
 }
 
+
+// Multi-GPU implementation functions
+void *gpu_worker_thread(void *args)
+{
+    GPUWorkerArgs *worker_args = (GPUWorkerArgs *)args;
+    
+    fprintf(stderr, "GPU %d worker thread started\n", worker_args->gpu_id);
+    
+    // Set this thread to use the assigned GPU - Add error handling
+    hipError_t set_device_err = hipSetDevice(worker_args->gpu_id);
+    if (set_device_err != hipSuccess)
+    {
+        fprintf(stderr, "Error: Failed to set GPU device %d in worker thread: %s\n", 
+                worker_args->gpu_id, hipGetErrorString(set_device_err));
+        worker_args->tokens_generated = 0;
+        return NULL;
+    }
+    
+    // Synchronize to ensure device is properly set
+    hipError_t sync_err = hipDeviceSynchronize();
+    if (sync_err != hipSuccess)
+    {
+        fprintf(stderr, "Error: Failed to synchronize GPU device %d: %s\n", 
+                worker_args->gpu_id, hipGetErrorString(sync_err));
+        worker_args->tokens_generated = 0;
+        return NULL;
+    }
+    
+    // Verify we're on the correct device
+    int current_device;
+    hipError_t get_device_err = hipGetDevice(&current_device);
+    if (get_device_err != hipSuccess || current_device != worker_args->gpu_id)
+    {
+        fprintf(stderr, "Error: Device verification failed for GPU %d (current: %d)\n", 
+                worker_args->gpu_id, current_device);
+        worker_args->tokens_generated = 0;
+        return NULL;
+    }
+    
+    // Initialize HIP context for this GPU in this thread
+    hipError_t ctx_err = hipFree(0);  // This forces context creation
+    if (ctx_err != hipSuccess)
+    {
+        fprintf(stderr, "Error: Failed to initialize HIP context for GPU %d: %s\n", 
+                worker_args->gpu_id, hipGetErrorString(ctx_err));
+        worker_args->tokens_generated = 0;
+        return NULL;
+    }
+    
+    fprintf(stderr, "GPU %d worker thread: device context initialized\n", worker_args->gpu_id);
+    // Create a subset Requests structure for this GPU
+    Requests gpu_requests;
+    gpu_requests.num_reqs = worker_args->num_requests;
+    gpu_requests.max_seq_len = worker_args->requests->max_seq_len;
+    gpu_requests.max_token_len = worker_args->requests->max_token_len;
+
+    // Calculate correct offsets for subset of requests this GPU should process
+    size_t str_offset = worker_args->start_req_idx * worker_args->requests->max_token_len * (worker_args->requests->max_seq_len + 1);
+    size_t tok_offset = worker_args->start_req_idx * (worker_args->requests->max_seq_len + 1);
+
+    gpu_requests.str_reqs = worker_args->requests->str_reqs + str_offset;
+    gpu_requests.tok_gens = worker_args->requests->tok_gens + tok_offset;
+
+    fprintf(stderr, "GPU %d worker: Processing %d requests (from idx %d)\n", 
+            worker_args->gpu_id, gpu_requests.num_reqs, worker_args->start_req_idx);
+    fprintf(stderr, "GPU %d worker: str_offset=%zu, tok_offset=%zu\n", 
+            worker_args->gpu_id, str_offset, tok_offset);
+
+    // Run inference on this GPU's subset of requests
+    long long tokens_generated = continuous_batching_inference(
+        worker_args->gpu_transformer,
+        worker_args->tokenizer,
+        worker_args->sampler,
+        &gpu_requests);
+
+    worker_args->tokens_generated = tokens_generated;
+
+    // Final synchronization before thread exit
+    hipError_t final_sync = hipDeviceSynchronize();
+    if (final_sync != hipSuccess)
+    {
+        fprintf(stderr, "Warning: Final sync failed for GPU %d: %s\n", 
+                worker_args->gpu_id, hipGetErrorString(final_sync));
+    }
+
+    fprintf(stderr, "GPU %d worker: Generated %lld tokens, exiting cleanly\n", 
+            worker_args->gpu_id, tokens_generated);
+
+    return NULL;
+}
+
+long long multi_gpu_inference(MultiGPUSystem *multi_gpu, Tokenizer *tokenizer,
+                              Sampler *sampler, Requests *requests)
+{
+
+    if (!multi_gpu->initialized)
+    {
+        fprintf(stderr, "Error: MultiGPUSystem not initialized\n");
+        return 0;
+    }
+
+    int available_gpus = get_available_gpu_count();
+    
+    // Only use GPUs that were actually initialized
+    int usable_gpus = 0;
+    for (int i = 0; i < available_gpus && i < NUM_GPUS; i++)
+    {
+        if (multi_gpu->gpu_transformers[i] != NULL)
+        {
+            usable_gpus++;
+        }
+        else
+        {
+            fprintf(stderr, "Warning: GPU %d not initialized, skipping\n", i);
+            break; // Stop at first uninitialized GPU
+        }
+    }
+    
+    if (usable_gpus == 0)
+    {
+        fprintf(stderr, "Error: No usable GPUs found\n");
+        return 0;
+    }
+    
+    fprintf(stderr, "Using %d out of %d available GPUs\n", usable_gpus, available_gpus);
+
+    // Calculate how to distribute requests across usable GPUs
+    int requests_per_gpu = requests->num_reqs / usable_gpus;
+    int remaining_requests = requests->num_reqs % usable_gpus;
+
+    fprintf(stderr,"Distributing %d requests across %d GPUs (%d base + remainder)\n",
+           requests->num_reqs, usable_gpus, requests_per_gpu);
+
+    // Set up worker arguments for each usable GPU
+    int current_start_idx = 0;
+    for (int gpu_id = 0; gpu_id < usable_gpus; gpu_id++)
+    {
+        GPUWorkerArgs *args = &multi_gpu->worker_args[gpu_id];
+
+        args->gpu_id = gpu_id;
+        args->gpu_transformer = multi_gpu->gpu_transformers[gpu_id];
+        args->tokenizer = tokenizer;
+        args->sampler = sampler;
+        args->requests = requests;
+        args->start_req_idx = current_start_idx;
+
+        // Give extra requests to first few GPUs if there's a remainder
+        args->num_requests = requests_per_gpu + (gpu_id < remaining_requests ? 1 : 0);
+        args->tokens_generated = 0;
+
+        current_start_idx += args->num_requests;
+
+        fprintf(stderr,"GPU %d: will process requests %d to %d (%d total)\n",
+               gpu_id, args->start_req_idx,
+               args->start_req_idx + args->num_requests - 1,
+               args->num_requests);
+    }
+
+    // Launch worker threads
+    fprintf(stderr,"Launching worker threads...\n");
+    for (int gpu_id = 0; gpu_id < usable_gpus; gpu_id++)
+    {
+        int result = pthread_create(&multi_gpu->worker_threads[gpu_id],
+                                    NULL,
+                                    gpu_worker_thread,
+                                    &multi_gpu->worker_args[gpu_id]);
+        if (result != 0)
+        {
+            fprintf(stderr, "Error creating thread for GPU %d: %d\n", gpu_id, result);
+            // Clean up already created threads
+            for (int i = 0; i < gpu_id; i++)
+            {
+                pthread_cancel(multi_gpu->worker_threads[i]);
+            }
+            return 0;
+        }
+        
+        // Small delay to avoid race conditions during thread startup
+        usleep(100000); // 100ms delay between thread launches
+        fprintf(stderr, "Thread for GPU %d created successfully\n", gpu_id);
+    }
+
+    // Wait for all threads to complete and collect results
+    long long total_tokens_generated = 0;
+    fprintf(stderr,"Waiting for worker threads to complete...\n");
+
+    for (int gpu_id = 0; gpu_id < usable_gpus; gpu_id++)
+    {
+        void *thread_result;
+        int result = pthread_join(multi_gpu->worker_threads[gpu_id], &thread_result);
+
+        if (result != 0)
+        {
+            fprintf(stderr, "Error joining thread for GPU %d: %d\n", gpu_id, result);
+        }
+        else
+        {
+            total_tokens_generated += multi_gpu->worker_args[gpu_id].tokens_generated;
+            fprintf(stderr, "GPU %d completed: %lld tokens generated\n",
+                   gpu_id, multi_gpu->worker_args[gpu_id].tokens_generated);
+        }
+    }
+
+    fprintf(stderr,"Multi-GPU inference completed: %lld total tokens generated\n", total_tokens_generated);
+    return total_tokens_generated;
+}
+
 long long inference(Transformer *transformer, Tokenizer *tokenizer,
                     Sampler *sampler, Requests *requests)
 {
     // Use continuous batching for better throughput
-    return continuous_batching_inference(gpu_transformer, tokenizer, sampler, requests);
+    return multi_gpu_inference(multi_gpu_system, tokenizer, sampler, requests);
 }
 
 /*
