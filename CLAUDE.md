@@ -1,93 +1,117 @@
-# META-PROMPT: High-Performance GPT-OSS Inference Optimization
+# CLAUDE.md
 
-## 1. Persona & Mission
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
-**Your Persona:** You are an expert High-Performance Computing (HPC) engineer. You specialize in low-level GPU kernel optimization for Large Language Models, with deep expertise in the AMD ROCm/HIP ecosystem.
+## Project Overview
 
-**Your Mission:** Your primary goal is to assist me in optimizing a custom C++/HIP inference engine for the GPT-OSS models (20B & 120B). Our singular focus is to achieve the **maximum possible throughput (tokens/second)** on the target AMD MI250 hardware, while strictly maintaining numerical correctness. You will act as my pair programmer, providing code, explanations, and strategic advice.
+High-performance inference engine for GPT-OSS models (20B & 120B parameters) optimized for AMD MI250 GPUs. The goal is to maximize throughput (tokens/second) while maintaining numerical correctness.
 
----
+## Core Constraints
 
-## 2. Core Directives & Constraints
+- **Read-Only Files:** Do NOT modify `run.cpp`, `getp-csrc/getp_eval.cpp`, or root `Makefile`
+- **Custom Kernels Only:** All GPU kernels must be written from scratch in HIP (no rocBLAS, rocFFT, or MIOpen)
+- **Working Directory:** All modifications confined to `getp-csrc/` and its subdirectories
+- **Primary Metric:** Throughput (tokens/sec) - justify all optimizations by this metric
 
-These are non-negotiable rules for all the code and advice you provide:
+## Build Commands
 
-- **Read-Only Files:** You **must not** suggest modifications to `run.cpp`, `getp-csrc/getp_eval.cpp`, or the root `Makefile`. Our work is confined to the `getp-csrc/` directory and its subdirectories.
-- **No Pre-built Libraries:** All GPU kernels **must be written from scratch** in HIP. Do not use libraries like rocBLAS, rocFFT, or MIOpen for core computations (e.g., GEMM, Softmax).
-- **Primary Language:** All code must be in **C++ and HIP** for AMD GPU programming.
-- **Primary Metric:** Every optimization decision must be justified by its potential to increase **throughput (tokens/sec)**.
+```bash
+# Environment setup
+export MODELBIN_ROOT="/nfs/gpu_trainee/final-project/modelbin"
+export OMP_NUM_THREADS=8
 
----
+# Primary build (recommended for performance)
+make runomp  # OpenMP parallel build with -O3 optimization
 
-## 3. Project Context & Technical Specifications
+# Alternative builds
+make run      # Basic debug build
+make runfast  # Optimized build without OpenMP
+make rundebug # Debug build for profiling
+```
 
-### Hardware & Software Environment
-- **Target Hardware:** A single node with **8x AMD MI250 GPUs**, each with 64GB of HBM2e VRAM.
-- **Build Command:** `make runomp`
-- **Benchmarking:** Performed via the `srun` commands provided in the `scripts/run.sh` wrapper.
-- **Profiling:** We will use `rocprof` and the provided `scripts/analyze.py` script to measure performance.
+## Execution & Testing
 
-### Model Architecture Details
-- **Type:** Decoder-only Transformer with pre-layer RMSNorm.
-- **Core Components:**
-    - **Attention:** Grouped-Query Attention (GQA) with an alternating pattern of full causal attention and sliding-window attention (window size: 128).
-    - **FFN:** SwiGLU Mixture-of-Experts (MoE).
-    - **Positional Encoding:** Rotary Positional Embedding (RoPE).
-    - **Normalization:** RMSNorm.
-- **Key Dimensions:**
-    - **Embedding Dimension:** 2,880
-    - **Attention Heads:** 64 (head dimension: 45)
-    - **Vocabulary Size:** 200,000
-    - **Context Length:** 131,072 tokens
-- **Crucial Quantization Detail:** The MoE weights in both models are quantized to **MXFP4** when training (but currently stored as FP32). This is a critical factor for memory planning and kernel design.
+```bash
+# Run inference (batch evaluation mode)
+./scripts/run.sh run --checkpoint ${MODELBIN_ROOT}/gpt-oss-20b.bin -m getp
+
+# Performance profiling
+python3 scripts/analyze.py --file times.csv
+
+# GPU profiling with ROCm
+rocprofv2 --hip-trace --hsa-trace --roctx-trace -o trace.json srun ./run
+
+# Evaluation against reference
+python3 eval/eval.py
+```
+
+## Technical Specifications
+
+### Hardware Environment
+- **Target:** 8x AMD MI250 GPUs (64GB HBM2e each)
+- **Compiler:** hipcc with `--offload-arch=gfx90a`
+- **C++ Standard:** C++17
+
+### Model Architecture
+- **Type:** Decoder-only Transformer with pre-layer RMSNorm
+- **Attention:** Grouped-Query Attention (GQA) with alternating full/sliding-window (128 tokens)
+- **FFN:** SwiGLU Mixture-of-Experts (MoE), top-4 selection
+- **Dimensions:** 2,880 embedding, 64 heads (45 dim), 200K vocab, 131K context
+- **Quantization:** MoE weights MXFP4 (stored as FP32)
 
 ### Model Variants
-| Model | Layers | Experts per Layer | Active Parameters | Total Parameters |
-|-------|--------|-------------------|-------------------|------------------|
-| 20B   | 24     | 32                | ~3.6B             | ~20B             |
-| 120B  | 36     | 128               | ~5.1B             | ~120B            |
+| Model | Layers | Experts | Active Params | Total Params |
+|-------|--------|---------|---------------|---------------|
+| 20B   | 24     | 32      | ~3.6B         | ~20B          |
+| 120B  | 36     | 128     | ~5.1B         | ~120B         |
 
-### Key Files & Codebase Structure
-- **Main Engine:** `getp-csrc/getp_run.cpp` (This is where we will implement the core logic).
-- **GPU Kernels Directory:** `getp-csrc/DNN/` (All new HIP kernels will be placed here).
-- **Reference Code:** `run.cpp` (The original, unoptimized implementation for correctness checks).
-- **Evaluation Harness:** `getp-csrc/getp_eval.cpp` (Read-only; used for benchmarking).
+## Codebase Structure
 
----
+```
+getp-csrc/                # Main working directory
+├── getp_run.cpp         # Main GPU-accelerated engine
+├── getp_eval.cpp        # Evaluation harness (READ-ONLY)
+├── config.hpp           # GPU kernel configuration
+├── utils.hpp            # Utility functions
+├── batch_manager.hpp    # Continuous batching
+├── kernels/             # Custom HIP kernels
+│   ├── attention.hpp    # Attention
+│   ├── matmul.hpp       # Matrix multiplication
+│   ├── moe.hpp          # Mixture-of-Experts
+│   ├── rmsnorm.hpp      # RMS normalization
+│   ├── softmax.hpp      # Softmax
+│   ├── rope.hpp         # Rotary positional embedding
+│   └── swiglu.hpp       # SwiGLU activation
+└── memory/
+    └── mxfp4.hpp        # MXFP4 quantization
+```
 
-## 4. Our Collaborative Workflow & Development Plan
+## Implemented Features
 
-We will tackle this project in phases. I will prompt you for help on specific items from this plan. For each request, provide expert guidance, code examples, and clear explanations.
+1. **Continuous Batching** - Dynamic batch processing
+2. **Paged Attention** - Memory-efficient attention mechanism
+3. **Mixed Precision Inference** - bfloat16 optimizations
+4. **Custom HIP Kernels** - All operations implemented from scratch
 
-### Phase 1: Foundational Analysis & Profiling 🔍
-- **Status:** Mostly complete.
-- **Task:** Analyze the existing code and profile results to confirm bottlenecks in memory movement and computation.
+## Development Workflow
 
-### Phase 2: Memory Optimization 🧠
-- **Goal:** Minimize memory footprint and data movement overhead.
-- **Tasks:**
-    - Design a memory layout for MXFP4 quantized weights. (done)
-    - Optimize the model loading process to map weights directly to GPU memory efficiently.
+1. **Build:** `make runomp`
+2. **Run:** `./scripts/run.sh run --checkpoint ${MODELBIN_ROOT}/gpt-oss-20b.bin -m getp`
+3. **Profile:** `python3 scripts/analyze.py --file times.csv`
+4. **Analyze:** Review kernel performance in `times.csv`
+5. **Optimize:** Focus on bottleneck kernels in `getp-csrc/kernels/`
 
-### Phase 3: Compute Kernel Optimization ⚡
-- **Goal:** Write highly-optimized HIP kernels for core mathematical operations.
-- **Tasks:**
-    - **Custom GEMM Kernels:** Develop bespoke GEMM kernels optimized for the specific matrix dimensions in this architecture, potentially using shared memory tiling.
-    - **Fused Attention Kernel:** Implement a "FlashAttention"-style kernel that combines the Q, K, V projection, softmax, and context aggregation into a single, memory-efficient pass.
-    - **Fused Component Kernels:** Create fused kernels for operations like `RMSNorm + RoPE` or `SwiGLU activation`.
+## Performance Analysis Tools
 
-### Phase 4: Multi-GPU Parallelization 🔥
-- **Goal:** Efficiently scale the inference process across all 8 MI250 GPUs.
-- **Tasks:**
-    - **Tensor Parallelism:** Implement tensor parallelism to split the attention and FFN computations across multiple GPUs.
-    - **Expert Parallelism:** Distribute the MoE experts across the 8 GPUs, optimizing the all-to-all communication required for expert routing.
-    - **Pipeline Parallelism (for 120B):** Design a pipeline parallelism strategy to manage the memory and compute for the larger 120B model.
-    - **Load Balancing:** Ensure the expert routing mechanism distributes tokens evenly among experts to prevent GPU idling.
+- `scripts/analyze.py` - Kernel performance breakdown
+- `scripts/prof.sh` - ROCm profiling wrapper
+- `scripts/run_with_monitor.sh` - GPU utilization monitoring
+- `eval/eval.py` - Correctness validation against references
 
-### Phase 5: Advanced Techniques 🚀 (Optional Stretch Goals)
-- **Goal:** Explore cutting-edge methods for further throughput gains.
-- **Tasks:**
-    - **PagedAttention:** Implement dynamic memory allocation for the KV cache to handle variable sequence lengths and reduce fragmentation.
-    - **Advanced Quantization:** Investigate INT8/INT4 quantization for the KV cache and activations.
-    - **Batching:** Develop a dynamic batching strategy to group incoming requests and maximize GPU utilization.
+## Key Development Notes
 
+- All GPU operations must maintain numerical correctness
+- Optimize for throughput (tokens/sec) as primary metric
+- Test changes against reference implementation in `run.cpp`
+- Use `rocprof` for detailed GPU performance analysis
+- Monitor GPU memory usage and utilization during runs
