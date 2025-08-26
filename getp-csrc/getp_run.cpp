@@ -689,7 +689,11 @@ void attention_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size)
 
 
     for (int i = 0; i < batch_size; i++) {
-        s->paged_managers[layer_idx]->extend_new_block(i, s->positions[i]);
+        if (s->positions[i] % PAGE_SIZE == 0) {
+            s->paged_managers[layer_idx]->extend_new_block(i, s->positions[i]);
+            if (layer_idx % 2 == 0) 
+                s->paged_managers[layer_idx]->free_past_blocks(i, s->positions[i], p->sliding_window);
+        }
     }
 
     s->paged_managers[layer_idx]->sync_to_device();

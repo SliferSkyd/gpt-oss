@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cmath>
 #include <hip/hip_runtime.h>
 #include <hip/hip_bf16.h>
 #include "../config.hpp"
@@ -121,7 +122,8 @@ __global__ void paged_attention_scores_kernel(float *att, const float *q,
     // Get physical block ID from block table
     const __hip_bfloat16* physical_block = block_table[batch_idx * PAGES_PER_SEQ + page_idx];
     if (physical_block == nullptr) {
-        printf("Error: Attempting to write to unallocated page (batch %d, page %d)\n", batch_idx, page_idx);
+        att[1LL*batch_idx * n_heads * seq_len + head_idx * seq_len + token_idx] = -INFINITY;
+        // printf("Error: Attempting to write to unallocated page (batch %d, page %d)\n", batch_idx, page_idx);
         return;
     }
 
@@ -189,8 +191,7 @@ __global__ void paged_attention_weighted_sum_kernel(float *output, const float *
         // Get physical block ID from block table
         __hip_bfloat16* physical_block = block_table[batch_idx * PAGES_PER_SEQ + page_idx];
         if (physical_block == nullptr) {
-            printf("Error: Attempting to write to unallocated page (batch %d, page %d)\n", batch_idx, page_idx);
-            return;
+            continue;
         }
         
         // Calculate value pointer in paged cache

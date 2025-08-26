@@ -75,6 +75,26 @@ public:
         HIP_CHECK(hipMalloc((void **)&h_block_table[block_id], 2 * PAGE_SIZE * kv_dim * sizeof(__hip_bfloat16)));
     }
 
+    void free_past_blocks(int seq_id, int current_pos, int window_size) {
+        // Only proceed if sliding window is active and we are past the first window
+        if (window_size <= 0 || current_pos < window_size) {
+            return;
+        }
+
+        int window_start_token = current_pos - window_size;
+        int last_stale_page_idx = (window_start_token - 1) / PAGE_SIZE;
+
+        for (int page_offset = 0; page_offset <= last_stale_page_idx; ++page_offset) {
+            int block_id = seq_id * PAGES_PER_SEQ + page_offset;
+
+            // Check if the block was actually allocated before trying to free it
+            if (h_block_table[block_id] != nullptr) {
+                HIP_CHECK(hipFree(h_block_table[block_id]));
+                h_block_table[block_id] = nullptr;
+            }
+        }
+    }
+
     // New function to sync host table to device
     void sync_to_device() {
         HIP_CHECK(hipMemcpy(d_block_table, h_block_table, table_size_bytes, hipMemcpyHostToDevice));
