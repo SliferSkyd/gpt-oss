@@ -127,6 +127,11 @@ typedef struct
     bool *finished;      // finished flags for each sequence
     int *positions;      // current positions (CPU copy)
     int *prompt_lens;    // prompt lengths
+    hipStream_t sGather;
+    hipStream_t sScatter;
+    hipStream_t sMLP[N_MLP_STREAMS];
+    int *expert_counts;
+    int *expert_offsets;
 
     // Continuous batching fields
     int next_request_idx;     // Index of next unprocessed request (0 to num_reqs-1)
@@ -443,6 +448,14 @@ void malloc_cpu_buffers(CPUBuffers *cpu_buf, Config *p)
         cpu_buf->request_mapping_cpu[i] = -1; // Initialize to -1 (no request)
     }
     cpu_buf->next_request_idx = 0;
+
+    HIP_CHECK(hipHostMalloc(&cpu_buf->expert_counts, p->n_experts * sizeof(int)));
+    HIP_CHECK(hipHostMalloc(&cpu_buf->expert_offsets, p->n_experts * sizeof(int)));
+    HIP_CHECK(hipStreamCreateWithFlags(&cpu_buf->sGather, hipStreamNonBlocking));
+    HIP_CHECK(hipStreamCreateWithFlags(&cpu_buf->sScatter, hipStreamNonBlocking));
+    for (int i = 0; i < N_MLP_STREAMS; ++i)
+        HIP_CHECK(hipStreamCreateWithFlags(&cpu_buf->sMLP[i], hipStreamNonBlocking));
+
 }
 
 void build_gpu_transformer(GPUTransformer *gpu_t, Transformer *cpu_t)
@@ -857,12 +870,6 @@ void attention_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size)
     }
 }
 
-constexpr int N_MLP_STREAMS = 4; // tune me (4–8 is usually good)
-
-static hipStream_t sGather = nullptr, sScatter = nullptr;
-static hipStream_t sMLP[N_MLP_STREAMS];
-static bool streams_inited = false;
-
 void moe_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size)
 {
     // ===== timers =====
@@ -887,24 +894,9 @@ void moe_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size)
     const int n_experts = p->n_experts;
     const int experts_per_token = p->experts_per_token;
 
-    // ===== init streams once =====
-    if (!streams_inited)
-    {
-        HIP_CHECK(hipStreamCreateWithFlags(&sGather, hipStreamNonBlocking));
-        HIP_CHECK(hipStreamCreateWithFlags(&sScatter, hipStreamNonBlocking));
-        for (int i = 0; i < N_MLP_STREAMS; ++i)
-            HIP_CHECK(hipStreamCreateWithFlags(&sMLP[i], hipStreamNonBlocking));
-        streams_inited = true;
-    }
-
-    // ===== pinned host scratch (reused across calls) =====
-    static int *h_expert_counts_pinned = nullptr;
-    static int *h_expert_offsets_pinned = nullptr;
-    if (!h_expert_counts_pinned)
-    {
-        HIP_CHECK(hipHostMalloc((void **)&h_expert_counts_pinned, n_experts * sizeof(int)));
-        HIP_CHECK(hipHostMalloc((void **)&h_expert_offsets_pinned, n_experts * sizeof(int)));
-    }
+    hipStream_t sGather = &cpu_buf->sGather;
+    hipStream_t sScatter = &cpu_buf->sScatter;
+    hipStream_t *sMLP = &cpu_buf->sMLP;
 
     // ===== per-call events =====
     hipEvent_t evRouterDone, evPermuteDone;
@@ -971,7 +963,7 @@ void moe_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size)
         HIP_CHECK(hipGetLastError());
 
         // counts D2H (async), then sync sGather to use them on CPU
-        HIP_CHECK(hipMemcpyAsync(h_expert_counts_pinned, s->d_expert_counts,
+        HIP_CHECK(hipMemcpyAsync(cpu_buf->expert_counts, s->d_expert_counts,
                                  n_experts * sizeof(int), hipMemcpyDeviceToHost, sGather));
         HIP_CHECK(hipStreamSynchronize(sGather)); // ensure counts available on host
 
@@ -979,12 +971,12 @@ void moe_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size)
         total_tokens = 0;
         for (int i = 0; i < n_experts; ++i)
         {
-            h_expert_offsets_pinned[i] = total_tokens;
-            total_tokens += h_expert_counts_pinned[i];
+            cpu_buf->expert_offsets[i] = total_tokens;
+            total_tokens += cpu_buf->expert_counts[i];
         }
 
         // offsets H2D (async)
-        HIP_CHECK(hipMemcpyAsync(s->d_expert_offsets, h_expert_offsets_pinned,
+        HIP_CHECK(hipMemcpyAsync(s->d_expert_offsets, cpu_buf->expert_offsets,
                                  n_experts * sizeof(int), hipMemcpyHostToDevice, sGather));
 
         // permute
@@ -1011,14 +1003,14 @@ void moe_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size)
     // ===== 3) EXPERT MLPs on multiple streams, each waits on permute =====
     for (int expert_id = 0; expert_id < n_experts; ++expert_id)
     {
-        const int h_batch_count = h_expert_counts_pinned[expert_id];
+        const int h_batch_count = cpu_buf->expert_counts[expert_id];
         if (h_batch_count == 0)
             continue;
 
         hipStream_t st = sMLP[expert_id % N_MLP_STREAMS];
         HIP_CHECK(hipStreamWaitEvent(st, evPermuteDone, 0));
 
-        const int expert_tok_off = h_expert_offsets_pinned[expert_id];
+        const int expert_tok_off = cpu_buf->expert_offsets[expert_id];
 
         float *expert_input_ptr = s->expert_input_buffer + (size_t)expert_tok_off * hidden_dim;
         float *mlp1_out_ptr = s->mlp1_out + (size_t)expert_tok_off * (2 * intermediate_dim);
