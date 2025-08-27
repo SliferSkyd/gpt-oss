@@ -676,6 +676,7 @@ void attention_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size)
     static Timer matmul_kernel_simple_timer("MatMulKernelSimple_attention", true);
     static Timer attention_weighted_sum_kernel_timer("AttentionWeightedSumKernel_attention", true);
     static Timer accumulate_kernel_timer("AccumulateKernel_attention", true);
+    static Timer fused_attention_kernel_timer("FusedAttentionKernel_attention", true);
 
     int head_dim = p->head_dim;
     int hidden_dim = p->hidden_dim;
@@ -782,51 +783,37 @@ void attention_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size)
         HIP_CHECK(hipGetLastError());
     }
 
-    // Compute attention scores
-    dim3 att_grid(batch_size, p->n_attn_heads, (MAX_SEQ_LEN + 31) / 32);
-    dim3 att_block(1, 1, 32);
+    // ------------------- FUSED KERNEL LAUNCH (REPLACES 4 OLD KERNELS) -------------------
     {
-        TIME_SCOPE(attention_scores_kernel_timer);
-        attention_scores_shared_mem_kernel<<<att_grid, att_block>>>(
-            s->att, s->q, s->key_cache, s->mask, s->positions, batch_size, p->n_attn_heads,
-            head_dim, MAX_SEQ_LEN, p->n_layers, layer_idx, p->sliding_window > 0);
+        TIME_SCOPE(fused_attention_kernel_timer);
+        
+        dim3 grid(batch_size, p->n_attn_heads);
+        dim3 block(256); // 256 threads is a good default for this type of workload
+
+        // Calculate required dynamic shared memory: Q vector + Att scores + reduction buffer
+        size_t shared_mem_size = (p->head_dim + MAX_SEQ_LEN + block.x) * sizeof(float);
+
+        fused_attention_kernel<<<grid, block, shared_mem_size>>>(
+            s->tb,                                      // Output goes to tb, matching the original weighted_sum output
+            s->q,
+            s->key_cache,
+            s->value_cache,
+            w->attn_sinks + layer_idx * p->n_attn_heads, // Offset to the current layer's sinks
+            s->mask,
+            s->positions,
+            batch_size,
+            p->n_attn_heads,
+            p->n_kv_heads,
+            p->head_dim,
+            MAX_SEQ_LEN,
+            p->n_layers,
+            layer_idx,
+            p->sliding_window > 0
+        );
         HIP_CHECK(hipGetLastError());
     }
+    // --------------------------------- END OF FUSED SECTION ---------------------------------
 
-    // Compute attention scores
-    //
-
-    // Add attention sinks - FIXED: Use GPU weight pointer
-    dim3 sink_grid(batch_size, p->n_attn_heads);
-    dim3 sink_block(1);
-    {
-        TIME_SCOPE(add_sinks_kernel_timer);
-        add_sinks_kernel<<<sink_grid, sink_block>>>(
-            s->att, w->attn_sinks + layer_idx * p->n_attn_heads, s->positions,
-            MAX_SEQ_LEN, p->n_attn_heads);
-        HIP_CHECK(hipGetLastError());
-    }
-
-    // Softmax attention weights
-    dim3 soft_grid(batch_size * p->n_attn_heads);
-    dim3 soft_block(THREADS_PER_BLOCK);
-    {
-        TIME_SCOPE(softmax_kernel_timer);
-        softmax_kernel_variable_len<<<soft_grid, soft_block>>>(
-            s->att, s->positions, batch_size, p->n_attn_heads, MAX_SEQ_LEN);
-        HIP_CHECK(hipGetLastError());
-    }
-
-    // Weighted sum of values
-    dim3 wsum_grid(batch_size, p->n_attn_heads);
-    dim3 wsum_block(head_dim);
-    {
-        TIME_SCOPE(matmul_kernel_simple_timer);
-        attention_weighted_sum_kernel<<<wsum_grid, wsum_block>>>(
-            s->tb, s->att, s->value_cache, s->positions, batch_size, p->n_attn_heads,
-            head_dim, MAX_SEQ_LEN, p->n_layers, layer_idx);
-        HIP_CHECK(hipGetLastError());
-    }
     // Output projection - FIXED: Use GPU weight pointer
 
     grid_dim.y = (hidden_dim + block_dim.y - 1) / block_dim.y; // Ceiling division
