@@ -1,7 +1,5 @@
 import pandas as pd
 import numpy as np
-import matplotlib.pyplot as plt
-import seaborn as sns
 import argparse
 
 class KernelAnalyzer:
@@ -123,62 +121,6 @@ class KernelAnalyzer:
                 time = self.df[self.df['name'] == kernel]['time_ms'].iloc[0]
                 print(f"    {kernel}: {time:.3f} ms")
     
-    def create_visualizations(self):
-        """Tạo charts"""
-        if len(self.df) == 0:
-            return
-        
-        plt.style.use('default')
-        fig, axes = plt.subplots(2, 2, figsize=(15, 10))
-        
-        # 1. Time distribution pie chart
-        kernel_times = self.df.groupby('name')['time_ms'].sum()
-        top_kernels = kernel_times.nlargest(8)
-        others = kernel_times.sum() - top_kernels.sum()
-        
-        if others > 0:
-            plot_data = pd.concat([top_kernels, pd.Series([others], index=['Others'])])
-        else:
-            plot_data = top_kernels
-        
-        axes[0,0].pie(plot_data.values, labels=plot_data.index, autopct='%1.1f%%', startangle=90)
-        axes[0,0].set_title('Execution Time Distribution')
-        
-        # 2. Bar chart - total time per kernel
-        kernel_times_sorted = kernel_times.sort_values(ascending=True)
-        axes[0,1].barh(range(len(kernel_times_sorted)), kernel_times_sorted.values)
-        axes[0,1].set_yticks(range(len(kernel_times_sorted)))
-        axes[0,1].set_yticklabels([name[:20] for name in kernel_times_sorted.index])
-        axes[0,1].set_xlabel('Time (ms)')
-        axes[0,1].set_title('Total Time per Kernel')
-        
-        # 3. Execution sequence
-        colors = plt.cm.Set3(np.linspace(0, 1, len(self.df['name'].unique())))
-        kernel_colors = dict(zip(self.df['name'].unique(), colors))
-        
-        for i, (_, row) in enumerate(self.df.iterrows()):
-            axes[1,0].bar(i, row['time_ms'], color=kernel_colors[row['name']], alpha=0.7)
-        axes[1,0].set_xlabel('Execution Order')
-        axes[1,0].set_ylabel('Time (ms)')
-        axes[1,0].set_title('Execution Timeline')
-        
-        # 4. Box plot for kernels with multiple runs
-        multi_runs = self.df.groupby('name').filter(lambda x: len(x) > 1)
-        if len(multi_runs) > 0:
-            multi_runs.boxplot(column='time_ms', by='name', ax=axes[1,1])
-            axes[1,1].set_title('Time Distribution (Multi-run Kernels)')
-            axes[1,1].set_xlabel('Kernel')
-            axes[1,1].tick_params(axis='x', rotation=45)
-        else:
-            axes[1,1].text(0.5, 0.5, 'No kernels with\nmultiple executions', 
-                          ha='center', va='center', transform=axes[1,1].transAxes)
-            axes[1,1].set_title('Time Distribution')
-        
-        plt.tight_layout()
-        plt.savefig('kernel_analysis.png', dpi=300, bbox_inches='tight')
-        print(f"\n📊 Charts saved as 'kernel_analysis.png'")
-        plt.show()
-    
     def optimization_suggestions(self):
         """Đề xuất tối ưu"""
         print("\n" + "="*50)
@@ -248,7 +190,6 @@ class KernelAnalyzer:
         self.variability_analysis()
         self.execution_pattern()
         self.optimization_suggestions()
-        self.create_visualizations()
         self.export_report()
         
         print("\n✅ Analysis complete!")
