@@ -1,5 +1,9 @@
 
 #pragma once
+#include <chrono>
+#include <cstdlib>
+#include <iomanip>
+#include <sstream>
 // HIP error checking macro
 #define HIP_CHECK(call)                                                                                 \
     do                                                                                                  \
@@ -49,9 +53,33 @@ struct Timer
     std::ofstream log_file;
     bool use_hip;
 
-    Timer(const std::string &timer_name, bool is_hip = false, const std::string &filename = "times.csv")
+    Timer(const std::string &timer_name, bool is_hip = false, const std::string &filename = "")
         : name(timer_name), use_hip(is_hip)
     {
+        std::string actual_filename = filename;
+        
+        // Auto-generate filename if not provided
+        if (actual_filename.empty()) {
+            // Try to get SLURM_JOB_ID first
+            const char* job_id = std::getenv("SLURM_JOB_ID");
+            if (job_id) {
+                actual_filename = "logs/times_job_" + std::string(job_id) + ".csv";
+            } else {
+                // Fall back to timestamp
+                auto now = std::chrono::system_clock::now();
+                auto time_t = std::chrono::system_clock::to_time_t(now);
+                auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                    now.time_since_epoch()) % 1000;
+                
+                std::stringstream ss;
+                ss << "logs/times_" << std::put_time(std::localtime(&time_t), "%Y%m%d_%H%M%S");
+                ss << "_" << std::setfill('0') << std::setw(3) << ms.count() << ".csv";
+                actual_filename = ss.str();
+            }
+        } else if (actual_filename.find('/') == std::string::npos) {
+            // If filename doesn't contain path, add logs/ prefix
+            actual_filename = "logs/" + actual_filename;
+        }
 
         if (use_hip)
         {
@@ -59,7 +87,7 @@ struct Timer
             hipEventCreate(&hip_stop);
         }
 
-        log_file.open(filename, std::ios::app);
+        log_file.open(actual_filename, std::ios::app);
         if (log_file.tellp() == 0)
         {
             log_file << "name,time_ms\n";
