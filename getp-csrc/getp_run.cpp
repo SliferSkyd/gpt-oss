@@ -6,7 +6,6 @@
 #include <hip/hip_runtime.h>
 #include <hip/hip_bf16.h>
 #include <iostream>
-#include <omp.h>
 #include <fstream>
 #include <vector>
 #include <string>
@@ -23,6 +22,7 @@
 #include "kernels/swiglu.hpp"
 #include "kernels/rope.hpp"
 #include "memory/mxfp4.hpp"
+#include <omp.h>
 
 #ifndef GETP_RUN
 #define GETP_RUN
@@ -135,6 +135,7 @@ typedef struct
     hipStream_t sMLP[N_MLP_STREAMS];
     int *expert_counts;
     int *expert_offsets;
+    float *logits;
 
     // Continuous batching fields
     int next_request_idx;     // Index of next unprocessed request (0 to num_reqs-1)
@@ -458,7 +459,7 @@ void malloc_cpu_buffers(CPUBuffers *cpu_buf, Config *p)
     HIP_CHECK(hipStreamCreateWithFlags(&cpu_buf->sScatter, hipStreamNonBlocking));
     for (int i = 0; i < N_MLP_STREAMS; ++i)
         HIP_CHECK(hipStreamCreateWithFlags(&cpu_buf->sMLP[i], hipStreamNonBlocking));
-
+    HIP_CHECK(hipHostMalloc(&cpu_buf->logits, BATCH_SIZE * p->vocab_size * sizeof(float)));
 }
 
 void build_gpu_transformer(GPUTransformer *gpu_t, Transformer *cpu_t)
@@ -684,6 +685,7 @@ void finish(Transformer *transformer, Tokenizer *tokenizer)
         free_gpu_transformer(gpu_transformers[dev]);
         free(gpu_transformers[dev]);
     }
+    free(gpu_transformers);
 }
 
 // GPU-accelerated neural network functions
@@ -705,6 +707,7 @@ void attention_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size)
             s->t, s->x, w->rms_attn_w + layer_idx * hidden_dim, batch_size, hidden_dim);
         HIP_CHECK(hipGetLastError());
     }
+    // HIP_CHECK(hipDeviceSynchronize());
 
     dim3 matmul_grid(batch_size, ((p->n_attn_heads + 2 * p->n_kv_heads) * head_dim + 31) / 32);
     dim3 matmul_block(32, min(32, THREADS_PER_BLOCK / 32));
@@ -726,7 +729,8 @@ void attention_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size)
             (p->n_attn_heads + 2 * p->n_kv_heads) * head_dim);
         HIP_CHECK(hipGetLastError());
     }
-
+    // HIP_CHECK(hipDeviceSynchronize());
+    
     HIP_CHECK(hipGetLastError());
     // Add bias - FIXED: Use GPU bias pointer and proper kernel
     int qkv_bias_offset = layer_idx * (head_dim * p->n_attn_heads + 2 * head_dim * p->n_kv_heads);
@@ -737,7 +741,8 @@ void attention_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size)
             s->qkv, w->b_qkv + qkv_bias_offset, batch_size, (p->n_attn_heads + 2 * p->n_kv_heads) * head_dim);
         HIP_CHECK(hipGetLastError());
     }
-
+    // HIP_CHECK(hipDeviceSynchronize());
+    
     // Copy Q, K, V from qkv buffer - SIMPLIFIED AND FIXED
     int q_size = p->n_attn_heads * head_dim;
     int k_size = p->n_kv_heads * head_dim;
@@ -750,7 +755,8 @@ void attention_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size)
         float *dst = s->q + 1LL * b * q_size;
         HIP_CHECK(hipMemcpy(dst, src, q_size * sizeof(float), hipMemcpyDeviceToDevice));
     }
-
+    // HIP_CHECK(hipDeviceSynchronize());
+    
     // Copy K: shape [batch_size, n_kv_heads * head_dim]
     int k_offset = p->n_attn_heads * head_dim;
     for (int b = 0; b < BATCH_SIZE; b++)
@@ -759,7 +765,8 @@ void attention_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size)
         float *dst = s->k + 1LL * b * k_size;
         HIP_CHECK(hipMemcpy(dst, src, k_size * sizeof(float), hipMemcpyDeviceToDevice));
     }
-
+    // HIP_CHECK(hipDeviceSynchronize());
+    
     // Copy V: shape [batch_size, n_kv_heads * head_dim]
     int v_offset = (p->n_attn_heads + p->n_kv_heads) * head_dim;
     for (int b = 0; b < BATCH_SIZE; b++)
@@ -768,7 +775,8 @@ void attention_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size)
         float *dst = s->v + 1LL * b * v_size;
         HIP_CHECK(hipMemcpy(dst, src, v_size * sizeof(float), hipMemcpyDeviceToDevice));
     }
-
+    // HIP_CHECK(hipDeviceSynchronize());
+    
     // Apply rotary embeddings
     dim3 rope_grid(batch_size, p->n_attn_heads);
     dim3 rope_block(head_dim / 2);
@@ -777,12 +785,14 @@ void attention_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size)
             s->q, s->cos_vals, s->sin_vals, s->positions, batch_size, p->n_attn_heads, head_dim);
         HIP_CHECK(hipGetLastError());
     }
-
+    // HIP_CHECK(hipDeviceSynchronize());
+    
     rope_grid.y = p->n_kv_heads;
     apply_rotary_emb_kernel<<<rope_grid, rope_block>>>(
         s->k, s->cos_vals, s->sin_vals, s->positions, batch_size, p->n_kv_heads, head_dim);
     HIP_CHECK(hipGetLastError());
-
+    // HIP_CHECK(hipDeviceSynchronize());
+    
     // Update KV cache - NEW: Proper GPU kernel
     dim3 kv_grid(batch_size, (kv_dim + 31) / 32);
     dim3 kv_block(1, 32);
@@ -792,7 +802,8 @@ void attention_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size)
             p->n_layers, layer_idx, MAX_SEQ_LEN, kv_dim);
         HIP_CHECK(hipGetLastError());
     }
-
+    // HIP_CHECK(hipDeviceSynchronize());
+    
     // Compute attention scores
     dim3 att_grid(batch_size, p->n_attn_heads, (MAX_SEQ_LEN + 31) / 32);
     dim3 att_block(1, 1, 32);
@@ -802,7 +813,8 @@ void attention_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size)
             head_dim, MAX_SEQ_LEN, p->n_layers, layer_idx, p->sliding_window > 0);
         HIP_CHECK(hipGetLastError());
     }
-
+    // HIP_CHECK(hipDeviceSynchronize());
+    
     // Compute attention scores
     //
 
@@ -815,7 +827,8 @@ void attention_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size)
             MAX_SEQ_LEN, p->n_attn_heads);
         HIP_CHECK(hipGetLastError());
     }
-
+    // HIP_CHECK(hipDeviceSynchronize());
+    
     // Softmax attention weights
     dim3 soft_grid(batch_size * p->n_attn_heads);
     dim3 soft_block(THREADS_PER_BLOCK);
@@ -824,7 +837,8 @@ void attention_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size)
             s->att, s->positions, batch_size, p->n_attn_heads, MAX_SEQ_LEN);
         HIP_CHECK(hipGetLastError());
     }
-
+    // HIP_CHECK(hipDeviceSynchronize());
+    
     // Weighted sum of values
     dim3 wsum_grid(batch_size, p->n_attn_heads);
     dim3 wsum_block(head_dim);
@@ -835,7 +849,8 @@ void attention_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size)
         HIP_CHECK(hipGetLastError());
     }
     // Output projection - FIXED: Use GPU weight pointer
-
+    // HIP_CHECK(hipDeviceSynchronize());
+    
     grid_dim.y = (hidden_dim + block_dim.y - 1) / block_dim.y; // Ceiling division
 
     int attn_out_offset = layer_idx * (head_dim * p->n_attn_heads) * hidden_dim;
@@ -846,7 +861,8 @@ void attention_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size)
             s->tb2, s->tb, w->w_o + attn_out_offset, batch_size, head_dim * p->n_attn_heads, hidden_dim);
         HIP_CHECK(hipGetLastError());
     }
-
+    // HIP_CHECK(hipDeviceSynchronize());
+    
     // Add bias and residual connection - FIXED: Use GPU bias pointer
     int attn_bias_offset = layer_idx * hidden_dim;
     {
@@ -854,11 +870,15 @@ void attention_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size)
             s->tb2, w->b_o + attn_bias_offset, batch_size, hidden_dim);
         HIP_CHECK(hipGetLastError());
     }
+    // HIP_CHECK(hipDeviceSynchronize());
+    
     {
         accumulate_kernel<<<(batch_size * hidden_dim + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK, THREADS_PER_BLOCK>>>(
             s->x, s->tb2, 1.0f, batch_size, hidden_dim);
         HIP_CHECK(hipGetLastError());
     }
+    HIP_CHECK(hipDeviceSynchronize());
+    
 }
 
 void moe_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size)
@@ -1127,13 +1147,8 @@ float *forward_batch_gpu(GPUTransformer *gpu_t, int *tokens, int batch_size)
             s->logits, s->x, w->out, batch_size, hidden_dim, p->vocab_size);
     }
     // Copy logits back to CPU (you might want to keep this on GPU for sampling)
-    float *h_logits = nullptr;
-    if (!h_logits)
-    {
-        h_logits = (float *)malloc(batch_size * p->vocab_size * sizeof(float));
-    }
-    HIP_CHECK(hipMemcpy(h_logits, s->logits, batch_size * p->vocab_size * sizeof(float), hipMemcpyDeviceToHost));
-    return h_logits;
+    HIP_CHECK(hipMemcpy(cpu_buf->logits, s->logits, batch_size * p->vocab_size * sizeof(float), hipMemcpyDeviceToHost));
+    return cpu_buf->logits;
 }
 
 long long continuous_batching_inference(Tokenizer *tokenizer,
