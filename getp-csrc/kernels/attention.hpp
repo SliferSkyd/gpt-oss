@@ -529,7 +529,6 @@ __global__ void fused_rmsnorm_qkv_rope_kvcache_kernel(
 // to the residual stream `x` in a single pass.
 // ============================================================================
 #define TILE_DIM 32 // Defines the size of the tiles processed by each thread block.
-
 __global__ void fused_output_projection_kernel(
     float *__restrict__ x,                     // Residual input, and final output [M, N]
     const float *__restrict__ input,           // Input from attention layers [M, K]
@@ -540,29 +539,24 @@ __global__ void fused_output_projection_kernel(
     int N                                      // Hidden dimension
 )
 {
-    // Shared memory for tiles of the input and weight matrices.
-    // This allows for faster access during the matrix multiplication.
+    // Shared memory for tiles. No padding is needed with this new approach.
     __shared__ float input_tile[TILE_DIM][TILE_DIM];
     __shared__ float weight_tile[TILE_DIM][TILE_DIM];
 
-    // Get the thread and block indices.
     int bx = blockIdx.x;
     int by = blockIdx.y;
     int tx = threadIdx.x;
     int ty = threadIdx.y;
 
-    // Calculate the row and column of the output matrix `x` this thread will compute.
     int row = by * TILE_DIM + ty;
     int col = bx * TILE_DIM + tx;
 
-    // Accumulator for the dot product result.
     float Cvalue = 0.0f;
 
-    // Loop over the input and weight matrices in tiles.
     for (int t = 0; t < (K + TILE_DIM - 1) / TILE_DIM; ++t)
     {
-        // Load a tile of the input matrix into shared memory.
-        // Each thread loads one element.
+        // 1. Load a tile of the input matrix into shared memory (coalesced).
+        // This part remains unchanged and correct.
         int input_col = t * TILE_DIM + tx;
         if (row < M && input_col < K)
         {
@@ -570,212 +564,43 @@ __global__ void fused_output_projection_kernel(
         }
         else
         {
-            input_tile[ty][tx] = 0.0f; // Pad with zero if out of bounds.
+            input_tile[ty][tx] = 0.0f;
         }
 
-        // Load a tile of the weight matrix into shared memory.
-        // The weight matrix is transposed on-the-fly to ensure coalesced memory access.
-        int weight_row = col;
-        int weight_col = t * TILE_DIM + ty;
-        if (weight_row < N && weight_col < K)
+        // 2. CORRECTED: Coalesced load of weight matrix WITH on-the-fly transpose.
+        int weight_load_row = bx * TILE_DIM + ty;
+        int weight_load_col = t * TILE_DIM + tx;
+        if (weight_load_row < N && weight_load_col < K)
         {
-            weight_tile[tx][ty] = __bfloat162float(weight[weight_row * K + weight_col]);
+            // The source access `weight[...][...]` is coalesced.
+            // The destination `weight_tile[tx][ty]` stores the data in a transposed layout.
+            weight_tile[tx][ty] = __bfloat162float(weight[weight_load_row * K + weight_load_col]);
         }
         else
         {
-            weight_tile[tx][ty] = 0.0f; // Pad with zero.
+            weight_tile[tx][ty] = 0.0f;
         }
 
-        __syncthreads(); // Wait for all threads in the block to finish loading.
+        __syncthreads();
 
-        // Multiply the tiles from shared memory and accumulate the results.
+        // 3. CORRECTED & EFFICIENT: Multiply tiles from shared memory.
         for (int k = 0; k < TILE_DIM; ++k)
         {
-            Cvalue += input_tile[ty][k] * weight_tile[tx][k];
+            // This now performs the correct dot product: input[row] dot W[col].
+            // The access to `weight_tile[k][tx]` is a conflict-free row-wise read
+            // because of the on-the-fly transpose during loading.
+            Cvalue += input_tile[ty][k] * weight_tile[k][tx];
         }
 
-        __syncthreads(); // Wait for all threads to finish computation before loading the next tile.
-    }
-
-    // FUSION STEP: After computing the matmul result (Cvalue), perform the fusion.
-    // Check if the thread is within the bounds of the output matrix.
-    if (row < M && col < N)
-    {
-        // 1. Add bias.
-        Cvalue += __bfloat162float(bias[col]);
-
-        // 2. Add residual from the original `x` vector.
-        Cvalue += x[row * N + col];
-
-        // 3. Write the final result directly back to `x`.
-        x[row * N + col] = Cvalue;
-    }
-}
-// ============================================================================
-// END: FUSED KERNEL
-// ============================================================================
-
-
-
-
-
-// Định nghĩa một block size hợp lý, có thể tinh chỉnh qua thực nghiệm
-#define FUSED_ATTN_BLOCK_SIZE 256
-
-__global__ void optimized_fused_rmsnorm_qkv_rope_kvcache_kernel(
-    // Outputs
-    float* __restrict__ q_out,
-    __hip_bfloat16* __restrict__ key_cache,
-    __hip_bfloat16* __restrict__ value_cache,
-    // Inputs
-    const float* __restrict__ x_in,
-    const __hip_bfloat16* __restrict__ rms_w,
-    const __hip_bfloat16* __restrict__ w_qkv,
-    const __hip_bfloat16* __restrict__ b_qkv,
-    const float* __restrict__ cos_vals,
-    const float* __restrict__ sin_vals,
-    const int* __restrict__ positions,
-    // Config
-    int hidden_dim,
-    int qkv_dim,
-    int q_dim,
-    int k_dim,
-    int head_dim,
-    int n_kv_heads,
-    int n_layers,
-    int layer_idx,
-    int seq_len)
-{
-    // Mỗi thread block xử lý một item trong batch
-    int batch_idx = blockIdx.x;
-    // Mỗi luồng tính toán một chiều đầu ra (cho Q, K, hoặc V)
-    int tid = threadIdx.x;
-
-    // --- Cấp phát Shared Memory một cách thông minh ---
-    // Shared memory dùng cho:
-    // 1. Lưu vector input `x`
-    // 2. Buffer cho parallel reduction của RMSNorm
-    // 3. Lưu kết quả QKV tạm thời trước khi áp dụng RoPE
-    extern __shared__ float s_mem[];
-    float* s_x = s_mem;                                          // size: hidden_dim
-    float* s_reduce = &s_mem[hidden_dim];                        // size: FUSED_ATTN_BLOCK_SIZE
-    float* s_qkv = &s_mem[hidden_dim + FUSED_ATTN_BLOCK_SIZE];   // size: qkv_dim
-
-    // ============================================================================
-    // 1. Tải input `x` vào shared memory và thực hiện RMSNorm (ĐÃ TỐI ƯU)
-    // ============================================================================
-    const float* x = x_in + batch_idx * hidden_dim;
-
-    // Tải song song vào shared memory
-    float ss = 0.0f;
-    for (int i = tid; i < hidden_dim; i += blockDim.x) {
-        float val = x[i];
-        s_x[i] = val;
-        ss += val * val;
-    }
-
-    // --- Parallel Reduction cho RMSNorm (thay thế atomicAdd) ---
-    s_reduce[tid] = ss;
-    __syncthreads();
-
-    // Thực hiện reduction tree trong shared memory
-    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
-        if (tid < s) {
-            s_reduce[tid] += s_reduce[tid + s];
-        }
         __syncthreads();
     }
 
-    // Luồng 0 tính toán scaling factor cuối cùng và ghi lại vào shared memory
-    if (tid == 0) {
-        float total_ss = s_reduce[0];
-        float mean_ss = total_ss / hidden_dim;
-        s_reduce[0] = 1.0f / sqrtf(mean_ss + 1e-5f);
-    }
-    __syncthreads();
-
-    // Tất cả các luồng đọc scaling factor chung
-    float rms_scale = s_reduce[0];
-
-    // ============================================================================
-    // 2. Nhân ma trận QKV và lưu kết quả tạm thời vào Shared Memory
-    // ============================================================================
-    for (int i = tid; i < qkv_dim; i += blockDim.x) {
-        float val = 0.0f;
-        // Thực hiện dot product (Matmul)
-        for (int j = 0; j < hidden_dim; ++j) {
-            // Áp dụng RMSNorm ngay lập tức, đọc x từ shared memory
-            float normalized_x = __bfloat162float(rms_w[j]) * (s_x[j] * rms_scale);
-            val += normalized_x * __bfloat162float(w_qkv[i * hidden_dim + j]);
-        }
-        val += __bfloat162float(b_qkv[i]);
-        s_qkv[i] = val; // Ghi kết quả tạm thời vào shared memory
-    }
-
-    // Đồng bộ hóa tất cả các luồng để đảm bảo s_qkv đã được ghi đầy đủ
-    __syncthreads();
-
-    // ============================================================================
-    // 3. Áp dụng RoPE và ghi vào KV Cache/Output (ĐÃ TỐI ƯU)
-    // ============================================================================
-    for (int i = tid; i < qkv_dim; i += blockDim.x) {
-        int pos = positions[batch_idx];
-        
-        // --- Xử lý Q ---
-        if (i < q_dim) {
-            int h_dim_idx = i % head_dim;
-            int half = head_dim / 2;
-            
-            // Đọc giá trị sin/cos
-            float c = cos_vals[pos * half + (h_dim_idx % half)];
-            float s = sin_vals[pos * half + (h_dim_idx % half)];
-
-            float final_q_val;
-            if (h_dim_idx < half) { // Nửa đầu của vector
-                float q1 = s_qkv[i];
-                float q2 = s_qkv[i + half]; // Đọc "đối tác" từ shared memory
-                final_q_val = q1 * c - q2 * s;
-            } else { // Nửa sau của vector
-                float q1 = s_qkv[i - half]; // Đọc "đối tác" từ shared memory
-                float q2 = s_qkv[i];
-                final_q_val = q2 * c + q1 * s;
-            }
-            q_out[batch_idx * q_dim + i] = final_q_val;
-        } 
-        // --- Xử lý K và V ---
-        else {
-            int kv_idx = i - q_dim; // Index trong không gian KV (K và V ghép lại)
-            int k_v_dim = k_dim; // k_dim và v_dim bằng nhau
-            
-            if (kv_idx < k_dim) { // Xử lý K
-                int h_dim_idx = kv_idx % head_dim;
-                int half = head_dim / 2;
-
-                float c = cos_vals[pos * half + (h_dim_idx % half)];
-                float s = sin_vals[pos * half + (h_dim_idx % half)];
-                
-                float final_k_val;
-                if (h_dim_idx < half) {
-                    float k1 = s_qkv[i];
-                    float k2 = s_qkv[i + half];
-                    final_k_val = k1 * c - k2 * s;
-                } else {
-                    float k1 = s_qkv[i - half];
-                    float k2 = s_qkv[i];
-                    final_k_val = k2 * c + k1 * s;
-                }
-                
-                // Ghi vào key_cache
-                size_t cache_idx = (size_t)layer_idx * seq_len * k_v_dim + (size_t)pos * k_v_dim + kv_idx;
-                key_cache[batch_idx * n_layers * seq_len * k_v_dim + cache_idx] = __float2bfloat16(final_k_val);
-            } else { // Xử lý V
-                int v_idx = kv_idx - k_dim;
-                float final_v_val = s_qkv[i]; // V không cần RoPE
-                
-                // Ghi vào value_cache
-                size_t cache_idx = (size_t)layer_idx * seq_len * k_v_dim + (size_t)pos * k_v_dim + v_idx;
-                value_cache[batch_idx * n_layers * seq_len * k_v_dim + cache_idx] = __float2bfloat16(final_v_val);
-            }
-        }
+    // Fusion step remains the same.
+    if (row < M && col < N)
+    {
+        Cvalue += __bfloat162float(bias[col]);
+        Cvalue += x[row * N + col];
+        x[row * N + col] = Cvalue;
     }
 }
+
