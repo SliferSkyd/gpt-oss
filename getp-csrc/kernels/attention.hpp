@@ -2,8 +2,6 @@
 #include <hip/hip_bf16.h>
 #include "../config.hpp"
 
-
-
 __global__ void attention_scores_shared_mem_kernel(
     float *att, const float *q, const __hip_bfloat16 *key_cache,
     const float *mask, const int *positions,
@@ -22,41 +20,44 @@ __global__ void attention_scores_shared_mem_kernel(
     // --- Tải Q vào Shared Memory ---
     // Mỗi thread trong block (32 threads) sẽ tải 2 phần tử của Q
     const float *q_head_global = q + 1LL * batch_idx * n_heads * head_dim + head_idx * head_dim;
-    if (thread_in_block < 32) {
+    if (thread_in_block < 32)
+    {
         q_shared[thread_in_block] = q_head_global[thread_in_block];
         q_shared[thread_in_block + 32] = q_head_global[thread_in_block + 32];
     }
-    
+
     // Đợi tất cả thread trong block tải xong
     __syncthreads();
 
     // --- Các bước còn lại gần như giữ nguyên ---
-    if (batch_idx >= batch_size || head_idx >= n_heads) return;
+    if (batch_idx >= batch_size || head_idx >= n_heads)
+        return;
     int pos = positions[batch_idx];
-    if (t > pos) return;
+    if (t > pos)
+        return;
 
     int kv_dim = head_dim * (n_heads / 8);
     int kv_head = head_idx / 8;
-    const __hip_bfloat16 *k_head = key_cache + 
-                                    1LL * batch_idx * n_layers * seq_len * kv_dim +
-                                    1LL * layer_idx * seq_len * kv_dim + 
-                                    1LL * t * kv_dim + 
-                                    kv_head * head_dim;
+    const __hip_bfloat16 *k_head = key_cache +
+                                   1LL * batch_idx * n_layers * seq_len * kv_dim +
+                                   1LL * layer_idx * seq_len * kv_dim +
+                                   1LL * t * kv_dim +
+                                   kv_head * head_dim;
 
     // Thay vì dùng q_ptr, ta dùng con trỏ tới shared memory
     const float4 *q_ptr_shared = reinterpret_cast<const float4 *>(q_shared);
-    
+
     float s0 = 0.0f, s1 = 0.0f, s2 = 0.0f, s3 = 0.0f;
     for (int i = 0; i < head_dim / 4; i++)
     {
         float4 q_vec = q_ptr_shared[i];
-        
+
         float k_vals[4];
         k_vals[0] = __bfloat162float(k_head[i * 4 + 0]);
         k_vals[1] = __bfloat162float(k_head[i * 4 + 1]);
         k_vals[2] = __bfloat162float(k_head[i * 4 + 2]);
         k_vals[3] = __bfloat162float(k_head[i * 4 + 3]);
-        
+
         s0 += q_vec.x * k_vals[0];
         s1 += q_vec.y * k_vals[1];
         s2 += q_vec.z * k_vals[2];
@@ -65,7 +66,8 @@ __global__ void attention_scores_shared_mem_kernel(
 
     float score = (s0 + s1) + (s2 + s3);
     score /= 8.0f;
-    if (use_sliding_window && layer_idx % 2 == 0) {
+    if (use_sliding_window && layer_idx % 2 == 0)
+    {
         score += mask[pos * seq_len + t];
     }
     att[1LL * batch_idx * n_heads * seq_len + head_idx * seq_len + t] = score;
@@ -91,9 +93,9 @@ __global__ void attention_scores_kernel(float *att, const float *q, const __hip_
     int kv_dim = head_dim * (n_heads / 8); // Assuming GQA with 4:1 ratio
     int kv_head = head_idx / 8;
 
-    const float *q_head = q + 1LL*batch_idx * n_heads * head_dim + head_idx * head_dim;
-    const __hip_bfloat16 *k_head = key_cache + 1LL*batch_idx * n_layers * seq_len * kv_dim +
-                                    1LL*layer_idx * seq_len * kv_dim + 1LL*t * kv_dim + kv_head * head_dim;
+    const float *q_head = q + 1LL * batch_idx * n_heads * head_dim + head_idx * head_dim;
+    const __hip_bfloat16 *k_head = key_cache + 1LL * batch_idx * n_layers * seq_len * kv_dim +
+                                   1LL * layer_idx * seq_len * kv_dim + 1LL * t * kv_dim + kv_head * head_dim;
 
     float score = 0.0f;
     for (int i = 0; i < head_dim; i++)
@@ -110,7 +112,7 @@ __global__ void attention_scores_kernel(float *att, const float *q, const __hip_
         score += mask[pos * seq_len + t];
     }
 
-    att[1LL*batch_idx * n_heads * seq_len + head_idx * seq_len + t] = score;
+    att[1LL * batch_idx * n_heads * seq_len + head_idx * seq_len + t] = score;
 }
 
 __global__ void attention_weighted_sum_kernel(float *output, const float *att,
@@ -135,8 +137,8 @@ __global__ void attention_weighted_sum_kernel(float *output, const float *att,
     float sum = 0.0f;
     for (int t = 0; t <= pos; t++)
     {
-        const __hip_bfloat16 *v_head = value_cache + 1LL*batch_idx * n_layers * seq_len * kv_dim +
-                                        1LL*layer_idx * seq_len * kv_dim + 1LL*t * kv_dim + kv_head * head_dim;
+        const __hip_bfloat16 *v_head = value_cache + 1LL * batch_idx * n_layers * seq_len * kv_dim +
+                                       1LL * layer_idx * seq_len * kv_dim + 1LL * t * kv_dim + kv_head * head_dim;
         // Convert BF16 value to FP32 for computation
         float v_val = __bfloat162float(v_head[dim_idx]);
         sum += att_head[t] * v_val;
@@ -160,11 +162,6 @@ __global__ void add_sinks_kernel(float *att, const __hip_bfloat16 *sinks, const 
         att[sink_att_idx] = sink_fp32;
     }
 }
-
-
-
-
-
 
 /**
  * @brief Fused attention kernel for AMD GPUs using HIP.
@@ -195,8 +192,8 @@ __global__ void add_sinks_kernel(float *att, const __hip_bfloat16 *sinks, const 
  * @param use_sliding_window A flag to enable the sliding window attention mask.
  */
 __global__ void fused_attention_kernel(
-    float *output,              // Output: [batch, n_heads, head_dim]
-    const float *q,             // Input Q: [batch, n_heads * head_dim]
+    float *output,                     // Output: [batch, n_heads, head_dim]
+    const float *q,                    // Input Q: [batch, n_heads * head_dim]
     const __hip_bfloat16 *key_cache,   // K Cache: [batch, n_layers, seq_len, kv_dim]
     const __hip_bfloat16 *value_cache, // V Cache: [batch, n_layers, seq_len, kv_dim]
     const __hip_bfloat16 *sinks,       // Sinks: [n_layers, n_heads]
@@ -209,9 +206,9 @@ __global__ void fused_attention_kernel(
     // --- Shared Memory Declaration ---
     // Use dynamic shared memory allocated at launch time.
     extern __shared__ float s_data[];
-    float* s_q = s_data;                               // For the query vector of the current head. Size: head_dim
-    float* s_att = (float*)&s_q[head_dim];             // For attention scores. Size: seq_len
-    float* s_reduce = (float*)&s_att[seq_len];         // For block-wide reductions in softmax. Size: blockDim.x
+    float *s_q = s_data;                        // For the query vector of the current head. Size: head_dim
+    float *s_att = (float *)&s_q[head_dim];     // For attention scores. Size: seq_len
+    float *s_reduce = (float *)&s_att[seq_len]; // For block-wide reductions in softmax. Size: blockDim.x
 
     // --- Thread & Block Identification ---
     const int batch_idx = blockIdx.x;
@@ -219,7 +216,8 @@ __global__ void fused_attention_kernel(
     const int tid = threadIdx.x;
 
     // Early exit for padding blocks in the grid
-    if (batch_idx >= batch_size || head_idx >= n_heads) return;
+    if (batch_idx >= batch_size || head_idx >= n_heads)
+        return;
 
     const int pos = positions[batch_idx];
 
@@ -229,13 +227,14 @@ __global__ void fused_attention_kernel(
     const int kv_dim = head_dim * n_kv_heads;
 
     // --- Set up Global Memory Pointers ---
-    const float* q_head_ptr = q + 1LL * batch_idx * n_heads * head_dim + 1LL * head_idx * head_dim;
-    const __hip_bfloat16* k_cache_layer_ptr = key_cache + 1LL * batch_idx * n_layers * seq_len * kv_dim + 1LL * layer_idx * seq_len * kv_dim;
-    float* output_ptr = output + 1LL * batch_idx * n_heads * head_dim + 1LL * head_idx * head_dim;
+    const float *q_head_ptr = q + 1LL * batch_idx * n_heads * head_dim + 1LL * head_idx * head_dim;
+    const __hip_bfloat16 *k_cache_layer_ptr = key_cache + 1LL * batch_idx * n_layers * seq_len * kv_dim + 1LL * layer_idx * seq_len * kv_dim;
+    float *output_ptr = output + 1LL * batch_idx * n_heads * head_dim + 1LL * head_idx * head_dim;
 
     // --- Step 1: Load Query (Q) into Shared Memory ---
     // All threads in the block cooperate to load the query vector.
-    for (int i = tid; i < head_dim; i += blockDim.x) {
+    for (int i = tid; i < head_dim; i += blockDim.x)
+    {
         s_q[i] = q_head_ptr[i];
     }
     __syncthreads();
@@ -243,18 +242,21 @@ __global__ void fused_attention_kernel(
     // --- Step 2: Calculate Attention Scores (Q * K^T) ---
     const float inv_sqrt_head_dim = rsqrtf((float)head_dim);
     // Parallelize the score calculation over the sequence length `t`.
-    for (int t = tid; t <= pos; t += blockDim.x) {
-        const __hip_bfloat16* k_vec = k_cache_layer_ptr + 1LL * t * kv_dim + 1LL * kv_head * head_dim;
+    for (int t = tid; t <= pos; t += blockDim.x)
+    {
+        const __hip_bfloat16 *k_vec = k_cache_layer_ptr + 1LL * t * kv_dim + 1LL * kv_head * head_dim;
         float score = 0.0f;
-        
+
         // Dot product between shared Q and global K
-        for (int i = 0; i < head_dim; i++) {
+        for (int i = 0; i < head_dim; i++)
+        {
             score += s_q[i] * __bfloat162float(k_vec[i]);
         }
         score *= inv_sqrt_head_dim;
 
         // Optionally apply sliding window mask
-        if (use_sliding_window && (layer_idx % 2 == 0)) {
+        if (use_sliding_window && (layer_idx % 2 == 0))
+        {
             score += mask[1LL * pos * seq_len + t];
         }
         s_att[t] = score;
@@ -263,8 +265,10 @@ __global__ void fused_attention_kernel(
 
     // --- Step 3: Add Sinks ---
     int softmax_len = pos + 1;
-    if (pos + 1 < seq_len) {
-        if (tid == 0) { // Only one thread needs to write the sink value
+    if (pos + 1 < seq_len)
+    {
+        if (tid == 0)
+        { // Only one thread needs to write the sink value
             s_att[pos + 1] = __bfloat162float(sinks[head_idx]);
         }
         softmax_len++; // The sink increases the effective sequence length for softmax
@@ -274,13 +278,16 @@ __global__ void fused_attention_kernel(
     // --- Step 4: In-place Softmax in Shared Memory ---
     // 4.1: Find max value for numerical stability (parallel reduction)
     float max_val = -FLT_MAX;
-    for (int t = tid; t < softmax_len; t += blockDim.x) {
+    for (int t = tid; t < softmax_len; t += blockDim.x)
+    {
         max_val = fmaxf(max_val, s_att[t]);
     }
     s_reduce[tid] = max_val;
     __syncthreads();
-    for (int offset = blockDim.x / 2; offset > 0; offset >>= 1) {
-        if (tid < offset) s_reduce[tid] = fmaxf(s_reduce[tid], s_reduce[tid + offset]);
+    for (int offset = blockDim.x / 2; offset > 0; offset >>= 1)
+    {
+        if (tid < offset)
+            s_reduce[tid] = fmaxf(s_reduce[tid], s_reduce[tid + offset]);
         __syncthreads();
     }
     max_val = s_reduce[0];
@@ -288,15 +295,18 @@ __global__ void fused_attention_kernel(
 
     // 4.2: Compute exp(score - max) and sum the results (parallel reduction)
     float sum_val = 0.0f;
-    for (int t = tid; t < softmax_len; t += blockDim.x) {
+    for (int t = tid; t < softmax_len; t += blockDim.x)
+    {
         float val = expf(s_att[t] - max_val);
         s_att[t] = val; // Store intermediate result back to shared memory
         sum_val += val;
     }
     s_reduce[tid] = sum_val;
     __syncthreads();
-    for (int offset = blockDim.x / 2; offset > 0; offset >>= 1) {
-        if (tid < offset) s_reduce[tid] += s_reduce[tid + offset];
+    for (int offset = blockDim.x / 2; offset > 0; offset >>= 1)
+    {
+        if (tid < offset)
+            s_reduce[tid] += s_reduce[tid + offset];
         __syncthreads();
     }
     sum_val = s_reduce[0];
@@ -304,23 +314,468 @@ __global__ void fused_attention_kernel(
 
     // 4.3: Normalize to get final attention weights
     const float inv_sum_val = 1.0f / (sum_val + 1e-9f); // Add epsilon for safety
-    for (int t = tid; t < softmax_len; t += blockDim.x) {
+    for (int t = tid; t < softmax_len; t += blockDim.x)
+    {
         s_att[t] *= inv_sum_val;
     }
     __syncthreads();
 
     // --- Step 5: Weighted Sum of Values (Att * V) ---
-    const __hip_bfloat16* v_cache_layer_ptr = value_cache + 1LL * batch_idx * n_layers * seq_len * kv_dim + 1LL * layer_idx * seq_len * kv_dim;
+    const __hip_bfloat16 *v_cache_layer_ptr = value_cache + 1LL * batch_idx * n_layers * seq_len * kv_dim + 1LL * layer_idx * seq_len * kv_dim;
 
     // Each thread computes one dimension of the final output vector.
-    if (tid < head_dim) {
+    if (tid < head_dim)
+    {
         float weighted_sum = 0.0f;
         // The sum only includes actual tokens, not sinks.
-        for (int t = 0; t <= pos; t++) {
-            const __hip_bfloat16* v_vec = v_cache_layer_ptr + 1LL * t * kv_dim + 1LL * kv_head * head_dim;
+        for (int t = 0; t <= pos; t++)
+        {
+            const __hip_bfloat16 *v_vec = v_cache_layer_ptr + 1LL * t * kv_dim + 1LL * kv_head * head_dim;
             weighted_sum += s_att[t] * __bfloat162float(v_vec[tid]);
         }
         output_ptr[tid] = weighted_sum;
     }
 }
 
+// ============================================================================
+// FUSED "MEGA" KERNEL
+// ============================================================================
+// This single kernel performs the following sequence of operations:
+// 1. RMS Normalization
+// 2. QKV Matrix Multiplication
+// 3. Add QKV Bias
+// 4. Apply Rotary Position Embedding (RoPE) to Q and K
+// 5. Update the KV Cache
+// This fusion eliminates multiple kernel launches and intermediate global memory
+// writes (to `t` and `qkv` buffers), significantly improving performance.
+__global__ void fused_rmsnorm_qkv_rope_kvcache_kernel(
+    // Outputs
+    float *__restrict__ q_out,
+    float *__restrict__ k_out,
+    float *__restrict__ v_out,
+    __hip_bfloat16 *__restrict__ key_cache,
+    __hip_bfloat16 *__restrict__ value_cache,
+    // Inputs
+    const float *__restrict__ x_in,
+    const __hip_bfloat16 *__restrict__ rms_w,
+    const __hip_bfloat16 *__restrict__ w_qkv,
+    const __hip_bfloat16 *__restrict__ b_qkv,
+    const float *__restrict__ cos_vals,
+    const float *__restrict__ sin_vals,
+    const int *__restrict__ positions,
+    // Config
+    int hidden_dim,
+    int qkv_dim,
+    int q_dim,
+    int k_dim,
+    int v_dim,
+    int head_dim,
+    int n_attn_heads,
+    int n_kv_heads,
+    int n_layers,
+    int layer_idx,
+    int seq_len)
+{
+    // Each thread block processes one item in the batch
+    int batch_idx = blockIdx.x;
+    // Each thread calculates one output dimension (for Q, K, or V)
+    int out_dim_idx = threadIdx.x;
+
+    // Shared memory for RMSNorm and holding the input vector `x`
+    extern __shared__ float s_mem[];
+    float *s_x = s_mem;                    // size: hidden_dim
+    float *s_rms_sum = &s_mem[hidden_dim]; // size: 1 (or blockDim.x for reduction)
+
+    // --- 1. Load input `x` to shared memory and start RMSNorm ---
+    const float *x = x_in + batch_idx * hidden_dim;
+
+    // Parallel load into shared memory
+    for (int i = out_dim_idx; i < hidden_dim; i += blockDim.x)
+    {
+        s_x[i] = x[i];
+    }
+
+    // Calculate sum of squares for RMSNorm in parallel
+    float ss = 0.0f;
+    for (int i = out_dim_idx; i < hidden_dim; i += blockDim.x)
+    {
+        ss += s_x[i] * s_x[i];
+    }
+
+    // Reduction for sum of squares
+    // Note: Using a single shared memory location for simplicity. For larger blocks,
+    // a parallel reduction tree in shared memory would be more efficient.
+    if (threadIdx.x == 0)
+        s_rms_sum[0] = 0.0f;
+    __syncthreads();
+    atomicAdd(s_rms_sum, ss);
+    __syncthreads();
+
+    // Finalize RMSNorm scaling factor
+    if (threadIdx.x == 0)
+    {
+        float mean_ss = s_rms_sum[0] / hidden_dim;
+        s_rms_sum[0] = 1.0f / sqrtf(mean_ss + 1e-5f);
+    }
+    __syncthreads();
+    float rms_scale = s_rms_sum[0];
+
+    // --- 2. Matmul, Bias, RoPE, and KV Cache Update ---
+    // Each thread computes one element of the QKV output vector
+    for (int i = out_dim_idx; i < qkv_dim; i += blockDim.x)
+    {
+        float val = 0.0f;
+        // Perform dot product (Matmul)
+        for (int j = 0; j < hidden_dim; ++j)
+        {
+            // Apply RMSNorm on the fly
+            float normalized_x = __bfloat162float(rms_w[j]) * (s_x[j] * rms_scale);
+            val += normalized_x * __bfloat162float(w_qkv[i * hidden_dim + j]);
+        }
+
+        // Add bias
+        val += __bfloat162float(b_qkv[i]);
+
+        // --- Split, Apply RoPE, and Write to Output ---
+        int pos = positions[batch_idx];
+
+        if (i < q_dim)
+        { // This is a Q dimension
+            int head_idx = i / head_dim;
+            int h_dim_idx = i % head_dim;
+            int half = head_dim / 2;
+
+            if (h_dim_idx < half)
+            {
+                float q1 = val;
+                // Fetch the corresponding q2 value for RoPE
+                // This requires a temporary buffer or a more complex indexing scheme.
+                // For simplicity here, we assume a way to get q2. A real implementation
+                // might re-compute or use shared memory.
+                // This part is complex to fuse perfectly without restructuring data.
+                // We'll apply RoPE after a sync, reading from an intermediate register stage.
+                // Let's calculate the other pair part.
+                int i2 = i + half;
+                float val2 = 0.0f;
+                for (int j = 0; j < hidden_dim; ++j)
+                {
+                    float normalized_x = __bfloat162float(rms_w[j]) * (s_x[j] * rms_scale);
+                    val2 += normalized_x * __bfloat162float(w_qkv[i2 * hidden_dim + j]);
+                }
+                val2 += __bfloat162float(b_qkv[i2]);
+
+                float c = cos_vals[pos * half + h_dim_idx];
+                float s = sin_vals[pos * half + h_dim_idx];
+
+                q_out[batch_idx * q_dim + i] = q1 * c - val2 * s;
+                q_out[batch_idx * q_dim + i2] = val2 * c + q1 * s;
+            }
+        }
+        else if (i < q_dim + k_dim)
+        { // This is a K dimension
+            int k_idx = i - q_dim;
+            int head_idx = k_idx / head_dim;
+            int h_dim_idx = k_idx % head_dim;
+            int half = head_dim / 2;
+
+            if (h_dim_idx < half)
+            {
+                float k1 = val;
+                int i2 = i + half;
+                float val2 = 0.0f;
+                for (int j = 0; j < hidden_dim; ++j)
+                {
+                    float normalized_x = __bfloat162float(rms_w[j]) * (s_x[j] * rms_scale);
+                    val2 += normalized_x * __bfloat162float(w_qkv[i2 * hidden_dim + j]);
+                }
+                val2 += __bfloat162float(b_qkv[i2]);
+
+                float c = cos_vals[pos * half + h_dim_idx];
+                float s = sin_vals[pos * half + h_dim_idx];
+
+                float final_k1 = k1 * c - val2 * s;
+                float final_k2 = val2 * c + k1 * s;
+
+                // Write to k_out
+                k_out[batch_idx * k_dim + k_idx] = final_k1;
+                k_out[batch_idx * k_dim + k_idx + half] = final_k2;
+
+                // Write to key_cache
+                size_t k_cache_idx1 = (size_t)batch_idx * n_layers * seq_len * k_dim +
+                                      (size_t)layer_idx * seq_len * k_dim + (size_t)pos * k_dim + k_idx;
+                size_t k_cache_idx2 = k_cache_idx1 + half;
+                key_cache[k_cache_idx1] = __float2bfloat16(final_k1);
+                key_cache[k_cache_idx2] = __float2bfloat16(final_k2);
+            }
+        }
+        else
+        { // This is a V dimension
+            int v_idx = i - q_dim - k_dim;
+            // Write to v_out
+            v_out[batch_idx * v_dim + v_idx] = val;
+
+            // Write to value_cache
+            size_t v_cache_idx = (size_t)batch_idx * n_layers * seq_len * v_dim +
+                                 (size_t)layer_idx * seq_len * v_dim + (size_t)pos * v_dim + v_idx;
+            value_cache[v_cache_idx] = __float2bfloat16(val);
+        }
+    }
+}
+
+// ============================================================================
+// START: FUSED KERNEL FOR OUTPUT PROJECTION
+// This kernel replaces three separate operations: matmul, add_bias, and accumulate.
+// It performs a matrix multiplication, adds a bias vector, and adds the result
+// to the residual stream `x` in a single pass.
+// ============================================================================
+#define TILE_DIM 32 // Defines the size of the tiles processed by each thread block.
+
+__global__ void fused_output_projection_kernel(
+    float *__restrict__ x,                     // Residual input, and final output [M, N]
+    const float *__restrict__ input,           // Input from attention layers [M, K]
+    const __hip_bfloat16 *__restrict__ weight, // Projection weights [N, K]
+    const __hip_bfloat16 *__restrict__ bias,   // Projection bias [N]
+    int M,                                     // Batch size
+    int K,                                     // Attention output dimension
+    int N                                      // Hidden dimension
+)
+{
+    // Shared memory for tiles of the input and weight matrices.
+    // This allows for faster access during the matrix multiplication.
+    __shared__ float input_tile[TILE_DIM][TILE_DIM];
+    __shared__ float weight_tile[TILE_DIM][TILE_DIM];
+
+    // Get the thread and block indices.
+    int bx = blockIdx.x;
+    int by = blockIdx.y;
+    int tx = threadIdx.x;
+    int ty = threadIdx.y;
+
+    // Calculate the row and column of the output matrix `x` this thread will compute.
+    int row = by * TILE_DIM + ty;
+    int col = bx * TILE_DIM + tx;
+
+    // Accumulator for the dot product result.
+    float Cvalue = 0.0f;
+
+    // Loop over the input and weight matrices in tiles.
+    for (int t = 0; t < (K + TILE_DIM - 1) / TILE_DIM; ++t)
+    {
+        // Load a tile of the input matrix into shared memory.
+        // Each thread loads one element.
+        int input_col = t * TILE_DIM + tx;
+        if (row < M && input_col < K)
+        {
+            input_tile[ty][tx] = input[row * K + input_col];
+        }
+        else
+        {
+            input_tile[ty][tx] = 0.0f; // Pad with zero if out of bounds.
+        }
+
+        // Load a tile of the weight matrix into shared memory.
+        // The weight matrix is transposed on-the-fly to ensure coalesced memory access.
+        int weight_row = col;
+        int weight_col = t * TILE_DIM + ty;
+        if (weight_row < N && weight_col < K)
+        {
+            weight_tile[tx][ty] = __bfloat162float(weight[weight_row * K + weight_col]);
+        }
+        else
+        {
+            weight_tile[tx][ty] = 0.0f; // Pad with zero.
+        }
+
+        __syncthreads(); // Wait for all threads in the block to finish loading.
+
+        // Multiply the tiles from shared memory and accumulate the results.
+        for (int k = 0; k < TILE_DIM; ++k)
+        {
+            Cvalue += input_tile[ty][k] * weight_tile[tx][k];
+        }
+
+        __syncthreads(); // Wait for all threads to finish computation before loading the next tile.
+    }
+
+    // FUSION STEP: After computing the matmul result (Cvalue), perform the fusion.
+    // Check if the thread is within the bounds of the output matrix.
+    if (row < M && col < N)
+    {
+        // 1. Add bias.
+        Cvalue += __bfloat162float(bias[col]);
+
+        // 2. Add residual from the original `x` vector.
+        Cvalue += x[row * N + col];
+
+        // 3. Write the final result directly back to `x`.
+        x[row * N + col] = Cvalue;
+    }
+}
+// ============================================================================
+// END: FUSED KERNEL
+// ============================================================================
+
+
+
+
+
+// Định nghĩa một block size hợp lý, có thể tinh chỉnh qua thực nghiệm
+#define FUSED_ATTN_BLOCK_SIZE 256
+
+__global__ void optimized_fused_rmsnorm_qkv_rope_kvcache_kernel(
+    // Outputs
+    float* __restrict__ q_out,
+    __hip_bfloat16* __restrict__ key_cache,
+    __hip_bfloat16* __restrict__ value_cache,
+    // Inputs
+    const float* __restrict__ x_in,
+    const __hip_bfloat16* __restrict__ rms_w,
+    const __hip_bfloat16* __restrict__ w_qkv,
+    const __hip_bfloat16* __restrict__ b_qkv,
+    const float* __restrict__ cos_vals,
+    const float* __restrict__ sin_vals,
+    const int* __restrict__ positions,
+    // Config
+    int hidden_dim,
+    int qkv_dim,
+    int q_dim,
+    int k_dim,
+    int head_dim,
+    int n_kv_heads,
+    int n_layers,
+    int layer_idx,
+    int seq_len)
+{
+    // Mỗi thread block xử lý một item trong batch
+    int batch_idx = blockIdx.x;
+    // Mỗi luồng tính toán một chiều đầu ra (cho Q, K, hoặc V)
+    int tid = threadIdx.x;
+
+    // --- Cấp phát Shared Memory một cách thông minh ---
+    // Shared memory dùng cho:
+    // 1. Lưu vector input `x`
+    // 2. Buffer cho parallel reduction của RMSNorm
+    // 3. Lưu kết quả QKV tạm thời trước khi áp dụng RoPE
+    extern __shared__ float s_mem[];
+    float* s_x = s_mem;                                          // size: hidden_dim
+    float* s_reduce = &s_mem[hidden_dim];                        // size: FUSED_ATTN_BLOCK_SIZE
+    float* s_qkv = &s_mem[hidden_dim + FUSED_ATTN_BLOCK_SIZE];   // size: qkv_dim
+
+    // ============================================================================
+    // 1. Tải input `x` vào shared memory và thực hiện RMSNorm (ĐÃ TỐI ƯU)
+    // ============================================================================
+    const float* x = x_in + batch_idx * hidden_dim;
+
+    // Tải song song vào shared memory
+    float ss = 0.0f;
+    for (int i = tid; i < hidden_dim; i += blockDim.x) {
+        float val = x[i];
+        s_x[i] = val;
+        ss += val * val;
+    }
+
+    // --- Parallel Reduction cho RMSNorm (thay thế atomicAdd) ---
+    s_reduce[tid] = ss;
+    __syncthreads();
+
+    // Thực hiện reduction tree trong shared memory
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (tid < s) {
+            s_reduce[tid] += s_reduce[tid + s];
+        }
+        __syncthreads();
+    }
+
+    // Luồng 0 tính toán scaling factor cuối cùng và ghi lại vào shared memory
+    if (tid == 0) {
+        float total_ss = s_reduce[0];
+        float mean_ss = total_ss / hidden_dim;
+        s_reduce[0] = 1.0f / sqrtf(mean_ss + 1e-5f);
+    }
+    __syncthreads();
+
+    // Tất cả các luồng đọc scaling factor chung
+    float rms_scale = s_reduce[0];
+
+    // ============================================================================
+    // 2. Nhân ma trận QKV và lưu kết quả tạm thời vào Shared Memory
+    // ============================================================================
+    for (int i = tid; i < qkv_dim; i += blockDim.x) {
+        float val = 0.0f;
+        // Thực hiện dot product (Matmul)
+        for (int j = 0; j < hidden_dim; ++j) {
+            // Áp dụng RMSNorm ngay lập tức, đọc x từ shared memory
+            float normalized_x = __bfloat162float(rms_w[j]) * (s_x[j] * rms_scale);
+            val += normalized_x * __bfloat162float(w_qkv[i * hidden_dim + j]);
+        }
+        val += __bfloat162float(b_qkv[i]);
+        s_qkv[i] = val; // Ghi kết quả tạm thời vào shared memory
+    }
+
+    // Đồng bộ hóa tất cả các luồng để đảm bảo s_qkv đã được ghi đầy đủ
+    __syncthreads();
+
+    // ============================================================================
+    // 3. Áp dụng RoPE và ghi vào KV Cache/Output (ĐÃ TỐI ƯU)
+    // ============================================================================
+    for (int i = tid; i < qkv_dim; i += blockDim.x) {
+        int pos = positions[batch_idx];
+        
+        // --- Xử lý Q ---
+        if (i < q_dim) {
+            int h_dim_idx = i % head_dim;
+            int half = head_dim / 2;
+            
+            // Đọc giá trị sin/cos
+            float c = cos_vals[pos * half + (h_dim_idx % half)];
+            float s = sin_vals[pos * half + (h_dim_idx % half)];
+
+            float final_q_val;
+            if (h_dim_idx < half) { // Nửa đầu của vector
+                float q1 = s_qkv[i];
+                float q2 = s_qkv[i + half]; // Đọc "đối tác" từ shared memory
+                final_q_val = q1 * c - q2 * s;
+            } else { // Nửa sau của vector
+                float q1 = s_qkv[i - half]; // Đọc "đối tác" từ shared memory
+                float q2 = s_qkv[i];
+                final_q_val = q2 * c + q1 * s;
+            }
+            q_out[batch_idx * q_dim + i] = final_q_val;
+        } 
+        // --- Xử lý K và V ---
+        else {
+            int kv_idx = i - q_dim; // Index trong không gian KV (K và V ghép lại)
+            int k_v_dim = k_dim; // k_dim và v_dim bằng nhau
+            
+            if (kv_idx < k_dim) { // Xử lý K
+                int h_dim_idx = kv_idx % head_dim;
+                int half = head_dim / 2;
+
+                float c = cos_vals[pos * half + (h_dim_idx % half)];
+                float s = sin_vals[pos * half + (h_dim_idx % half)];
+                
+                float final_k_val;
+                if (h_dim_idx < half) {
+                    float k1 = s_qkv[i];
+                    float k2 = s_qkv[i + half];
+                    final_k_val = k1 * c - k2 * s;
+                } else {
+                    float k1 = s_qkv[i - half];
+                    float k2 = s_qkv[i];
+                    final_k_val = k2 * c + k1 * s;
+                }
+                
+                // Ghi vào key_cache
+                size_t cache_idx = (size_t)layer_idx * seq_len * k_v_dim + (size_t)pos * k_v_dim + kv_idx;
+                key_cache[batch_idx * n_layers * seq_len * k_v_dim + cache_idx] = __float2bfloat16(final_k_val);
+            } else { // Xử lý V
+                int v_idx = kv_idx - k_dim;
+                float final_v_val = s_qkv[i]; // V không cần RoPE
+                
+                // Ghi vào value_cache
+                size_t cache_idx = (size_t)layer_idx * seq_len * k_v_dim + (size_t)pos * k_v_dim + v_idx;
+                value_cache[batch_idx * n_layers * seq_len * k_v_dim + cache_idx] = __float2bfloat16(final_v_val);
+            }
+        }
+    }
+}
