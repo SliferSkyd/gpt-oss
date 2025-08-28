@@ -273,7 +273,7 @@ __global__ void fused_attention_kernel(
 
     // --- Step 4: In-place Softmax in Shared Memory ---
     // 4.1: Find max value for numerical stability (parallel reduction)
-    float max_val = -FLT_MAX;
+    float max_val = -INFINITY;
     for (int t = tid; t < softmax_len; t += blockDim.x) {
         max_val = fmaxf(max_val, s_att[t]);
     }
