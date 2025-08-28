@@ -1,3 +1,5 @@
+#pragma once
+
 // mfma_gemm_gfx90a.hpp
 #include <hip/hip_runtime.h>
 #include <hip/hip_bf16.h>

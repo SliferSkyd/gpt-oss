@@ -823,24 +823,25 @@ void attention_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size)
 
     {
         TIME_SCOPE(fused_output_projection_timer);
+        int M = batch_size;
+        int N = hidden_dim;
+        int K = head_dim * p->n_attn_heads;
 
-        // Configure grid and block dimensions for the fused kernel.
-        // The block is 2D, matching the TILE_DIM.
-        dim3 block(TILE_DIM, TILE_DIM);
-        // The grid is sized to cover the entire output matrix `x`.
-        dim3 grid(
-            (hidden_dim + TILE_DIM - 1) / TILE_DIM,
-            (batch_size + TILE_DIM - 1) / TILE_DIM);
+        dim3 gridDim((N + BLOCK_N - 1) / BLOCK_N, (M + BLOCK_M - 1) / BLOCK_M);
+        dim3 blockDim(LANE_PER_WAVE, WAVES_PER_BLOCK);
+        
+        // Shared memory: 2 buffers for A [M,K] tiles, 2 for B [K,N] tiles
+        size_t shared_mem_bytes = (2 * BLOCK_M * BLOCK_K + 2 * BLOCK_K * BLOCK_N) * sizeof(uint16_t);
+        
 
-        // Launch the single fused kernel.
-        fused_output_projection_kernel<<<grid, block>>>(
+        fused_output_projection_kernel_optimized<<<gridDim, blockDim, shared_mem_bytes>>>(
             s->x,                       // Residual input and final output
             s->tb,                      // Input from attention weighted sum
             w->w_o + attn_out_offset,   // Projection weights
             w->b_o + attn_bias_offset,  // Projection bias
-            batch_size,                 // M
-            head_dim * p->n_attn_heads, // K
-            hidden_dim                  // N
+            M,                          // M
+            K,                          // K
+            N                           // N
         );
         HIP_CHECK(hipGetLastError());
     }

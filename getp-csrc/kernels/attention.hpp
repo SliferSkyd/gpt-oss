@@ -1,6 +1,7 @@
 #include <hip/hip_runtime.h>
 #include <hip/hip_bf16.h>
 #include "../config.hpp"
+#include "matmul.hpp"
 
 __global__ void attention_scores_shared_mem_kernel(
     float *att, const float *q, const __hip_bfloat16 *key_cache,
@@ -603,3 +604,194 @@ __global__ void fused_output_projection_kernel(
     }
 }
 
+
+
+#include <hip/hip_runtime.h>
+#include <hip/hip_bf16.h>
+
+// =================================================================================================
+// ## MFMA Configuration and Helpers
+//
+// This section defines the constants and helper functions necessary for the MFMA-based kernel.
+// The configuration is tuned for a block size of 64x64, processed by 16 wavefronts.
+// =================================================================================================
+
+// --- Store and Fuse Results ---
+
+// Stores the accumulator tile back to global memory and performs the fusion steps.
+template<bool Interior>
+__device__ inline void store_and_fuse_tile(
+    float* __restrict__ x, // In/Out buffer
+    const __hip_bfloat16* __restrict__ bias,
+    const f32x4& acc,
+    int M, int N,
+    int m0, int n0,
+    int wave_m, int wave_n,
+    int lane)
+{
+    const int rowBase = m0 + wave_m * WM + lane_group(lane) * 4;
+    const int col     = n0 + wave_n * WN + lane_row(lane);
+
+    #pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        const int row = rowBase + i;
+        if constexpr (!Interior) {
+            if (row >= M || col >= N) continue;
+        }
+
+        // Fused operations: add bias and residual
+        float Cvalue = acc[i];
+        Cvalue += __bfloat162float(bias[col]);
+        Cvalue += x[(size_t)row * N + col];
+        x[(size_t)row * N + col] = Cvalue;
+    }
+}
+
+// =================================================================================================
+// ## Optimized Fused Kernel (MFMA)
+//
+// This kernel calculates: x = (input @ weight^T) + bias + x
+// - Uses MFMA instructions for the matmul.
+// - Employs double-buffering in shared memory to hide data-loading latency.
+// - Integrates bias and residual addition in the final store operation.
+// =================================================================================================
+__global__ void fused_output_projection_kernel_optimized(
+    float *__restrict__ x,                     // Residual input [M,N], and final output [M,N]
+    const float *__restrict__ input,           // Input from attention layers [M, K]
+    const __hip_bfloat16 *__restrict__ weight, // Projection weights [N, K]
+    const __hip_bfloat16 *__restrict__ bias,   // Projection bias [N]
+    int M,                                     // Batch size
+    int K,                                     // Attention output dimension
+    int N                                      // Hidden dimension
+) {
+    // --- Block and Thread Identification ---
+    const int m0 = blockIdx.y * BLOCK_M;
+    const int n0 = blockIdx.x * BLOCK_N;
+
+    const int lane   = threadIdx.x; // 0..63
+    const int wave   = threadIdx.y; // 0..15
+    const int wave_m = wave / WAVES_N;
+    const int wave_n = wave % WAVES_N;
+    
+    const int threadsPerBlock = blockDim.x * blockDim.y;
+    const int linearT         = wave * blockDim.x + lane;
+
+    // --- Shared Memory for Double-Buffered Tiles ---
+    extern __shared__ uint8_t smemRaw[];
+    auto* sA0 = reinterpret_cast<uint16_t*>(smemRaw);
+    auto* sA1 = sA0 + (BLOCK_M * BLOCK_K);
+    auto* sB0 = sA1 + (BLOCK_M * BLOCK_K);
+    auto* sB1 = sB0 + (BLOCK_K * BLOCK_N);
+
+    // --- Per-lane Accumulators ---
+    f32x4 acc = {0.0f, 0.0f, 0.0f, 0.0f};
+
+    // --- Pre-load first k-slice into shared memory ---
+    {
+        // Load input (A) tile: FP32 -> BF16, store row-major
+        for (int idx = linearT; idx < BLOCK_M * BLOCK_K; idx += threadsPerBlock) {
+            const int r = idx / BLOCK_K;
+            const int c = idx % BLOCK_K;
+            const int gm = m0 + r;
+            const int gk = c;
+            float val = (gm < M && gk < K) ? input[(size_t)gm * K + gk] : 0.0f;
+            sA0[idx] = f32_to_bf16_bits(val);
+        }
+        // Load weight (B) tile: BF16, store transposed (column-major)
+        for (int idx = linearT; idx < BLOCK_K * BLOCK_N; idx += threadsPerBlock) {
+            const int c = idx / BLOCK_K; // Column in block (0..BLOCK_N-1)
+            const int r = idx % BLOCK_K; // Row in block (0..BLOCK_K-1)
+            const int gn = n0 + c;
+            const int gk = r;
+            __hip_bfloat16 val = (gk < K && gn < N) ? weight[(size_t)gn * K + gk] : __float2bfloat16(0.0f);
+            sB0[c * BLOCK_K + r] = hipbf16_to_bits(val);
+        }
+    }
+    __syncthreads();
+
+    // --- Main Loop: Pipe-lined computation and data loading ---
+    auto* currA = sA0; auto* nextA = sA1;
+    auto* currB = sB0; auto* nextB = sB1;
+
+    for (int k0 = 0; k0 < K; k0 += BLOCK_K) {
+        // Pre-fetch next tiles while computing on current tiles
+        if (k0 + BLOCK_K < K) {
+            const int kBase = k0 + BLOCK_K;
+            // Load next input (A) tile
+            for (int idx = linearT; idx < BLOCK_M * BLOCK_K; idx += threadsPerBlock) {
+                const int r = idx / BLOCK_K;
+                const int c = idx % BLOCK_K;
+                const int gm = m0 + r;
+                const int gk = kBase + c;
+                float val = (gm < M && gk < K) ? input[(size_t)gm * K + gk] : 0.0f;
+                nextA[idx] = f32_to_bf16_bits(val);
+            }
+            // Load next weight (B) tile
+            for (int idx = linearT; idx < BLOCK_K * BLOCK_N; idx += threadsPerBlock) {
+                const int c = idx / BLOCK_K;
+                const int r = idx % BLOCK_K;
+                const int gn = n0 + c;
+                const int gk = kBase + r;
+                __hip_bfloat16 val = (gk < K && gn < N) ? weight[(size_t)gn * K + gk] : __float2bfloat16(0.0f);
+                nextB[c * BLOCK_K + r] = hipbf16_to_bits(val);
+            }
+        }
+
+        // --- MFMA Computation ---
+        const int aRowBase = wave_m * WM;
+        const int bColBase = wave_n * WN;
+        bf16x4 avec = make_a_vec(currA, BLOCK_K, aRowBase, lane);
+        bf16x4 bvec = make_b_vec(currB, BLOCK_K, bColBase, lane);
+        acc = mfma_16x16x16_bf16(avec, bvec, acc);
+
+        __syncthreads();
+
+        // Swap shared memory buffers for next iteration
+        auto* tmpA = currA; currA = nextA; nextA = tmpA;
+        auto* tmpB = currB; currB = nextB; nextB = tmpB;
+    }
+
+    // --- Store Results and Fuse Operations ---
+    const bool interior = (m0 + BLOCK_M <= M && n0 + BLOCK_N <= N);
+    if (interior) {
+        store_and_fuse_tile<true>(x, bias, acc, M, N, m0, n0, wave_m, wave_n, lane);
+    } else {
+        store_and_fuse_tile<false>(x, bias, acc, M, N, m0, n0, wave_m, wave_n, lane);
+    }
+}
+
+
+// =================================================================================================
+// ## Updated Kernel Launcher
+// =================================================================================================
+extern "C" void launch_output_projection_optimized_kernel(
+    const float* input1, const float* input2, float* output,
+    int size1, int size2, int size3, hipStream_t stream = 0)
+{
+    int M = size1;
+    int N = size2;
+    int K = size3;
+    
+    const __hip_bfloat16* weight = reinterpret_cast<const __hip_bfloat16*>(input2);
+    // Bias is located immediately after the weight matrix in memory
+    const __hip_bfloat16* bias = weight + (size_t)N * K;
+    
+    // --- MFMA Launch Configuration ---
+    dim3 gridDim((N + BLOCK_N - 1) / BLOCK_N, (M + BLOCK_M - 1) / BLOCK_M);
+    dim3 blockDim(LANE_PER_WAVE, WAVES_PER_BLOCK);
+    
+    // Shared memory: 2 buffers for A [M,K] tiles, 2 for B [K,N] tiles
+    size_t shared_mem_bytes = (2 * BLOCK_M * BLOCK_K + 2 * BLOCK_K * BLOCK_N) * sizeof(uint16_t);
+    
+    // The `output` buffer serves as both input (for residual) and output
+    hipLaunchKernelGGL(fused_output_projection_kernel_optimized, 
+                       gridDim, 
+                       blockDim, 
+                       shared_mem_bytes, 
+                       stream,
+                       output, // `x` in the kernel
+                       input1, // `input` in the kernel
+                       weight, 
+                       bias, 
+                       M, K, N);
+}
