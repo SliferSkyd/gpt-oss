@@ -1,11 +1,15 @@
+// mfma_gemm_gfx90a.hpp
 #include <hip/hip_runtime.h>
 #include <hip/hip_bf16.h>
-#include <rocwmma/rocwmma.hpp>
 #include "../config.hpp"
 #include "../memory/mxfp4.hpp"
+#include <hip/hip_fp16.h>
 
-// ===== Tunables =====
-// Default to smaller, higher-occupancy 64x64 tile with 8 waves (512 threads).
+#include <hip/hip_runtime.h>
+#include <hip/hip_fp16.h>
+#include <hip/hip_bfloat16.h>
+
+// ===== Tunables (same defaults you had) =====
 #ifndef WM
 #define WM 16
 #endif
@@ -13,73 +17,108 @@
 #define WN 16
 #endif
 #ifndef WK
-#define WK 16
+#define WK 16   // MFMA K-chunk is 16 for bf16 path
 #endif
 
 #ifndef WAVES_M
-#define WAVES_M 4   // 2x4 waves -> 32x64 sub-tiles per block
+#define WAVES_M 4
 #endif
 #ifndef WAVES_N
 #define WAVES_N 4
 #endif
 
-constexpr int BLOCK_M = WM * WAVES_M;        // 32 or 64 depending on WAVES_M
-constexpr int BLOCK_N = WN * WAVES_N;        // 64 or 32 depending on WAVES_N
-constexpr int BLOCK_K = WK;
+static_assert(WM == 16 && WN == 16 && WK == 16, "This MFMA microkernel assumes 16x16x16 bf16 tiles.");
+
+constexpr int BLOCK_M = WM * WAVES_M;        // e.g. 64 if WAVES_M=4
+constexpr int BLOCK_N = WN * WAVES_N;        // e.g. 64 if WAVES_N=4
+constexpr int BLOCK_K = WK;                  // 16
 constexpr int LANE_PER_WAVE = 64;
 constexpr int WAVES_PER_BLOCK = WAVES_M * WAVES_N;
 
-// ===== Helpers =====
-__device__ inline rocwmma::bfloat16_t f32_to_bf16(float x) {
-    __hip_bfloat16 t = __float2bfloat16(x);           // HIP intrinsic, RN
-    rocwmma::bfloat16_t y;
-    *reinterpret_cast<uint16_t*>(&y) = *reinterpret_cast<const uint16_t*>(&t);
-    return y;
+// ===== Small vector helpers (types that match MFMA signatures) =====
+using f32x4  = float __attribute__((ext_vector_type(4)));
+using bf16x4 = unsigned short __attribute__((ext_vector_type(4))); // 4×i16 carrying BF16 bit patterns
+
+// ===== Conversions =====
+__device__ inline uint16_t f32_to_bf16_bits(float x) {
+    __hip_bfloat16 t = __float2bfloat16(x);
+    return *reinterpret_cast<uint16_t*>(&t);
 }
 
-template<bool InteriorStore>
-__device__ inline void store_c_tile(
-    float* __restrict__ C,
-    const rocwmma::fragment<rocwmma::accumulator, WM, WN, WK, float>& cFrag,
-    int M, int N, int m0, int n0,
-    int wave_m, int wave_n,
-    int lane,
-    float* __restrict__ sC) // may be null when InteriorStore==true
-{
-    if constexpr (InteriorStore) {
-        // Store directly to global row-major with stride N
-        const int gm = m0 + wave_m * WM;
-        const int gn = n0 + wave_n * WN;
-        rocwmma::store_matrix_sync(C + (size_t)gm * N + gn, cFrag, N, rocwmma::mem_row_major);
-    } else {
-        // Ragged edges: spill to LDS then masked global write
-        float* sCbase = sC + (wave_m * WAVES_N + wave_n) * (WM * WN);
-        rocwmma::store_matrix_sync(sCbase, cFrag, WN, rocwmma::mem_row_major);
-        __syncthreads();
+__device__ inline uint16_t hipbf16_to_bits(__hip_bfloat16 x) {
+    return *reinterpret_cast<uint16_t*>(&x);
+}
 
-        const int c_m0 = m0 + wave_m * WM;
-        const int c_n0 = n0 + wave_n * WN;
-        for (int t = lane; t < WM * WN; t += LANE_PER_WAVE) {
-            const int r = t / WN;
-            const int c = t % WN;
-            const int gm = c_m0 + r;
-            const int gn = c_n0 + c;
-            if (gm < M && gn < N) {
-                C[(size_t)gm * N + gn] = sCbase[r * WN + c];
-            }
+// ===== MFMA wrapper (gfx90a supports BF16->F32 accumulate) =====
+// d = a*b + c, one 16x16x16 bf16 MMA per wave (returns 4 accumulators / lane)
+__device__ inline f32x4 mfma_16x16x16_bf16(bf16x4 a_vec, bf16x4 b_vec, f32x4 c_vec) {
+    // cbsz, abid, blgp must be immediates
+    return __builtin_amdgcn_mfma_f32_16x16x16bf16_1k(a_vec, b_vec, c_vec, 0, 0, 0);
+    // Syntax & wavefront-wide semantics: AMD Lab Notes on Matrix Cores.  :contentReference[oaicite:4]{index=4}
+}
+
+// ===== Lane → (row/col-group) mapping helpers =====
+__device__ inline int lane_row(int lane)   { return lane & 15; }   // 0..15
+__device__ inline int lane_group(int lane) { return lane >> 4; }   // 0..3
+
+// ===== Build the per-lane bf16x4 operands from LDS tiles =====
+// A is in LDS row-major [BLOCK_M x BLOCK_K] with ldA = BLOCK_K
+// Take row = (wave_m*WM) + lane_row, columns (grp*4 + i), i=0..3
+__device__ inline bf16x4 make_a_vec(const uint16_t* __restrict__ sA,
+                                    int ldA, int aRowBase, int lane)
+{
+    const int r   = aRowBase + lane_row(lane);
+    const int grp = lane_group(lane); // 0..3
+    bf16x4 v;
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        v[i] = sA[r * ldA + (grp * 4 + i)];
+    }
+    return v;
+}
+
+// B is in LDS column-major [BLOCK_K x BLOCK_N] with ldB = BLOCK_K
+// Take column = (wave_n*WN) + lane_row (0..15), rows (grp*4 + i)
+__device__ inline bf16x4 make_b_vec(const uint16_t* __restrict__ sB,
+                                    int ldB, int bColBase, int lane)
+{
+    const int col = bColBase + lane_row(lane); // 0..15 within the 16x16 tile
+    const int grp = lane_group(lane);          // 0..3
+    bf16x4 v;
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        // column-major addressing: index = col*ldB + row
+        v[i] = sB[col * ldB + (grp * 4 + i)];
+    }
+    return v;
+}
+
+// ===== Store 16x16 accum tile from per-lane f32x4 =====
+template<bool InteriorStore>
+__device__ inline void store_c_tile_mfma(
+float* __restrict__ C, const f32x4& acc,
+    int M, int N, int m0, int n0, int wave_m, int wave_n, int lane)
+{
+    const int rowBase = m0 + wave_m * WM + lane_group(lane) * 4; // 4 rows per group
+    const int col     = n0 + wave_n * WN + lane_row(lane);       // one column per lane_row
+
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        const int row = rowBase + i;
+        if constexpr (InteriorStore) {
+            C[(size_t)row * N + col] = acc[i];
+        } else {
+            if (row < M && col < N) C[(size_t)row * N + col] = acc[i];
         }
     }
 }
-
-// ===== BF16 kernel =====
-__global__ void gemm_wmma_bf16_kernel_opt(
+// ===== BF16 kernel (A: FP32, B: BF16) =====
+__global__ void gemm_mfma_bf16_kernel_opt(
     float* __restrict__ C,                     // [M, N]
-    const float* __restrict__ A,               // [M, K] (FP32)
-    const __hip_bfloat16* __restrict__ Wbf16,  // [N, K] row-major
+    const float* __restrict__ A,               // [M, K] FP32
+    const __hip_bfloat16* __restrict__ Wbf16,  // [N, K] row-major (weights)
     int M, int K, int N)
 {
-    using namespace rocwmma;
-
     const int m0 = blockIdx.y * BLOCK_M;
     const int n0 = blockIdx.x * BLOCK_N;
 
@@ -88,92 +127,81 @@ __global__ void gemm_wmma_bf16_kernel_opt(
     const int wave_m = wave / WAVES_N;
     const int wave_n = wave % WAVES_N;
 
-    // LDS layout with ping-pong buffers:
-    // sA0, sA1: [BLOCK_M, BLOCK_K] row-major
-    // sB0, sB1: [BLOCK_K, BLOCK_N] col-major
-    // sC:       [WAVES_PER_BLOCK, WM*WN] floats (only when ragged)
+    // LDS layout (ping–pong):
+    // sA0, sA1: [BLOCK_M x BLOCK_K] row-major (uint16_t BF16 bits)
+    // sB0, sB1: [BLOCK_K x BLOCK_N] col-major (uint16_t BF16 bits)
     extern __shared__ uint8_t smemRaw[];
-    auto* sA0 = reinterpret_cast<rocwmma::bfloat16_t*>(smemRaw);
+    auto* sA0 = reinterpret_cast<uint16_t*>(smemRaw);
     auto* sA1 = sA0 + (BLOCK_M * BLOCK_K);
     auto* sB0 = sA1 + (BLOCK_M * BLOCK_K);
     auto* sB1 = sB0 + (BLOCK_K * BLOCK_N);
-    auto* sC   = reinterpret_cast<float*>(sB1 + (BLOCK_K * BLOCK_N)); // size: WAVES_PER_BLOCK * WM * WN
 
-    fragment<accumulator, WM, WN, WK, float> cFrag;
-    fill_fragment(cFrag, 0.0f);
+    f32x4 acc = {0.f, 0.f, 0.f, 0.f};
 
     const int threadsPerBlock = blockDim.x * blockDim.y;
     const int linearT = wave * blockDim.x + lane;
 
-    // Preload stage 0
+    // Preload k-slice 0
     {
-        // A -> sA0
+        // A -> sA0 (row-major), convert FP32->BF16
         for (int idx = linearT; idx < BLOCK_M * BLOCK_K; idx += threadsPerBlock) {
             const int r = idx / BLOCK_K;
             const int c = idx % BLOCK_K;
             const int gm = m0 + r;
             const int gk = c;
             float a = (gm < M && gk < K) ? A[(size_t)gm * K + gk] : 0.0f;
-            sA0[r * BLOCK_K + c] = f32_to_bf16(a);
+            sA0[r * BLOCK_K + c] = f32_to_bf16_bits(a);
         }
-        // B (already bf16) -> sB0 (col-major in LDS)
+        // B -> sB0 (col-major), Wbf16 is [N,K] row-major
         for (int idx = linearT; idx < BLOCK_K * BLOCK_N; idx += threadsPerBlock) {
-            const int c = idx / BLOCK_K;
-            const int r = idx % BLOCK_K;
+            const int c = idx / BLOCK_K;  // tile column within N-block
+            const int r = idx % BLOCK_K;  // k inside this slice
             const int gn = n0 + c;
             const int gk = r;
             __hip_bfloat16 wb = (gk < K && gn < N) ? Wbf16[(size_t)gn * K + gk] : __float2bfloat16(0.0f);
-            rocwmma::bfloat16_t y;
-            *reinterpret_cast<uint16_t*>(&y) = *reinterpret_cast<uint16_t*>(&wb);
-            sB0[c * BLOCK_K + r] = y;
+            sB0[c * BLOCK_K + r] = hipbf16_to_bits(wb);
         }
     }
     __syncthreads();
-
-    // Main loop with ping-pong buffers
-    rocwmma::fragment<matrix_a, WM, WN, WK, bfloat16_t, row_major> aFrag;
-    rocwmma::fragment<matrix_b, WM, WN, WK, bfloat16_t, col_major> bFrag;
 
     auto* currA = sA0;
     auto* currB = sB0;
     auto* nextA = sA1;
     auto* nextB = sB1;
 
+    // MFMA microkernel: one MFMA per K-chunk (16)
     for (int k0 = 0; k0 < K; k0 += BLOCK_K) {
-        // Preload next stage if any
+        // Preload next stage
         if (k0 + BLOCK_K < K) {
             const int kBase = k0 + BLOCK_K;
-            // A -> nextA
+
             for (int idx = linearT; idx < BLOCK_M * BLOCK_K; idx += threadsPerBlock) {
                 const int r = idx / BLOCK_K;
                 const int c = idx % BLOCK_K;
                 const int gm = m0 + r;
                 const int gk = kBase + c;
                 float a = (gm < M && gk < K) ? A[(size_t)gm * K + gk] : 0.0f;
-                nextA[r * BLOCK_K + c] = f32_to_bf16(a);
+                nextA[r * BLOCK_K + c] = f32_to_bf16_bits(a);
             }
-            // B -> nextB (col-major)
             for (int idx = linearT; idx < BLOCK_K * BLOCK_N; idx += threadsPerBlock) {
                 const int c = idx / BLOCK_K;
                 const int r = idx % BLOCK_K;
                 const int gn = n0 + c;
                 const int gk = kBase + r;
                 __hip_bfloat16 wb = (gk < K && gn < N) ? Wbf16[(size_t)gn * K + gk] : __float2bfloat16(0.0f);
-                rocwmma::bfloat16_t y;
-                *reinterpret_cast<uint16_t*>(&y) = *reinterpret_cast<uint16_t*>(&wb);
-                nextB[c * BLOCK_K + r] = y;
+                nextB[c * BLOCK_K + r] = hipbf16_to_bits(wb);
             }
         }
 
-        // MMA on current stage
+        // Build lane operands and issue MFMA
         const int ldA = BLOCK_K;
         const int ldB = BLOCK_K;
-        const int aRow = wave_m * WM;
-        const int bCol = wave_n * WN;
+        const int aRowBase = wave_m * WM;  // selects our 16 rows within the block
+        const int bColBase = wave_n * WN;  // selects our 16 cols within the block
 
-        load_matrix_sync(aFrag, currA + aRow * ldA, ldA);
-        load_matrix_sync(bFrag, currB + bCol * ldB, ldB);
-        mma_sync(cFrag, aFrag, bFrag, cFrag);
+        bf16x4 avec = make_a_vec(currA, ldA, aRowBase, lane);
+        bf16x4 bvec = make_b_vec(currB, ldB, bColBase, lane);
+        acc = mfma_16x16x16_bf16(avec, bvec, acc);
 
         __syncthreads();
         // Swap buffers
@@ -183,22 +211,20 @@ __global__ void gemm_wmma_bf16_kernel_opt(
 
     const bool interior = (m0 + BLOCK_M) <= M && (n0 + BLOCK_N) <= N;
     if (interior) {
-        store_c_tile<true>(C, cFrag, M, N, m0, n0, wave_m, wave_n, lane, nullptr);
+        store_c_tile_mfma<true>(C, acc, M, N, m0, n0, wave_m, wave_n, lane);
     } else {
-        store_c_tile<false>(C, cFrag, M, N, m0, n0, wave_m, wave_n, lane, sC);
+        store_c_tile_mfma<false>(C, acc, M, N, m0, n0, wave_m, wave_n, lane);
     }
 }
 
-// ===== MXFP4 (uint8-packed) kernel =====
-__global__ void gemm_wmma_uint8_kernel_opt(
+// ===== MXFP4 (packed 4-bit) path: dequantize -> BF16 -> MFMA =====
+__global__ void gemm_mfma_uint8_kernel_opt(
     float* __restrict__ C,                        // [M, N]
-    const float* __restrict__ A,                  // [M, K] (FP32)
+    const float* __restrict__ A,                  // [M, K] FP32
     const uint8_t* __restrict__ Wp,               // [N, K] packed (MXFP4)
-    const float* __restrict__ weight_scales,      // [N / 32] or your layout
+    const float* __restrict__ weight_scales,      // [N / 32] (or your layout)
     int M, int K, int N, size_t total_weight_elements)
 {
-    using namespace rocwmma;
-
     const int m0 = blockIdx.y * BLOCK_M;
     const int n0 = blockIdx.x * BLOCK_N;
 
@@ -208,29 +234,26 @@ __global__ void gemm_wmma_uint8_kernel_opt(
     const int wave_n = wave % WAVES_N;
 
     extern __shared__ uint8_t smemRaw[];
-    auto* sA0 = reinterpret_cast<rocwmma::bfloat16_t*>(smemRaw);
+    auto* sA0 = reinterpret_cast<uint16_t*>(smemRaw);
     auto* sA1 = sA0 + (BLOCK_M * BLOCK_K);
     auto* sB0 = sA1 + (BLOCK_M * BLOCK_K);
     auto* sB1 = sB0 + (BLOCK_K * BLOCK_N);
-    auto* sC  = reinterpret_cast<float*>(sB1 + (BLOCK_K * BLOCK_N));
 
-    fragment<accumulator, WM, WN, WK, float> cFrag;
-    fill_fragment(cFrag, 0.0f);
+    f32x4 acc = {0.f, 0.f, 0.f, 0.f};
 
     const int threadsPerBlock = blockDim.x * blockDim.y;
     const int linearT = wave * blockDim.x + lane;
 
-    // Helper lambda to load a B tile into LDS (col-major), calling your dequantize
-    auto load_B_tile = [&](rocwmma::bfloat16_t* dst, int kBase) {
+    auto load_B_tile = [&](uint16_t* dst, int kBase) {
         for (int idx = linearT; idx < BLOCK_K * BLOCK_N; idx += threadsPerBlock) {
-            const int c = idx / BLOCK_K;       // column within the block
-            const int r = idx % BLOCK_K;       // k within the slice
+            const int c = idx / BLOCK_K;       // col within block
+            const int r = idx % BLOCK_K;       // k within slice
             const int gn = n0 + c;
             const int gk = kBase + r;
             float wb = (gk < K && gn < N)
                 ? dequantize_mxfp4(Wp, weight_scales, (size_t)gn * K + gk, total_weight_elements)
                 : 0.0f;
-            dst[c * BLOCK_K + r] = f32_to_bf16(wb);
+            dst[c * BLOCK_K + r] = f32_to_bf16_bits(wb);
         }
     };
 
@@ -242,14 +265,11 @@ __global__ void gemm_wmma_uint8_kernel_opt(
             const int gm = m0 + r;
             const int gk = c;
             float a = (gm < M && gk < K) ? A[(size_t)gm * K + gk] : 0.0f;
-            sA0[r * BLOCK_K + c] = f32_to_bf16(a);
+            sA0[r * BLOCK_K + c] = f32_to_bf16_bits(a);
         }
         load_B_tile(sB0, /*kBase=*/0);
     }
     __syncthreads();
-
-    rocwmma::fragment<matrix_a, WM, WN, WK, bfloat16_t, row_major> aFrag;
-    rocwmma::fragment<matrix_b, WM, WN, WK, bfloat16_t, col_major> bFrag;
 
     auto* currA = sA0;
     auto* currB = sB0;
@@ -257,28 +277,28 @@ __global__ void gemm_wmma_uint8_kernel_opt(
     auto* nextB = sB1;
 
     for (int k0 = 0; k0 < K; k0 += BLOCK_K) {
-        // Preload next stage
         if (k0 + BLOCK_K < K) {
             const int kBase = k0 + BLOCK_K;
+
             for (int idx = linearT; idx < BLOCK_M * BLOCK_K; idx += threadsPerBlock) {
                 const int r = idx / BLOCK_K;
                 const int c = idx % BLOCK_K;
                 const int gm = m0 + r;
                 const int gk = kBase + c;
                 float a = (gm < M && gk < K) ? A[(size_t)gm * K + gk] : 0.0f;
-                nextA[r * BLOCK_K + c] = f32_to_bf16(a);
+                nextA[r * BLOCK_K + c] = f32_to_bf16_bits(a);
             }
             load_B_tile(nextB, kBase);
         }
 
         const int ldA = BLOCK_K;
         const int ldB = BLOCK_K;
-        const int aRow = wave_m * WM;
-        const int bCol = wave_n * WN;
+        const int aRowBase = wave_m * WM;
+        const int bColBase = wave_n * WN;
 
-        load_matrix_sync(aFrag, currA + aRow * ldA, ldA);
-        load_matrix_sync(bFrag, currB + bCol * ldB, ldB);
-        mma_sync(cFrag, aFrag, bFrag, cFrag);
+        bf16x4 avec = make_a_vec(currA, ldA, aRowBase, lane);
+        bf16x4 bvec = make_b_vec(currB, ldB, bColBase, lane);
+        acc = mfma_16x16x16_bf16(avec, bvec, acc);
 
         __syncthreads();
         auto* tmpA = currA; currA = nextA; nextA = tmpA;
@@ -287,13 +307,13 @@ __global__ void gemm_wmma_uint8_kernel_opt(
 
     const bool interior = (m0 + BLOCK_M) <= M && (n0 + BLOCK_N) <= N;
     if (interior) {
-        store_c_tile<true>(C, cFrag, M, N, m0, n0, wave_m, wave_n, lane, nullptr);
+        store_c_tile_mfma<true>(C, acc, M, N, m0, n0, wave_m, wave_n, lane);
     } else {
-        store_c_tile<false>(C, cFrag, M, N, m0, n0, wave_m, wave_n, lane, sC);
+        store_c_tile_mfma<false>(C, acc, M, N, m0, n0, wave_m, wave_n, lane);
     }
 }
 
-// ===== Host wrappers =====
+// ===== Host wrappers (unchanged API) =====
 void matmul(
     float* __restrict__ output,                 // [B, O]
     const float* __restrict__ input,            // [B, I]
@@ -305,13 +325,12 @@ void matmul(
     dim3 grid((N + BLOCK_N - 1) / BLOCK_N, (M + BLOCK_M - 1) / BLOCK_M);
     dim3 block(LANE_PER_WAVE, WAVES_PER_BLOCK);
 
-    // Double-buffered A/B + optional sC for ragged edges
+    // Double-buffered A/B only (no sC spill needed; we mask-ed store)
     size_t shmem_bytes =
-        (size_t)(2 * BLOCK_M * BLOCK_K + 2 * BLOCK_K * BLOCK_N) * sizeof(rocwmma::bfloat16_t) +
-        (size_t)(WAVES_PER_BLOCK * WM * WN) * sizeof(float);
+        (size_t)(2 * BLOCK_M * BLOCK_K + 2 * BLOCK_K * BLOCK_N) * sizeof(uint16_t);
 
     hipLaunchKernelGGL(
-        gemm_wmma_bf16_kernel_opt,
+        gemm_mfma_bf16_kernel_opt,
         grid, block, shmem_bytes, stream,
         output, input, weight, M, K, N);
 }
@@ -330,11 +349,10 @@ void matmul_mxfp4(
     dim3 block(LANE_PER_WAVE, WAVES_PER_BLOCK);
 
     size_t shmem_bytes =
-        (size_t)(2 * BLOCK_M * BLOCK_K + 2 * BLOCK_K * BLOCK_N) * sizeof(rocwmma::bfloat16_t) +
-        (size_t)(WAVES_PER_BLOCK * WM * WN) * sizeof(float);
+        (size_t)(2 * BLOCK_M * BLOCK_K + 2 * BLOCK_K * BLOCK_N) * sizeof(uint16_t);
 
     hipLaunchKernelGGL(
-        gemm_wmma_uint8_kernel_opt,
+        gemm_mfma_uint8_kernel_opt,
         grid, block, shmem_bytes, stream,
         output, input, weight_packed, weight_scales, M, K, N, total_weight_elements);
 }
