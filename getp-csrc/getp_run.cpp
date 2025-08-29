@@ -820,21 +820,22 @@ void attention_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size)
 
     // ------------------- FUSED KERNEL LAUNCH (REPLACES 4 OLD KERNELS) -------------------
     // --- Fused attention launch (matching kernel above) ---
+    
+    
     {
         dim3 grid(batch_size, p->n_attn_heads);
-        dim3 block(256);
+        dim3 block(256);  // 4 warps; good for sweeping tokens
 
-        // Determine if we *actually* apply the sliding window on this layer
         const bool apply_window = (p->sliding_window > 0) && ((layer_idx & 1) == 0);
         constexpr int HOST_WARPSIZE = 64;
-        const int numWarps = (block.x + HOST_WARPSIZE - 1) / HOST_WARPSIZE;
+        const int warps = (block.x + HOST_WARPSIZE - 1) / HOST_WARPSIZE;
 
-        // Dynamic shared memory: Q + att + reduce
-        // - SW path: att = SW_WINDOW + 1 (space for sink)
-        // - FULL path: att = MAX_SEQ_LEN
-        size_t shmem_sw   = (size_t)(p->head_dim + (SW_WINDOW + 1) + numWarps) * sizeof(float);
-        size_t shmem_full = (size_t)(p->head_dim +  MAX_SEQ_LEN        + numWarps) * sizeof(float);
-        size_t shared_mem_size = apply_window ? shmem_sw : shmem_full;
+        // att capacity: SW path reserves SW_WINDOW+1 (sink included), FULL path reserves MAX_SEQ_LEN
+        const size_t att_cap = apply_window ? (SW_WINDOW + 1) : MAX_SEQ_LEN;
+
+        // New layout: s_att[att_cap] + s_partials[warps * head_dim] + s_reduce[warps]
+        const size_t shared_mem_size =
+            (att_cap + (size_t)warps * p->head_dim + warps) * sizeof(float);
 
         hipLaunchKernelGGL(
             fused_attention_kernel,
@@ -843,8 +844,7 @@ void attention_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size)
             s->q,
             s->key_cache,
             s->value_cache,
-            // sinks pointer already offset by layer on host; kernel indexes by head only
-            w->attn_sinks + layer_idx * p->n_attn_heads,
+            w->attn_sinks + layer_idx * p->n_attn_heads,  // already layer-offset
             s->mask,
             s->positions,
             batch_size,
@@ -858,6 +858,8 @@ void attention_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size)
         );
         HIP_CHECK(hipGetLastError());
     }
+
+
 
     // --------------------------------- END OF FUSED SECTION ---------------------------------
 
