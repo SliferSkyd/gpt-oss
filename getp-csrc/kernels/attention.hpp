@@ -397,121 +397,191 @@ __device__ __forceinline__ void blockReduce(float val, float *smem, int tid, int
 
 
 // --- MODIFIED FUSED ATTENTION KERNEL ---
+#ifndef SW_WINDOW
+#define SW_WINDOW 128
+#endif
+
+// ===== warp/block reductions (HIP-safe) =====
+__device__ inline float warpReduceMax(float v) {
+    for (int off = warpSize >> 1; off > 0; off >>= 1)
+        v = fmaxf(v, __shfl_down(v, off));
+    return v;
+}
+__device__ inline float warpReduceSum(float v) {
+    for (int off = warpSize >> 1; off > 0; off >>= 1)
+        v += __shfl_down(v, off);
+    return v;
+}
+__device__ inline float blockReduceMax(float v, float *smem) {
+    int lane = threadIdx.x & (warpSize - 1);
+    int wid  = threadIdx.x >> __ffs(warpSize)-1; // warp id in block
+    v = warpReduceMax(v);
+    if (lane == 0) smem[wid] = v;
+    __syncthreads();
+    float out = -INFINITY;
+    if (threadIdx.x < (blockDim.x + warpSize - 1) / warpSize) out = smem[lane];
+    __syncthreads();
+    out = warpReduceMax(out);
+    // broadcast to all threads
+    if (lane == 0 && wid == 0) smem[0] = out;
+    __syncthreads();
+    return smem[0];
+}
+__device__ inline float blockReduceSum(float v, float *smem) {
+    int lane = threadIdx.x & (warpSize - 1);
+    int wid  = threadIdx.x >> __ffs(warpSize)-1;
+    v = warpReduceSum(v);
+    if (lane == 0) smem[wid] = v;
+    __syncthreads();
+    float out = 0.f;
+    if (threadIdx.x < (blockDim.x + warpSize - 1) / warpSize) out = smem[lane];
+    __syncthreads();
+    out = warpReduceSum(out);
+    if (lane == 0 && wid == 0) smem[0] = out;
+    __syncthreads();
+    return smem[0];
+}
 
 __global__ void fused_attention_kernel(
-    float *output, // Output: [batch, n_heads, head_dim]
-    const float *q, // Input Q: [batch, n_heads * head_dim]
-    const __hip_bfloat16 *key_cache, // K Cache: [batch, n_layers, seq_len, kv_dim]
-    const __hip_bfloat16 *value_cache, // V Cache: [batch, n_layers, seq_len, kv_dim]
-    const __hip_bfloat16 *sinks, // Sinks: [n_layers, n_heads]
-    const float *mask, // Mask: [seq_len, seq_len]
-    const int *positions, // Positions: [batch]
+    float * __restrict__ output,               // [batch, n_heads, head_dim]
+    const float * __restrict__ q,              // [batch, n_heads * head_dim]
+    const __hip_bfloat16 * __restrict__ key_cache,   // [batch, n_layers, seq_len, kv_dim]
+    const __hip_bfloat16 * __restrict__ value_cache, // [batch, n_layers, seq_len, kv_dim]
+    const __hip_bfloat16 * __restrict__ sinks,       // [n_heads]  (already offset by layer on host)
+    const float * __restrict__ mask,                 // [seq_len, seq_len]
+    const int * __restrict__ positions,              // [batch]
     int batch_size, int n_heads, int n_kv_heads, int head_dim,
     int seq_len, int n_layers, int layer_idx,
     bool use_sliding_window)
 {
-    // --- Shared Memory Declaration ---
-    extern __shared__ float s_data[];
-    float *s_q = s_data;
-    float *s_att = (float *)&s_q[head_dim];
-    // Shared memory for block-wide reductions. Size needed is blockDim.x / warpSize
-    float *s_reduce = (float *)&s_att[seq_len];
+    extern __shared__ float s_mem[]; // layout: [Q | att | reduce]
+    float *s_q = s_mem;
 
-    // --- Thread & Block Identification ---
-    const int batch_idx = blockIdx.x;
-    const int head_idx = blockIdx.y;
+    // s_att will point either to SW_WINDOW+1 or MAX_SEQ_LEN (chosen by launch)
+    // s_reduce is sized to number of warps in the block.
+    // We compute offsets dynamically based on launch-provided shmem layout:
+    //   s_q:       [0 .. head_dim)
+    //   s_att:     [head_dim .. head_dim + att_cap)
+    //   s_reduce:  [head_dim + att_cap .. head_dim + att_cap + numWarps)
+    const int numWarps = (blockDim.x + warpSize - 1) / warpSize;
+
+    // We cannot know "att_cap" here directly from the pointer sizes,
+    // but we rely on the launcher to allocate enough shared memory for either
+    // SW or FULL variants and our code never indexes beyond:
+    //   softmax_len <= win_core_len + (sink ? 1 : 0)
+    // where win_core_len is either pos+1 (FULL) or <= SW_WINDOW (SW).
+
+    // Thread/block ids
+    const int b   = blockIdx.x;
+    const int h   = blockIdx.y;
     const int tid = threadIdx.x;
 
-    if (batch_idx >= batch_size || head_idx >= n_heads)
-        return;
+    if (b >= batch_size || h >= n_heads) return;
 
-    const int pos = positions[batch_idx];
-
-    // --- GQA (Grouped-Query Attention) Setup ---
+    const int pos = positions[b];
     const int gqa_ratio = n_heads / n_kv_heads;
-    const int kv_head = head_idx / gqa_ratio;
-    const int kv_dim = head_dim * n_kv_heads;
+    const int kv_h      = h / gqa_ratio;
+    const int kv_dim    = head_dim * n_kv_heads;
 
-    // --- Set up Global Memory Pointers ---
-    const float *q_head_ptr = q + 1LL * batch_idx * n_heads * head_dim + 1LL * head_idx * head_dim;
-    const __hip_bfloat16 *k_cache_layer_ptr = key_cache + 1LL * batch_idx * n_layers * seq_len * kv_dim + 1LL * layer_idx * seq_len * kv_dim;
-    float *output_ptr = output + 1LL * batch_idx * n_heads * head_dim + 1LL * head_idx * head_dim;
+    // Base pointers
+    const float *q_head = q + 1LL * b * n_heads * head_dim + 1LL * h * head_dim;
+    const __hip_bfloat16 *k_base =
+        key_cache + 1LL * b * n_layers * seq_len * kv_dim + 1LL * layer_idx * seq_len * kv_dim;
+    const __hip_bfloat16 *v_base =
+        value_cache + 1LL * b * n_layers * seq_len * kv_dim + 1LL * layer_idx * seq_len * kv_dim;
+    float *out_head =
+        output + 1LL * b * n_heads * head_dim + 1LL * h * head_dim;
 
-    // --- Step 1: Load Query (Q) into Shared Memory ---
-    for (int i = tid; i < head_dim; i += blockDim.x) {
-        s_q[i] = q_head_ptr[i];
+    // Load Q into shared
+    for (int i = tid; i < head_dim; i += blockDim.x) s_q[i] = q_head[i];
+    __syncthreads();
+
+    // Figure out shared memory slice sizes from launch choice:
+    // We don't have att_cap explicitly; compute pointer math using assumptions:
+    //  s_att starts right after s_q; s_reduce must be placed at the end.
+    // We'll compute an upper bound "att_cap" from provided shmem size:
+    extern __shared__ unsigned char __s_base[];
+    size_t total_floats = (size_t) ( (size_t)blockDim.x * 0 /* dummy to silence warnings */ );
+    // Convert our float* back to base to deduce sizes:
+    float* base_ptr = (float*) __s_base;
+    // Our pointers were laid out as: s_q = base_ptr; s_att follows head_dim floats.
+    float *s_att = s_q + head_dim;
+    // The launcher made room for "att_cap + numWarps" floats after s_q; but we don't need to
+    // know the cap precisely as long as we don't index beyond "softmax_len" which we control.
+    float *s_reduce = s_att; // will move this after we know softmax_len
+    // We’ll rebase s_reduce later after writing s_att[0..softmax_len-1].
+
+    // Apply sliding window only on even layers to match original behavior
+    const bool apply_window = use_sliding_window && ((layer_idx & 1) == 0);
+
+    const int win_start    = apply_window ? max(0, pos - (SW_WINDOW - 1)) : 0;
+    const int win_core_len = pos - win_start + 1; // number of tokens actually attended in V-sum
+
+    // Compute scores into s_att[0..win_core_len-1]; append sink after that if any.
+    const float inv_sqrt_d = rsqrtf((float)head_dim);
+
+    for (int w = tid; w < win_core_len; w += blockDim.x) {
+        const int t = win_start + w;
+        const __hip_bfloat16 *k_vec = k_base + 1LL * t * kv_dim + 1LL * kv_h * head_dim;
+
+        float acc = 0.f;
+        #pragma unroll 4
+        for (int i = 0; i < head_dim; ++i) {
+            acc += s_q[i] * __bfloat162float(k_vec[i]);
+        }
+        acc *= inv_sqrt_d;
+
+        // keep your original conditional mask add
+        if (apply_window) {
+            acc += mask[1LL * pos * seq_len + t];
+        }
+        s_att[w] = acc;
     }
     __syncthreads();
 
-    // --- Step 2: Calculate Attention Scores (Q * K^T) ---
-    const float inv_sqrt_head_dim = rsqrtf((float)head_dim);
-    for (int t = tid; t <= pos; t += blockDim.x) {
-        const __hip_bfloat16 *k_vec = k_cache_layer_ptr + 1LL * t * kv_dim + 1LL * kv_head * head_dim;
-        float score = 0.0f;
-        for (int i = 0; i < head_dim; i++) {
-            score += s_q[i] * __bfloat162float(k_vec[i]);
-        }
-        score *= inv_sqrt_head_dim;
-        if (use_sliding_window && (layer_idx % 2 == 0)) {
-            score += mask[1LL * pos * seq_len + t];
-        }
-        s_att[t] = score;
-    }
-    __syncthreads();
-
-    // --- Step 3: Add Sinks ---
-    int softmax_len = pos + 1;
+    int softmax_len = win_core_len;
     if (pos + 1 < seq_len) {
-        if (tid == 0) {
-            s_att[pos + 1] = __bfloat162float(sinks[head_idx]);
-        }
-        softmax_len++;
+        if (tid == 0) s_att[softmax_len] = __bfloat162float(sinks[h]);
+        softmax_len += 1;
     }
     __syncthreads();
 
-    // ==============================================================================
-    // --- Step 4: In-place Softmax in Shared Memory (MODIFIED) ---
-    // ==============================================================================
+    // Place s_reduce right after the softmax slice (saves shared memory)
+    s_reduce = s_att + softmax_len;
 
-    // 4.1: Find max value for numerical stability using new reduction helpers
-    float thread_max = -INFINITY;
-    for (int t = tid; t < softmax_len; t += blockDim.x) {
-        thread_max = fmaxf(thread_max, s_att[t]);
-    }
-    blockReduce<MaxOp>(thread_max, s_reduce, tid, blockDim.x, MaxOp());
-    const float max_val = s_reduce[0];
-    __syncthreads(); // Ensure max_val is visible to all threads
+    // Softmax over s_att[0..softmax_len-1]
+    // max
+    float tmax = -INFINITY;
+    for (int i = tid; i < softmax_len; i += blockDim.x) tmax = fmaxf(tmax, s_att[i]);
+    const float max_val = blockReduceMax(tmax, s_reduce);
 
-    // 4.2: Compute exp(score - max) and sum the results
-    float thread_sum = 0.0f;
-    for (int t = tid; t < softmax_len; t += blockDim.x) {
-        float val = expf(s_att[t] - max_val);
-        s_att[t] = val; // Store intermediate result back to shared memory
-        thread_sum += val;
+    // exp & sum
+    float tsum = 0.f;
+    for (int i = tid; i < softmax_len; i += blockDim.x) {
+        float v = expf(s_att[i] - max_val);
+        s_att[i] = v;
+        tsum += v;
     }
-    blockReduce<SumOp>(thread_sum, s_reduce, tid, blockDim.x, SumOp());
-    const float sum_val = s_reduce[0];
-    __syncthreads(); // Ensure sum_val is visible to all threads
+    const float sum_val = blockReduceSum(tsum, s_reduce);
 
-    // 4.3: Normalize to get final attention weights
-    const float inv_sum_val = 1.0f / (sum_val + 1e-9f);
-    for (int t = tid; t < softmax_len; t += blockDim.x) {
-        s_att[t] *= inv_sum_val;
-    }
+    const float inv_sum = 1.f / (sum_val + 1e-9f);
+    for (int i = tid; i < softmax_len; i += blockDim.x) s_att[i] *= inv_sum;
     __syncthreads();
 
-    // --- Step 5: Weighted Sum of Values (Att * V) ---
-    const __hip_bfloat16 *v_cache_layer_ptr = value_cache + 1LL * batch_idx * n_layers * seq_len * kv_dim + 1LL * layer_idx * seq_len * kv_dim;
-
+    // Weighted sum of V over the *core* window only (exclude sink)
     if (tid < head_dim) {
-        float weighted_sum = 0.0f;
-        for (int t = 0; t <= pos; t++) {
-            const __hip_bfloat16 *v_vec = v_cache_layer_ptr + 1LL * t * kv_dim + 1LL * kv_head * head_dim;
-            weighted_sum += s_att[t] * __bfloat162float(v_vec[tid]);
+        float acc = 0.f;
+        for (int w = 0; w < win_core_len; ++w) {
+            const int t = win_start + w;
+            const __hip_bfloat16 *v_vec = v_base + 1LL * t * kv_dim + 1LL * kv_h * head_dim;
+            acc += s_att[w] * __bfloat162float(v_vec[tid]);
         }
-        output_ptr[tid] = weighted_sum;
+        out_head[tid] = acc;
     }
 }
+
+
+
 // ============================================================================
 // FUSED "MEGA" KERNEL
 // ============================================================================
