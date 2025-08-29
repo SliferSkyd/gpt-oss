@@ -23,9 +23,12 @@
 #include "kernels/swiglu.hpp"
 #include "kernels/rope.hpp"
 #include "memory/mxfp4.hpp"
+#include <omp.h>
 
 #ifndef GETP_RUN
 #define GETP_RUN
+
+int num_gpus = 1;
 
 // GPU Transformer Weights struct - stores all model weights on GPU in bfloat16 format
 typedef struct
@@ -128,6 +131,12 @@ typedef struct
     bool *finished;      // finished flags for each sequence
     int *positions;      // current positions (CPU copy)
     int *prompt_lens;    // prompt lengths
+    hipStream_t sGather;
+    hipStream_t sScatter;
+    hipStream_t sMLP[N_MLP_STREAMS];
+    int *expert_counts;
+    int *expert_offsets;
+    float *logits;
 
     // Continuous batching fields
     int next_request_idx;     // Index of next unprocessed request (0 to num_reqs-1)
@@ -146,7 +155,7 @@ typedef struct
 } GPUTransformer;
 
 // Global variables for direct access in batched_generate_gpu
-static GPUTransformer *gpu_transformer;
+static GPUTransformer *gpu_transformers[MAX_GPUS];
 
 // Memory allocation functions
 void malloc_gpu_run_state(GPURunState *s, Config *p)
@@ -444,6 +453,14 @@ void malloc_cpu_buffers(CPUBuffers *cpu_buf, Config *p)
         cpu_buf->request_mapping_cpu[i] = -1; // Initialize to -1 (no request)
     }
     cpu_buf->next_request_idx = 0;
+
+    HIP_CHECK(hipHostMalloc(&cpu_buf->expert_counts, p->n_experts * sizeof(int)));
+    HIP_CHECK(hipHostMalloc(&cpu_buf->expert_offsets, p->n_experts * sizeof(int)));
+    HIP_CHECK(hipStreamCreateWithFlags(&cpu_buf->sGather, hipStreamNonBlocking));
+    HIP_CHECK(hipStreamCreateWithFlags(&cpu_buf->sScatter, hipStreamNonBlocking));
+    for (int i = 0; i < N_MLP_STREAMS; ++i)
+        HIP_CHECK(hipStreamCreateWithFlags(&cpu_buf->sMLP[i], hipStreamNonBlocking));
+    HIP_CHECK(hipHostMalloc(&cpu_buf->logits, BATCH_SIZE * p->vocab_size * sizeof(float)));
 }
 
 void build_gpu_transformer(GPUTransformer *gpu_t, Transformer *cpu_t)
@@ -464,29 +481,38 @@ void warm_up(Transformer *transformer, Tokenizer *tokenizer)
 {
     Config *p = &transformer->config;
     // Create GPU transformer
-    gpu_transformer = (GPUTransformer *)malloc(sizeof(GPUTransformer));
-    assert(gpu_transformer != NULL);
-    gpu_transformer->config = transformer->config;
+    // Multi-GPU support: allocate and initialize GPUTransformer for each GPU
+    HIP_CHECK(hipGetDeviceCount(&num_gpus));
+    if (num_gpus > MAX_GPUS) num_gpus = MAX_GPUS;
 
-    // Build GPU transformer
-    build_gpu_transformer(gpu_transformer, transformer);
+    #pragma omp parallel for
+    for (int dev = 0; dev < num_gpus; ++dev) {
+        HIP_CHECK(hipSetDevice(dev));
+        gpu_transformers[dev] = (GPUTransformer *)malloc(sizeof(GPUTransformer));
+        assert(gpu_transformers[dev] != NULL);
 
-    float ntk_beta = 32.0f;
-    float ntk_alpha = 1.0f;
+        GPUTransformer *gpu_transformer = gpu_transformers[dev];
 
-    for (int pos = 0; pos < MAX_SEQ_LEN; ++pos)
-    {
-        compute_cos_sin_getp(pos, p->rope_theta, p->head_dim, p->rope_scaling_factor,
-                             p->initial_context_length, ntk_beta, ntk_alpha,
-                             gpu_transformer->cpu_buffers.cos_vals + (pos * p->head_dim / 2),
-                             gpu_transformer->cpu_buffers.sin_vals + (pos * p->head_dim / 2));
-    }
+        gpu_transformer->config = transformer->config;
+        build_gpu_transformer(gpu_transformer, transformer);
 
-    // Copy RoPE values to GPU
-    HIP_CHECK(hipMemcpy(gpu_transformer->state.cos_vals, gpu_transformer->cpu_buffers.cos_vals,
-                        (p->head_dim / 2) * MAX_SEQ_LEN * sizeof(float), hipMemcpyHostToDevice));
-    HIP_CHECK(hipMemcpy(gpu_transformer->state.sin_vals, gpu_transformer->cpu_buffers.sin_vals,
-                        (p->head_dim / 2) * MAX_SEQ_LEN * sizeof(float), hipMemcpyHostToDevice));
+        float ntk_beta = 32.0f;
+        float ntk_alpha = 1.0f;
+
+        for (int pos = 0; pos < MAX_SEQ_LEN; ++pos)
+        {
+            compute_cos_sin_getp(pos, p->rope_theta, p->head_dim, p->rope_scaling_factor,
+                                p->initial_context_length, ntk_beta, ntk_alpha,
+                                gpu_transformer->cpu_buffers.cos_vals + (pos * p->head_dim / 2),
+                                gpu_transformer->cpu_buffers.sin_vals + (pos * p->head_dim / 2));
+        }
+
+        // Copy RoPE values to GPU
+        HIP_CHECK(hipMemcpy(gpu_transformer->state.cos_vals, gpu_transformer->cpu_buffers.cos_vals,
+                            (p->head_dim / 2) * MAX_SEQ_LEN * sizeof(float), hipMemcpyHostToDevice));
+        HIP_CHECK(hipMemcpy(gpu_transformer->state.sin_vals, gpu_transformer->cpu_buffers.sin_vals,
+                            (p->head_dim / 2) * MAX_SEQ_LEN * sizeof(float), hipMemcpyHostToDevice));
+    }    
 }
 
 void free_gpu_weights(GPUTransformerWeights *w)
@@ -655,8 +681,12 @@ void free_gpu_transformer(GPUTransformer *gpu_t)
 void finish(Transformer *transformer, Tokenizer *tokenizer)
 {
     // Free GPU transformer
-    free_gpu_transformer(gpu_transformer);
-    free(gpu_transformer);
+    #pragma omp parallel for
+    for (int dev = 0; dev < num_gpus; ++dev) {
+        free_gpu_transformer(gpu_transformers[dev]);
+        free(gpu_transformers[dev]);
+    }
+    free(gpu_transformers);
 }
 
 
@@ -689,11 +719,11 @@ void attention_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size)
     dim3 norm_grid(batch_size);
     dim3 norm_block(THREADS_PER_BLOCK);
     {
-        TIME_SCOPE(rms_norm_timer);
         rmsnorm_kernel<<<norm_grid, norm_block>>>(
             s->t, s->x, w->rms_attn_w + layer_idx * hidden_dim, batch_size, hidden_dim);
         HIP_CHECK(hipGetLastError());
     }
+    // HIP_CHECK(hipDeviceSynchronize());
 
     dim3 matmul_grid(batch_size, ((p->n_attn_heads + 2 * p->n_kv_heads) * head_dim + 31) / 32);
     dim3 matmul_block(32, min(32, THREADS_PER_BLOCK / 32));
@@ -705,7 +735,6 @@ void attention_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size)
     grid_dim.x = batch_size;
     grid_dim.y = ((p->n_attn_heads + 2 * p->n_kv_heads) * head_dim + block_dim.y - 1) / block_dim.y; // Ceiling division
     {
-        TIME_SCOPE(matmul_timer);
         // QKV projection using safer matmul kernel - FIXED: Use GPU weight pointer
         matmul(
             s->qkv,
@@ -716,19 +745,20 @@ void attention_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size)
             (p->n_attn_heads + 2 * p->n_kv_heads) * head_dim);
         HIP_CHECK(hipGetLastError());
     }
-
+    // HIP_CHECK(hipDeviceSynchronize());
+    
     HIP_CHECK(hipGetLastError());
     // Add bias - FIXED: Use GPU bias pointer and proper kernel
     int qkv_bias_offset = layer_idx * (head_dim * p->n_attn_heads + 2 * head_dim * p->n_kv_heads);
     dim3 bias_grid((1LL * batch_size * (p->n_attn_heads + 2 * p->n_kv_heads) * head_dim + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK);
 
     {
-        TIME_SCOPE(add_bias_timer);
         add_bias_kernel<<<bias_grid, THREADS_PER_BLOCK>>>(
             s->qkv, w->b_qkv + qkv_bias_offset, batch_size, (p->n_attn_heads + 2 * p->n_kv_heads) * head_dim);
         HIP_CHECK(hipGetLastError());
     }
-
+    // HIP_CHECK(hipDeviceSynchronize());
+    
     // Copy Q, K, V from qkv buffer - SIMPLIFIED AND FIXED
     int q_size = p->n_attn_heads * head_dim;
     int k_size = p->n_kv_heads * head_dim;
@@ -741,7 +771,8 @@ void attention_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size)
         float *dst = s->q + 1LL * b * q_size;
         HIP_CHECK(hipMemcpy(dst, src, q_size * sizeof(float), hipMemcpyDeviceToDevice));
     }
-
+    // HIP_CHECK(hipDeviceSynchronize());
+    
     // Copy K: shape [batch_size, n_kv_heads * head_dim]
     int k_offset = p->n_attn_heads * head_dim;
     for (int b = 0; b < BATCH_SIZE; b++)
@@ -750,7 +781,8 @@ void attention_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size)
         float *dst = s->k + 1LL * b * k_size;
         HIP_CHECK(hipMemcpy(dst, src, k_size * sizeof(float), hipMemcpyDeviceToDevice));
     }
-
+    // HIP_CHECK(hipDeviceSynchronize());
+    
     // Copy V: shape [batch_size, n_kv_heads * head_dim]
     int v_offset = (p->n_attn_heads + p->n_kv_heads) * head_dim;
     for (int b = 0; b < BATCH_SIZE; b++)
@@ -759,27 +791,28 @@ void attention_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size)
         float *dst = s->v + 1LL * b * v_size;
         HIP_CHECK(hipMemcpy(dst, src, v_size * sizeof(float), hipMemcpyDeviceToDevice));
     }
-
+    // HIP_CHECK(hipDeviceSynchronize());
+    
     // Apply rotary embeddings
     dim3 rope_grid(batch_size, p->n_attn_heads);
     dim3 rope_block(head_dim / 2);
     {
-        TIME_SCOPE(apply_rope_timer);
         apply_rotary_emb_kernel<<<rope_grid, rope_block>>>(
             s->q, s->cos_vals, s->sin_vals, s->positions, batch_size, p->n_attn_heads, head_dim);
         HIP_CHECK(hipGetLastError());
     }
-
+    // HIP_CHECK(hipDeviceSynchronize());
+    
     rope_grid.y = p->n_kv_heads;
     apply_rotary_emb_kernel<<<rope_grid, rope_block>>>(
         s->k, s->cos_vals, s->sin_vals, s->positions, batch_size, p->n_kv_heads, head_dim);
     HIP_CHECK(hipGetLastError());
-
+    // HIP_CHECK(hipDeviceSynchronize());
+    
     // Update KV cache - NEW: Proper GPU kernel
     dim3 kv_grid(batch_size, (kv_dim + 31) / 32);
     dim3 kv_block(1, 32);
     {
-        TIME_SCOPE(update_kv_cache_timer);
         update_kv_cache_kernel<<<kv_grid, kv_block>>>(
             s->key_cache, s->value_cache, s->k, s->v, s->positions, batch_size,
             p->n_layers, layer_idx, MAX_SEQ_LEN, kv_dim);
@@ -850,55 +883,17 @@ void attention_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size)
 
 
 
-constexpr int N_MLP_STREAMS = 4; // tune me (4–8 is usually good)
-
-static hipStream_t sGather = nullptr, sScatter = nullptr;
-static hipStream_t sMLP[N_MLP_STREAMS];
-static bool streams_inited = false;
-
 void moe_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size)
 {
-    // ===== timers =====
-    static Timer rms_norm_timer("RMSNorm_moe", true);
-    static Timer matmul_kernel_simple_timer("MatMulKernelSimple_moe", true);
-    static Timer add_bias_timer("AddBias_moe", true);
-    static Timer topk_kernel_timer("TopKKernel_moe", true);
-    static Timer softmax_kernel_timer("SoftmaxKernel_moe", true);
-    static Timer gather_expert_inputs_kernel_timer("GatherExpertInputsKernel_moe", true);
-    static Timer expert_agg_kernel_timer("ExpertAggKernel_moe", true);
-    static Timer scatter_expert_outputs_kernel_timer("ScatterExpertOutputsKernel_moe", true);
-    static Timer accumulate_kernel_timer("AccumulateKernel_moe", true);
-    static Timer split_gate_up_kernel_timer("SplitGateUpKernel_moe", true);
-    static Timer swiglu_kernel_timer("SwigluKernel_moe", true);
-
     Config *p = &gpu_t->config;
     GPURunState *s = &gpu_t->state;
     GPUTransformerWeights *w = &gpu_t->weights;
-
+    CPUBuffers *cpu_buf = &gpu_t->cpu_buffers;
+    
     const int hidden_dim = p->hidden_dim;
     const int intermediate_dim = p->intermediate_dim;
     const int n_experts = p->n_experts;
     const int experts_per_token = p->experts_per_token;
-
-    // ===== init streams once =====
-    if (!streams_inited)
-    {
-        HIP_CHECK(hipStreamCreateWithFlags(&sGather, hipStreamNonBlocking));
-        HIP_CHECK(hipStreamCreateWithFlags(&sScatter, hipStreamNonBlocking));
-        for (int i = 0; i < N_MLP_STREAMS; ++i)
-            HIP_CHECK(hipStreamCreateWithFlags(&sMLP[i], hipStreamNonBlocking));
-        streams_inited = true;
-    }
-
-    // ===== pinned host scratch (reused across calls) =====
-    static int *h_expert_counts_pinned = nullptr;
-    static int *h_expert_offsets_pinned = nullptr;
-    if (!h_expert_counts_pinned)
-    {
-        HIP_CHECK(hipHostMalloc((void **)&h_expert_counts_pinned, n_experts * sizeof(int)));
-        HIP_CHECK(hipHostMalloc((void **)&h_expert_offsets_pinned, n_experts * sizeof(int)));
-    }
-
     // ===== per-call events =====
     hipEvent_t evRouterDone, evPermuteDone;
     HIP_CHECK(hipEventCreateWithFlags(&evRouterDone, hipEventDisableTiming));
@@ -915,103 +910,97 @@ void moe_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size)
     {
         dim3 norm_grid(batch_size);
         dim3 norm_block(THREADS_PER_BLOCK);
-        TIME_SCOPE(rms_norm_timer);
-        rmsnorm_kernel<<<norm_grid, norm_block, 0, sGather>>>(
+        rmsnorm_kernel<<<norm_grid, norm_block, 0, cpu_buf->sGather>>>(
             s->t, s->x, w->rms_ffn_w + (size_t)layer_idx * hidden_dim,
             batch_size, hidden_dim);
     }
     HIP_CHECK(hipGetLastError());
 
     {
-        TIME_SCOPE(matmul_kernel_simple_timer);
         // [B,H] x [H,E] -> [B,E]
         matmul(s->router_score, s->t,
                w->w_router + (size_t)layer_idx * hidden_dim * n_experts,
-               batch_size, hidden_dim, n_experts, sGather);
+               batch_size, hidden_dim, n_experts, cpu_buf->sGather);
     }
     {
-        TIME_SCOPE(add_bias_timer);
         const int elems = batch_size * n_experts;
         add_bias_kernel<<<(elems + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK,
-                          THREADS_PER_BLOCK, 0, sGather>>>(
+                          THREADS_PER_BLOCK, 0, cpu_buf->sGather>>>(
             s->router_score, w->b_router + (size_t)layer_idx * n_experts,
             batch_size, n_experts);
     }
     {
-        TIME_SCOPE(topk_kernel_timer);
-        topk_kernel<<<batch_size, 1, 0, sGather>>>(
+        topk_kernel<<<batch_size, 1, 0, cpu_buf->sGather>>>(
             s->topk_v, s->topk_i, s->router_score,
             batch_size, n_experts, experts_per_token);
     }
     {
-        TIME_SCOPE(softmax_kernel_timer);
         dim3 norm_block(THREADS_PER_BLOCK);
-        softmax_kernel<<<batch_size, norm_block, 0, sGather>>>(
+        softmax_kernel<<<batch_size, norm_block, 0, cpu_buf->sGather>>>(
             s->topk_v, batch_size, experts_per_token);
     }
-    HIP_CHECK(hipEventRecord(evRouterDone, sGather));
+    HIP_CHECK(hipEventRecord(evRouterDone, cpu_buf->sGather));
 
     // ===== 2) GATHER on sGather: count -> prefix-sum(host) -> offsets H2D -> permute =====
     {
-        TIME_SCOPE(gather_expert_inputs_kernel_timer);
 
-        HIP_CHECK(hipStreamWaitEvent(sGather, evRouterDone, 0));
+        HIP_CHECK(hipStreamWaitEvent(cpu_buf->sGather, evRouterDone, 0));
 
-        HIP_CHECK(hipMemsetAsync(s->d_expert_counts, 0, n_experts * sizeof(int), sGather));
+        HIP_CHECK(hipMemsetAsync(s->d_expert_counts, 0, n_experts * sizeof(int), cpu_buf->sGather));
         const dim3 count_grid((batch_size + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK);
-        count_tokens_per_expert_kernel<<<count_grid, THREADS_PER_BLOCK, 0, sGather>>>(
+        count_tokens_per_expert_kernel<<<count_grid, THREADS_PER_BLOCK, 0, cpu_buf->sGather>>>(
             s->topk_i, s->d_expert_counts, batch_size, experts_per_token);
         HIP_CHECK(hipGetLastError());
 
         // counts D2H (async), then sync sGather to use them on CPU
-        HIP_CHECK(hipMemcpyAsync(h_expert_counts_pinned, s->d_expert_counts,
-                                 n_experts * sizeof(int), hipMemcpyDeviceToHost, sGather));
-        HIP_CHECK(hipStreamSynchronize(sGather)); // ensure counts available on host
+        HIP_CHECK(hipMemcpyAsync(cpu_buf->expert_counts, s->d_expert_counts,
+                                 n_experts * sizeof(int), hipMemcpyDeviceToHost, cpu_buf->sGather));
+        HIP_CHECK(hipStreamSynchronize(cpu_buf->sGather)); // ensure counts available on host
 
         // host prefix-sum -> offsets
         total_tokens = 0;
         for (int i = 0; i < n_experts; ++i)
         {
-            h_expert_offsets_pinned[i] = total_tokens;
-            total_tokens += h_expert_counts_pinned[i];
+            cpu_buf->expert_offsets[i] = total_tokens;
+            total_tokens += cpu_buf->expert_counts[i];
         }
 
         // offsets H2D (async)
-        HIP_CHECK(hipMemcpyAsync(s->d_expert_offsets, h_expert_offsets_pinned,
-                                 n_experts * sizeof(int), hipMemcpyHostToDevice, sGather));
+        HIP_CHECK(hipMemcpyAsync(s->d_expert_offsets, cpu_buf->expert_offsets,
+                                 n_experts * sizeof(int), hipMemcpyHostToDevice, cpu_buf->sGather));
 
         // permute
-        HIP_CHECK(hipMemsetAsync(s->d_expert_write_idx, 0, n_experts * sizeof(int), sGather));
+        HIP_CHECK(hipMemsetAsync(s->d_expert_write_idx, 0, n_experts * sizeof(int), cpu_buf->sGather));
         const dim3 permute_grid(batch_size);
         const dim3 permute_block(256);
         int shared_mem_size = experts_per_token * sizeof(int); // For destination_indices
-        permute_expert_inputs_kernel<<<permute_grid, permute_block, shared_mem_size, sGather>>>(
+        permute_expert_inputs_kernel<<<permute_grid, permute_block, shared_mem_size, cpu_buf->sGather>>>(
             s->t, s->topk_i, s->topk_v, s->d_expert_offsets, s->d_expert_write_idx,
             batch_size, hidden_dim, experts_per_token,
             s->expert_input_buffer, s->expert_indices, s->expert_weights);
         HIP_CHECK(hipGetLastError());
 
-        HIP_CHECK(hipEventRecord(evPermuteDone, sGather));
+        HIP_CHECK(hipEventRecord(evPermuteDone, cpu_buf->sGather));
     }
 
     // ===== CRITICAL FIX: Zero buffer AFTER gather completes =====
     // Đợi gather hoàn thành trước khi zero buffer trên sScatter
-    HIP_CHECK(hipStreamWaitEvent(sScatter, evPermuteDone, 0));
+    HIP_CHECK(hipStreamWaitEvent(cpu_buf->sScatter, evPermuteDone, 0));
     HIP_CHECK(hipMemsetAsync(s->e_agg, 0,
                              (size_t)batch_size * hidden_dim * sizeof(float),
-                             sScatter));
+                             cpu_buf->sScatter));
 
     // ===== 3) EXPERT MLPs on multiple streams, each waits on permute =====
     for (int expert_id = 0; expert_id < n_experts; ++expert_id)
     {
-        const int h_batch_count = h_expert_counts_pinned[expert_id];
+        const int h_batch_count = cpu_buf->expert_counts[expert_id];
         if (h_batch_count == 0)
             continue;
 
-        hipStream_t st = sMLP[expert_id % N_MLP_STREAMS];
+        hipStream_t st = cpu_buf->sMLP[expert_id % N_MLP_STREAMS];
         HIP_CHECK(hipStreamWaitEvent(st, evPermuteDone, 0));
 
-        const int expert_tok_off = h_expert_offsets_pinned[expert_id];
+        const int expert_tok_off = cpu_buf->expert_offsets[expert_id];
 
         float *expert_input_ptr = s->expert_input_buffer + (size_t)expert_tok_off * hidden_dim;
         float *mlp1_out_ptr = s->mlp1_out + (size_t)expert_tok_off * (2 * intermediate_dim);
@@ -1022,7 +1011,6 @@ void moe_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size)
 
         // MLP1 (Gate/Up) — MXFP4
         {
-            TIME_SCOPE(matmul_kernel_simple_timer);
             const size_t w_off1 = ((size_t)layer_idx * n_experts + expert_id) * (size_t)(2 * intermediate_dim) * hidden_dim;
             const size_t w_packed_off1 = w_off1 / 2; // 2 FP4 / byte
             const size_t w_scale_off1 = w_off1 / MXFP4_BLOCK_SIZE;
@@ -1037,7 +1025,6 @@ void moe_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size)
 
         // split + swiglu
         {
-            TIME_SCOPE(split_gate_up_kernel_timer);
             const int elems = h_batch_count * intermediate_dim;
             const dim3 grid((elems + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK);
             split_gate_up_kernel<<<grid, THREADS_PER_BLOCK, 0, st>>>(
@@ -1046,7 +1033,6 @@ void moe_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size)
                 h_batch_count, intermediate_dim);
         }
         {
-            TIME_SCOPE(swiglu_kernel_timer);
             const int elems = h_batch_count * intermediate_dim;
             const dim3 grid((elems + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK);
             swiglu_kernel<<<grid, THREADS_PER_BLOCK, 0, st>>>(
@@ -1056,7 +1042,6 @@ void moe_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size)
 
         // MLP2 (Down) — MXFP4
         {
-            TIME_SCOPE(matmul_kernel_simple_timer);
             const size_t w_off2 = ((size_t)layer_idx * n_experts + expert_id) * (size_t)hidden_dim * intermediate_dim;
             const size_t w_packed_off2 = w_off2 / 2;
             const size_t w_scale_off2 = w_off2 / MXFP4_BLOCK_SIZE;
@@ -1071,7 +1056,6 @@ void moe_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size)
 
         // bias
         {
-            TIME_SCOPE(add_bias_timer);
             const int elems = h_batch_count * hidden_dim;
             const dim3 grid((elems + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK);
             add_bias_kernel<<<grid, THREADS_PER_BLOCK, 0, st>>>(
@@ -1084,18 +1068,17 @@ void moe_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size)
 
     // record one "done" event per MLP stream (tail of each queue)
     for (int i = 0; i < N_MLP_STREAMS; ++i)
-        HIP_CHECK(hipEventRecord(evExpertsDone[i], sMLP[i]));
+        HIP_CHECK(hipEventRecord(evExpertsDone[i], cpu_buf->sMLP[i]));
 
     // ===== 4) SCATTER on sScatter, after all MLP streams =====
     for (int i = 0; i < N_MLP_STREAMS; ++i)
-        HIP_CHECK(hipStreamWaitEvent(sScatter, evExpertsDone[i], 0));
+        HIP_CHECK(hipStreamWaitEvent(cpu_buf->sScatter, evExpertsDone[i], 0));
 
     if (total_tokens > 0)
     {
-        TIME_SCOPE(scatter_expert_outputs_kernel_timer);
         const int elems = total_tokens * hidden_dim;
         const dim3 grid((elems + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK);
-        scatter_expert_outputs_kernel<<<grid, THREADS_PER_BLOCK, 0, sScatter>>>(
+        scatter_expert_outputs_kernel<<<grid, THREADS_PER_BLOCK, 0, cpu_buf->sScatter>>>(
             s->e_agg, s->expert_output_buffer, s->expert_indices, s->expert_weights,
             total_tokens, hidden_dim);
         HIP_CHECK(hipGetLastError());
@@ -1103,16 +1086,15 @@ void moe_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size)
 
     // ===== 5) Residual on sScatter =====
     {
-        TIME_SCOPE(accumulate_kernel_timer);
         const int elems = batch_size * hidden_dim;
         accumulate_kernel<<<(elems + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK,
-                            THREADS_PER_BLOCK, 0, sScatter>>>(
+                            THREADS_PER_BLOCK, 0, cpu_buf->sScatter>>>(
             s->x, s->e_agg, 1.0f, batch_size, hidden_dim);
         HIP_CHECK(hipGetLastError());
     }
 
     // Ensure all computations complete before returning
-    HIP_CHECK(hipStreamSynchronize(sScatter));
+    HIP_CHECK(hipStreamSynchronize(cpu_buf->sScatter));
 
     // destroy events
     HIP_CHECK(hipEventDestroy(evRouterDone));
@@ -1123,10 +1105,6 @@ void moe_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size)
 
 float *forward_batch_gpu(GPUTransformer *gpu_t, int *tokens, int batch_size)
 {
-    static Timer copy_embed_timer("copy_embeddings_forward", true);
-    static Timer rms_norm_timer("RMSNorm_forward", true);
-    static Timer matmul_kernel_simple_timer("MatMulKernelSimple_forward", true);
-
     Config *p = &gpu_t->config;
     GPURunState *s = &gpu_t->state;
     GPUTransformerWeights *w = &gpu_t->weights;
@@ -1141,7 +1119,6 @@ float *forward_batch_gpu(GPUTransformer *gpu_t, int *tokens, int batch_size)
     // Copy token embeddings
     dim3 embed_grid((batch_size * hidden_dim + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK);
     {
-        TIME_SCOPE(copy_embed_timer);
         copy_embeddings_kernel<<<embed_grid, THREADS_PER_BLOCK>>>(
             s->x, w->token_embedding_table, s->current_tokens, batch_size, hidden_dim);
         HIP_CHECK(hipGetLastError());
@@ -1156,7 +1133,6 @@ float *forward_batch_gpu(GPUTransformer *gpu_t, int *tokens, int batch_size)
     dim3 final_norm_grid(batch_size);
     dim3 final_norm_block(THREADS_PER_BLOCK);
     {
-        TIME_SCOPE(rms_norm_timer);
         rmsnorm_kernel<<<final_norm_grid, final_norm_block>>>(
             s->x, s->x, w->rms_out_w, batch_size, hidden_dim);
         HIP_CHECK(hipGetLastError());
@@ -1168,189 +1144,198 @@ float *forward_batch_gpu(GPUTransformer *gpu_t, int *tokens, int batch_size)
     grid_dim.y = (p->vocab_size + block_dim.y - 1) / block_dim.y; // Ceiling division
 
     {
-        TIME_SCOPE(matmul_kernel_simple_timer);
         // Launch the simple kernel
         matmul(
             s->logits, s->x, w->out, batch_size, hidden_dim, p->vocab_size);
     }
     // Copy logits back to CPU (you might want to keep this on GPU for sampling)
-    static float *h_logits = nullptr;
-    if (!h_logits)
-    {
-        h_logits = (float *)malloc(batch_size * p->vocab_size * sizeof(float));
-    }
-    HIP_CHECK(hipMemcpy(h_logits, s->logits, batch_size * p->vocab_size * sizeof(float), hipMemcpyDeviceToHost));
-    return h_logits;
+    HIP_CHECK(hipMemcpy(cpu_buf->logits, s->logits, batch_size * p->vocab_size * sizeof(float), hipMemcpyDeviceToHost));
+    return cpu_buf->logits;
 }
 
-long long continuous_batching_inference(GPUTransformer *gpu_t, Tokenizer *tokenizer,
+long long continuous_batching_inference(Tokenizer *tokenizer,
                                         Sampler *sampler, Requests *requests)
 {
-    Config *p = &gpu_t->config;
-    CPUBuffers *cpu_buf = &gpu_t->cpu_buffers;
-    GPURunState *state = &gpu_t->state;
     long long total_tokens_generated = 0;
-
-    // Initialize
-    cpu_buf->next_request_idx = 0;
-
-    // Initialize all slots to inactive
-    for (int slot = 0; slot < BATCH_SIZE; slot++)
+    int total_requests = requests->num_reqs;
+    #pragma omp parallel num_threads(num_gpus) reduction(+:total_tokens_generated)
     {
-        cpu_buf->slot_active_cpu[slot] = false;
-        cpu_buf->request_mapping_cpu[slot] = -1;
-        cpu_buf->seq_lengths_cpu[slot] = 0;
-        cpu_buf->positions[slot] = 0;
-        cpu_buf->finished[slot] = true;
-    }
+        int gpu_id = omp_get_thread_num();
+        HIP_CHECK(hipSetDevice(gpu_id));
+        
+        GPUTransformer *gpu_t = gpu_transformers[gpu_id];
 
-    // Fill initial batch with first requests
-    for (int slot = 0; slot < BATCH_SIZE && cpu_buf->next_request_idx < requests->num_reqs; slot++)
-    {
-        int req_idx = cpu_buf->next_request_idx++;
-        const char *input_seq = get_str_req_ptr(requests, req_idx);
+        int requests_per_gpu = requests->num_reqs / num_gpus;
+        int extra = requests->num_reqs % num_gpus;
 
-        // Encode prompt
-        encode(tokenizer, input_seq, -1, -1, cpu_buf->prompt_tokens[slot],
-               &cpu_buf->prompt_lens[slot], p->initial_context_length);
+        int local_request = requests_per_gpu + (gpu_id < extra ? 1 : 0);
+        int start_request = gpu_id * requests_per_gpu + (gpu_id < extra ? gpu_id : extra);
+        int end_request = start_request + local_request;
 
-        if (cpu_buf->prompt_lens[slot] < 1)
-        {
-            fprintf(stderr, "Error: prompt too short for request %d\n", req_idx);
-            cpu_buf->prompt_lens[slot] = 1;
-            cpu_buf->prompt_tokens[slot][0] = 1; // BOS token
-        }
+        Config *p = &gpu_t->config;
+        CPUBuffers *cpu_buf = &gpu_t->cpu_buffers;
+        GPURunState *state = &gpu_t->state;
 
-        // Initialize slot
-        cpu_buf->request_mapping_cpu[slot] = req_idx;
-        cpu_buf->slot_active_cpu[slot] = true;
-        cpu_buf->seq_lengths_cpu[slot] = 0;
-        cpu_buf->positions[slot] = 0;
-        cpu_buf->finished[slot] = false;
-        cpu_buf->current_tokens[slot] = cpu_buf->prompt_tokens[slot][0];
-    }
+        // Initialize
+        cpu_buf->next_request_idx = start_request;
 
-    // Copy initial state to GPU
-    HIP_CHECK(hipMemcpy(state->slot_active, cpu_buf->slot_active_cpu,
-                        BATCH_SIZE * sizeof(bool), hipMemcpyHostToDevice));
-    HIP_CHECK(hipMemcpy(state->request_mapping, cpu_buf->request_mapping_cpu,
-                        BATCH_SIZE * sizeof(int), hipMemcpyHostToDevice));
-    HIP_CHECK(hipMemcpy(state->seq_lengths, cpu_buf->seq_lengths_cpu,
-                        BATCH_SIZE * sizeof(int), hipMemcpyHostToDevice));
-
-    // Main generation loop
-    int max_steps = requests->max_seq_len;
-    bool has_active_slots = true;
-
-    while (has_active_slots)
-    {
-        // Forward pass on all slots (inactive ones will be skipped internally)
-        float *logits = forward_batch_gpu(gpu_t, cpu_buf->current_tokens, BATCH_SIZE);
-
-        // Process each slot
-        has_active_slots = false;
+        // Initialize all slots to inactive
         for (int slot = 0; slot < BATCH_SIZE; slot++)
         {
-            if (!cpu_buf->slot_active_cpu[slot])
-                continue;
+            cpu_buf->slot_active_cpu[slot] = false;
+            cpu_buf->request_mapping_cpu[slot] = -1;
+            cpu_buf->seq_lengths_cpu[slot] = 0;
+            cpu_buf->positions[slot] = 0;
+            cpu_buf->finished[slot] = true;
+        }
 
-            has_active_slots = true;
-            int req_idx = cpu_buf->request_mapping_cpu[slot];
-            int pos = cpu_buf->positions[slot];
-            float *logits_slot = logits + slot * p->vocab_size;
+        // Fill initial batch with first requests
+        for (int slot = 0; slot < BATCH_SIZE && cpu_buf->next_request_idx < end_request; slot++)
+        {
+            int req_idx = cpu_buf->next_request_idx++;
+            const char *input_seq = get_str_req_ptr(requests, req_idx);
 
-            int next_token;
-            // Advance position first
-            pos++;
+            // Encode prompt
+            encode(tokenizer, input_seq, -1, -1, cpu_buf->prompt_tokens[slot],
+                &cpu_buf->prompt_lens[slot], p->initial_context_length);
 
-            if (pos < cpu_buf->prompt_lens[slot])
+            if (cpu_buf->prompt_lens[slot] < 1)
             {
-                // Still processing prompt - force next prompt token
-                next_token = cpu_buf->prompt_tokens[slot][pos];
-            }
-            else
-            {
-                // Generate new token
-                next_token = sample(sampler, logits_slot);
-
-                // Save generated token
-                int *output_tokens = get_tok_gen_ptr(requests, req_idx);
-                int gen_pos = pos - cpu_buf->prompt_lens[slot];
-                if (gen_pos >= 0 && gen_pos < requests->max_seq_len)
-                {
-                    output_tokens[gen_pos] = next_token;
-                    total_tokens_generated++;
-                }
+                fprintf(stderr, "Error: prompt too short for request %d\n", req_idx);
+                cpu_buf->prompt_lens[slot] = 1;
+                cpu_buf->prompt_tokens[slot][0] = 1; // BOS token
             }
 
-            // Check for completion
-            bool completed = (next_token == 199999 || next_token == 200002 ||
-                              pos >= max_steps - 1 || pos >= MAX_SEQ_LEN - 2);
+            // Initialize slot
+            cpu_buf->request_mapping_cpu[slot] = req_idx;
+            cpu_buf->slot_active_cpu[slot] = true;
+            cpu_buf->seq_lengths_cpu[slot] = 0;
+            cpu_buf->positions[slot] = 0;
+            cpu_buf->finished[slot] = false;
+            cpu_buf->current_tokens[slot] = cpu_buf->prompt_tokens[slot][0];
+        }
 
-            if (completed)
+        // Copy initial state to GPU
+        HIP_CHECK(hipMemcpy(state->slot_active, cpu_buf->slot_active_cpu,
+                            BATCH_SIZE * sizeof(bool), hipMemcpyHostToDevice));
+        HIP_CHECK(hipMemcpy(state->request_mapping, cpu_buf->request_mapping_cpu,
+                            BATCH_SIZE * sizeof(int), hipMemcpyHostToDevice));
+        HIP_CHECK(hipMemcpy(state->seq_lengths, cpu_buf->seq_lengths_cpu,
+                            BATCH_SIZE * sizeof(int), hipMemcpyHostToDevice));
+
+        // Main generation loop
+        int max_steps = requests->max_seq_len;
+        bool has_active_slots = true;
+
+        while (has_active_slots)
+        {
+            // Forward pass on all slots (inactive ones will be skipped internally)
+            float *logits = forward_batch_gpu(gpu_t, cpu_buf->current_tokens, BATCH_SIZE);
+
+            // Process each slot
+            has_active_slots = false;
+            for (int slot = 0; slot < BATCH_SIZE; slot++)
             {
-                if (next_token == 199999 || next_token == 200002)
+                if (!cpu_buf->slot_active_cpu[slot])
+                    continue;
+
+                has_active_slots = true;
+                int req_idx = cpu_buf->request_mapping_cpu[slot];
+                int pos = cpu_buf->positions[slot];
+                float *logits_slot = logits + slot * p->vocab_size;
+
+                int next_token;
+                // Advance position first
+                pos++;
+
+                if (pos < cpu_buf->prompt_lens[slot])
                 {
-                    fprintf(stderr, "Request %d received EOS token %d at position %d\n", req_idx, next_token, pos);
-                }
-                // fprintf(stderr, "Request %d completed at position %d with token %d\n", req_idx, pos, next_token);
-                // Mark end of generation
-                int *output_tokens = get_tok_gen_ptr(requests, req_idx);
-                int gen_pos = pos - cpu_buf->prompt_lens[slot] + 1;
-                if (gen_pos >= 0 && gen_pos < requests->max_seq_len)
-                {
-                    output_tokens[gen_pos] = -1; // End marker
-                }
-
-                // Try to assign a new request to this slot
-                if (cpu_buf->next_request_idx < requests->num_reqs)
-                {
-                    // Get next request
-                    req_idx = cpu_buf->next_request_idx++;
-                    const char *input_seq = get_str_req_ptr(requests, req_idx);
-
-                    // Encode prompt
-                    encode(tokenizer, input_seq, -1, -1, cpu_buf->prompt_tokens[slot],
-                           &cpu_buf->prompt_lens[slot], p->initial_context_length);
-
-                    if (cpu_buf->prompt_lens[slot] < 1)
-                    {
-                        fprintf(stderr, "Error: prompt too short for request %d\n", req_idx);
-                        cpu_buf->prompt_lens[slot] = 1;
-                        cpu_buf->prompt_tokens[slot][0] = 1; // BOS token
-                    }
-
-                    // Reinitialize slot with new request
-                    cpu_buf->request_mapping_cpu[slot] = req_idx;
-                    cpu_buf->positions[slot] = 0;
-                    cpu_buf->seq_lengths_cpu[slot] = 0;
-                    cpu_buf->current_tokens[slot] = cpu_buf->prompt_tokens[slot][0];
-                    // Slot remains active
+                    // Still processing prompt - force next prompt token
+                    next_token = cpu_buf->prompt_tokens[slot][pos];
                 }
                 else
                 {
-                    // No more requests, deactivate slot
-                    cpu_buf->slot_active_cpu[slot] = false;
-                    cpu_buf->request_mapping_cpu[slot] = -1;
+                    // Generate new token
+                    next_token = sample(sampler, logits_slot);
+
+                    // Save generated token
+                    int *output_tokens = get_tok_gen_ptr(requests, req_idx);
+                    int gen_pos = pos - cpu_buf->prompt_lens[slot];
+                    if (gen_pos >= 0 && gen_pos < requests->max_seq_len)
+                    {
+                        output_tokens[gen_pos] = next_token;
+                        total_tokens_generated++;
+                    }
+                }
+
+                // Check for completion
+                bool completed = (next_token == 199999 || next_token == 200002 ||
+                                pos >= max_steps - 1 || pos >= MAX_SEQ_LEN - 2);
+
+                if (completed)
+                {
+                    // fprintf(stderr, "Request %d completed at position %d with token %d\n", req_idx, pos, next_token);
+                    // Mark end of generation
+                    int *output_tokens = get_tok_gen_ptr(requests, req_idx);
+                    int gen_pos = pos - cpu_buf->prompt_lens[slot] + 1;
+                    if (gen_pos >= 0 && gen_pos < requests->max_seq_len)
+                    {
+                        output_tokens[gen_pos] = -1; // End marker
+                    }
+
+                    // Try to assign a new request to this slot
+                    if (cpu_buf->next_request_idx < end_request)
+                    {
+                        // Get next request
+                        req_idx = cpu_buf->next_request_idx++;
+                        const char *input_seq = get_str_req_ptr(requests, req_idx);
+
+                        // Encode prompt
+                        encode(tokenizer, input_seq, -1, -1, cpu_buf->prompt_tokens[slot],
+                            &cpu_buf->prompt_lens[slot], p->initial_context_length);
+
+                        if (cpu_buf->prompt_lens[slot] < 1)
+                        {
+                            fprintf(stderr, "Error: prompt too short for request %d\n", req_idx);
+                            cpu_buf->prompt_lens[slot] = 1;
+                            cpu_buf->prompt_tokens[slot][0] = 1; // BOS token
+                        }
+
+                        // Reinitialize slot with new request
+                        cpu_buf->request_mapping_cpu[slot] = req_idx;
+                        cpu_buf->positions[slot] = 0;
+                        cpu_buf->seq_lengths_cpu[slot] = 0;
+                        cpu_buf->current_tokens[slot] = cpu_buf->prompt_tokens[slot][0];
+                        // Slot remains active
+                    }
+                    else
+                    {
+                        // No more requests, deactivate slot
+                        cpu_buf->slot_active_cpu[slot] = false;
+                        cpu_buf->request_mapping_cpu[slot] = -1;
+                    }
+                }
+                else
+                {
+                    // Continue generation
+                    cpu_buf->positions[slot] = pos;
+                    cpu_buf->seq_lengths_cpu[slot]++;
+                    cpu_buf->current_tokens[slot] = next_token;
                 }
             }
-            else
-            {
-                // Continue generation
-                cpu_buf->positions[slot] = pos;
-                cpu_buf->seq_lengths_cpu[slot]++;
-                cpu_buf->current_tokens[slot] = next_token;
-            }
-        }
 
-        // Update GPU state for next iteration
-        HIP_CHECK(hipMemcpy(state->slot_active, cpu_buf->slot_active_cpu,
-                            BATCH_SIZE * sizeof(bool), hipMemcpyHostToDevice));
-        HIP_CHECK(hipMemcpy(state->seq_lengths, cpu_buf->seq_lengths_cpu,
-                            BATCH_SIZE * sizeof(int), hipMemcpyHostToDevice));
-        HIP_CHECK(hipMemcpy(state->positions, cpu_buf->positions,
-                            BATCH_SIZE * sizeof(int), hipMemcpyHostToDevice));
+            // Update GPU state for next iteration
+            HIP_CHECK(hipMemcpy(state->slot_active, cpu_buf->slot_active_cpu,
+                                BATCH_SIZE * sizeof(bool), hipMemcpyHostToDevice));
+            HIP_CHECK(hipMemcpy(state->seq_lengths, cpu_buf->seq_lengths_cpu,
+                                BATCH_SIZE * sizeof(int), hipMemcpyHostToDevice));
+            HIP_CHECK(hipMemcpy(state->positions, cpu_buf->positions,
+                                BATCH_SIZE * sizeof(int), hipMemcpyHostToDevice));
+        }
     }
+
+    int max_steps = gpu_transformers[0]->config.seq_len;
+    Config *p = gpu_transformers[0] ? &gpu_transformers[0]->config : nullptr;
 
     // Print results for all requests
     for (int req_idx = 0; req_idx < requests->num_reqs; req_idx++)
@@ -1389,144 +1374,11 @@ long long continuous_batching_inference(GPUTransformer *gpu_t, Tokenizer *tokeni
     return total_tokens_generated;
 }
 
-long long batched_generate_gpu(GPUTransformer *gpu_t, Tokenizer *tokenizer,
-                               Sampler *sampler, Requests *requests)
-{
-
-    Config *p = &gpu_t->config;
-    CPUBuffers *cpu_buf = &gpu_t->cpu_buffers;
-    long long total_tokens_generated = 0;
-
-    // Process requests in batches
-    for (int req_start = 0; req_start < requests->num_reqs; req_start += BATCH_SIZE)
-    {
-        int current_batch_size = (req_start + BATCH_SIZE > requests->num_reqs)
-                                     ? (requests->num_reqs - req_start)
-                                     : BATCH_SIZE;
-
-        // Initialize batch
-        for (int b = 0; b < current_batch_size; b++)
-        {
-            int req_idx = req_start + b;
-            const char *input_seq = get_str_req_ptr(requests, req_idx);
-
-            // Encode prompt
-            encode(tokenizer, input_seq, -1, -1, cpu_buf->prompt_tokens[b],
-                   &cpu_buf->prompt_lens[b], p->initial_context_length);
-
-            if (cpu_buf->prompt_lens[b] < 1)
-            {
-                fprintf(stderr, "Error: prompt too short for request %d\n", req_idx);
-                cpu_buf->prompt_lens[b] = 1;
-                cpu_buf->prompt_tokens[b][0] = 1; // BOS token
-            }
-
-            // Initialize sequence state
-            cpu_buf->positions[b] = 0;
-            cpu_buf->finished[b] = false;
-            cpu_buf->current_tokens[b] = cpu_buf->prompt_tokens[b][0];
-        }
-
-        // Generation loop
-        int max_steps = requests->max_seq_len;
-        int alive = current_batch_size;
-
-        for (int step = 0; step < max_steps && alive > 0; step++)
-        {
-            // Forward pass on GPU
-            float *logits = forward_batch_gpu(gpu_t, cpu_buf->current_tokens, current_batch_size);
-
-            // Sample next tokens (on CPU for now, could be moved to GPU)
-            for (int b = 0; b < current_batch_size; b++)
-            {
-                if (cpu_buf->finished[b])
-                    continue;
-
-                int req_idx = req_start + b;
-                int pos = cpu_buf->positions[b];
-                float *logits_b = logits + b * p->vocab_size;
-
-                int next_token;
-                // Advance position first
-                pos++;
-
-                if (pos < cpu_buf->prompt_lens[b])
-                {
-                    // Still processing prompt - force next prompt token
-                    next_token = cpu_buf->prompt_tokens[b][pos];
-                }
-                else
-                {
-                    // Generate new token
-                    next_token = sample(sampler, logits_b);
-
-                    // Save generated token
-                    int *output_tokens = get_tok_gen_ptr(requests, req_idx);
-                    int gen_pos = pos - cpu_buf->prompt_lens[b];
-                    if (gen_pos >= 0 && gen_pos < requests->max_seq_len)
-                    {
-                        output_tokens[gen_pos] = next_token;
-                        total_tokens_generated++;
-                    }
-                }
-
-                // Check for termination
-                if (next_token == 199999 || next_token == 200002 || pos >= max_steps - 1)
-                {
-                    --alive;
-                    cpu_buf->finished[b] = true;
-                    int *output_tokens = get_tok_gen_ptr(requests, req_idx);
-                    int gen_pos = pos - cpu_buf->prompt_lens[b] + 1;
-                    if (gen_pos >= 0 && gen_pos < requests->max_seq_len)
-                    {
-                        output_tokens[gen_pos] = -1; // End marker
-                    }
-                    continue;
-                }
-
-                // Update for next iteration
-                cpu_buf->positions[b] = pos;
-                cpu_buf->current_tokens[b] = next_token;
-            }
-        }
-
-        // Print results
-        for (int b = 0; b < current_batch_size; b++)
-        {
-            int req_idx = req_start + b;
-            const char *input_seq = get_str_req_ptr(requests, req_idx);
-            int *output_tokens = get_tok_gen_ptr(requests, req_idx);
-
-            // Print the original prompt string
-            safe_printf(input_seq);
-            printf("!");
-
-            // Decode and print generated tokens
-            int last_prompt_token = cpu_buf->prompt_tokens[b][cpu_buf->prompt_lens[b] - 1];
-            int prev_token = last_prompt_token;
-            for (int i = 0; i < max_steps; ++i)
-            {
-                int token = output_tokens[i];
-                if (token == -1)
-                    break;
-
-                const char *piece = decode_piece(tokenizer, prev_token, token);
-                safe_printf(piece);
-                prev_token = token;
-            }
-            printf("\n");
-        }
-        fflush(stdout);
-    }
-
-    return total_tokens_generated;
-}
-
 long long inference(Transformer *transformer, Tokenizer *tokenizer,
                     Sampler *sampler, Requests *requests)
 {
     // Use continuous batching for better throughput
-    return continuous_batching_inference(gpu_transformer, tokenizer, sampler, requests);
+    return continuous_batching_inference(tokenizer, sampler, requests);
 }
 
 /*
