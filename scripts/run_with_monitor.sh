@@ -64,7 +64,7 @@ run_inference() {
         --checkpoint ${MODELBIN_ROOT}/gpt-oss-20b.bin \
         -m getp \
         -i data/input.txt \
-        -o data/output.txt
+        -o data/output.txt -n 100
         # -n 64 \
     
     local exit_code=$?
