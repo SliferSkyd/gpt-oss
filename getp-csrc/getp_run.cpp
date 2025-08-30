@@ -688,27 +688,15 @@ void finish(Transformer *transformer, Tokenizer *tokenizer)
     }
 }
 
-
+static Timer attention("attention", true);
+static Timer moe("moe", true);
 
 void attention_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size)
 {
+    TIME_SCOPE(attention);
     Config *p = &gpu_t->config;
     GPURunState *s = &gpu_t->state;
     GPUTransformerWeights *w = &gpu_t->weights;
-
-    static Timer rms_norm_timer("RMSNorm_attention", true);
-    static Timer matmul_timer("MatMul_attention", true);
-    static Timer add_bias_timer("AddBias_attention", true);
-    static Timer apply_rope_timer("ApplyRoPE_attention", true);
-    static Timer update_kv_cache_timer("UpdateKVCache_attention", true);
-    static Timer attention_scores_kernel_timer("AttentionScoresKernel_attention", true);
-    static Timer add_sinks_kernel_timer("AddSinksKernel_attention", true);
-    static Timer softmax_kernel_timer("SoftmaxKernel_attention", true);
-    static Timer matmul_kernel_simple_timer("MatMulKernelSimple_attention", true);
-    static Timer attention_weighted_sum_kernel_timer("AttentionWeightedSumKernel_attention", true);
-    static Timer accumulate_kernel_timer("AccumulateKernel_attention", true);
-    static Timer fused_attention_kernel_timer("FusedAttentionKernel_attention", true);
-    static Timer fused_output_projection_timer("FusedOutputProjection_attention", true);
 
     int head_dim = p->head_dim;
     int hidden_dim = p->hidden_dim;
@@ -724,15 +712,8 @@ void attention_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size)
     }
     // HIP_CHECK(hipDeviceSynchronize());
 
-    dim3 matmul_grid(batch_size, ((p->n_attn_heads + 2 * p->n_kv_heads) * head_dim + 31) / 32);
-    dim3 matmul_block(32, min(32, THREADS_PER_BLOCK / 32));
     int qkv_weight_offset = layer_idx * hidden_dim * (head_dim * p->n_attn_heads + 2 * head_dim * p->n_kv_heads);
 
-    // Define block and grid dimensions
-    dim3 block_dim(32, 32); // A 2D block, e.g., 32x32 = 1024 threads.
-    dim3 grid_dim;
-    grid_dim.x = batch_size;
-    grid_dim.y = ((p->n_attn_heads + 2 * p->n_kv_heads) * head_dim + block_dim.y - 1) / block_dim.y; // Ceiling division
     {
         // QKV projection using safer matmul kernel - FIXED: Use GPU weight pointer
         matmul(
@@ -868,7 +849,6 @@ void attention_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size)
     int attn_bias_offset = layer_idx * hidden_dim;
 
     {
-        TIME_SCOPE(fused_output_projection_timer);
         int M = batch_size;
         int N = hidden_dim;
         int K = head_dim * p->n_attn_heads;
@@ -898,6 +878,7 @@ void attention_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size)
 
 void moe_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size)
 {
+    TIME_SCOPE(moe);
     Config *p = &gpu_t->config;
     GPURunState *s = &gpu_t->state;
     GPUTransformerWeights *w = &gpu_t->weights;
@@ -1116,7 +1097,7 @@ void moe_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size)
         HIP_CHECK(hipEventDestroy(evExpertsDone[i]));
 }
 
-float *forward_batch_gpu(GPUTransformer *gpu_t, int *tokens, int batch_size)
+int *forward_batch_gpu(GPUTransformer *gpu_t, int *tokens, int batch_size)
 {
     Config *p = &gpu_t->config;
     GPURunState *s = &gpu_t->state;
@@ -1161,9 +1142,10 @@ float *forward_batch_gpu(GPUTransformer *gpu_t, int *tokens, int batch_size)
         matmul(
             s->logits, s->x, w->out, batch_size, hidden_dim, p->vocab_size);
     }
+    sample_argmax(s->logits, s->current_tokens, batch_size, p->vocab_size);
     // Copy logits back to CPU (you might want to keep this on GPU for sampling)
-    HIP_CHECK(hipMemcpy(cpu_buf->logits, s->logits, batch_size * p->vocab_size * sizeof(float), hipMemcpyDeviceToHost));
-    return cpu_buf->logits;
+    HIP_CHECK(hipMemcpy(cpu_buf->current_tokens, s->current_tokens, batch_size * sizeof(int), hipMemcpyDeviceToHost));
+    return cpu_buf->current_tokens; 
 }
 
 long long continuous_batching_inference(Tokenizer *tokenizer,
@@ -1243,7 +1225,7 @@ long long continuous_batching_inference(Tokenizer *tokenizer,
         while (has_active_slots)
         {
             // Forward pass on all slots (inactive ones will be skipped internally)
-            float *logits = forward_batch_gpu(gpu_t, cpu_buf->current_tokens, BATCH_SIZE);
+            int *next_tokens = forward_batch_gpu(gpu_t, cpu_buf->current_tokens, BATCH_SIZE);
 
             // Process each slot
             has_active_slots = false;
@@ -1255,7 +1237,6 @@ long long continuous_batching_inference(Tokenizer *tokenizer,
                 has_active_slots = true;
                 int req_idx = cpu_buf->request_mapping_cpu[slot];
                 int pos = cpu_buf->positions[slot];
-                float *logits_slot = logits + slot * p->vocab_size;
 
                 int next_token;
                 // Advance position first
@@ -1269,7 +1250,7 @@ long long continuous_batching_inference(Tokenizer *tokenizer,
                 else
                 {
                     // Generate new token
-                    next_token = sample(sampler, logits_slot);
+                    next_token = next_tokens[slot];
 
                     // Save generated token
                     int *output_tokens = get_tok_gen_ptr(requests, req_idx);
