@@ -715,7 +715,6 @@ void attention_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size)
     int qkv_weight_offset = layer_idx * hidden_dim * (head_dim * p->n_attn_heads + 2 * head_dim * p->n_kv_heads);
 
     {
-        // QKV projection using safer matmul kernel - FIXED: Use GPU weight pointer
         matmul(
             s->qkv,
             s->t,
@@ -725,7 +724,6 @@ void attention_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size)
             (p->n_attn_heads + 2 * p->n_kv_heads) * head_dim);
         HIP_CHECK(hipGetLastError());
     }
-    // HIP_CHECK(hipDeviceSynchronize());
     
     HIP_CHECK(hipGetLastError());
     // Add bias - FIXED: Use GPU bias pointer and proper kernel
@@ -738,14 +736,14 @@ void attention_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size)
         HIP_CHECK(hipGetLastError());
     }
     // HIP_CHECK(hipDeviceSynchronize());
-    
+    /*
     // Copy Q, K, V from qkv buffer - SIMPLIFIED AND FIXED
     int q_size = p->n_attn_heads * head_dim;
     int k_size = p->n_kv_heads * head_dim;
     int v_size = p->n_kv_heads * head_dim;
 
     // Copy Q: shape [batch_size, n_attn_heads * head_dim]
-    for (int b = 0; b < BATCH_SIZE; b++)
+    for (int b = 0; b < batch_size; b++)
     {
         float *src = s->qkv + 1LL * b * (p->n_attn_heads + 2 * p->n_kv_heads) * head_dim;
         float *dst = s->q + 1LL * b * q_size;
@@ -755,7 +753,7 @@ void attention_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size)
     
     // Copy K: shape [batch_size, n_kv_heads * head_dim]
     int k_offset = p->n_attn_heads * head_dim;
-    for (int b = 0; b < BATCH_SIZE; b++)
+    for (int b = 0; b < batch_size; b++)
     {
         float *src = s->qkv + 1LL * b * (p->n_attn_heads + 2 * p->n_kv_heads) * head_dim + k_offset;
         float *dst = s->k + 1LL * b * k_size;
@@ -765,7 +763,7 @@ void attention_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size)
     
     // Copy V: shape [batch_size, n_kv_heads * head_dim]
     int v_offset = (p->n_attn_heads + p->n_kv_heads) * head_dim;
-    for (int b = 0; b < BATCH_SIZE; b++)
+    for (int b = 0; b < batch_size; b++)
     {
         float *src = s->qkv + 1LL * b * (p->n_attn_heads + 2 * p->n_kv_heads) * head_dim + v_offset;
         float *dst = s->v + 1LL * b * v_size;
@@ -788,10 +786,20 @@ void attention_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size)
         s->k, s->cos_vals, s->sin_vals, s->positions, batch_size, p->n_kv_heads, head_dim);
     HIP_CHECK(hipGetLastError());
     // HIP_CHECK(hipDeviceSynchronize());
-    
+    */
+    launch_split_qkv_apply_rotary(
+        /*qkv=*/s->qkv,
+        /*q=*/s->q, /*k=*/s->k, /*v=*/s->v,
+        /*cos/sin=*/s->cos_vals, s->sin_vals,
+        /*pos=*/s->positions,
+        /*sizes=*/batch_size, p->n_attn_heads, p->n_kv_heads, p->head_dim,
+        /*stream=*/0);
+    HIP_CHECK(hipGetLastError());
+
+
     // Update KV cache - NEW: Proper GPU kernel
-    dim3 kv_grid(batch_size, (kv_dim + 31) / 32);
-    dim3 kv_block(1, 32);
+    dim3 kv_grid(batch_size, (kv_dim + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK);
+    dim3 kv_block(1, THREADS_PER_BLOCK);
     {
         update_kv_cache_kernel<<<kv_grid, kv_block>>>(
             s->key_cache, s->value_cache, s->k, s->v, s->positions, batch_size,
