@@ -33,6 +33,7 @@ std::mutex debug_mutex;
 
 // Variadic macro hỗ trợ format như printf
 #define THREAD_DEBUG(fmt, ...) do { \
+    HIP_CHECK(hipDeviceSynchronize()); \
     std::lock_guard<std::mutex> lock(debug_mutex); \
     std::printf("[Thread %lu] " fmt, \
                 (unsigned long)(omp_get_thread_num()), \
@@ -1074,37 +1075,57 @@ static inline int to_local_id(int expert_id, int local_base) {
 }
 
 __global__ void pack_remote_tokens_kernel(
-    const float * __restrict__ d_t, // [B, H]
-    const int   * __restrict__ topk_i, // [B, k] global expert ids
-    const float * __restrict__ topk_v, // [B, k]
+    const float * __restrict__ d_t,           // [B, H]
+    const int   * __restrict__ topk_i,        // [B, k] global expert ids
+    const float * __restrict__ topk_v,        // [B, k]
     int B, int H, int k,
     int peer_base, int peer_n,
-    int * __restrict__ d_send_token_ids,   // [B*k]
-    int * __restrict__ d_send_topk_i,      // [B*k] (peer-local expert ids)
-    float * __restrict__ d_send_topk_v,    // [B*k]
-    float * __restrict__ d_send_hidden,    // [B*k, H]
-    int * __restrict__ d_send_count)       // [1]
+    int max_rows,                              // = B*k (capacity of d_send_*)
+    int * __restrict__ d_send_token_ids,       // [B*k]
+    int * __restrict__ d_send_topk_i,          // [B*k]
+    float * __restrict__ d_send_topk_v,        // [B*k]
+    float * __restrict__ d_send_hidden,        // [B*k, H]
+    int * __restrict__ d_send_count)           // [1]
 {
-    int b = blockIdx.x; // block-per-token
+    const int b = blockIdx.x;
     if (b >= B) return;
 
-    // Each block copies one row; map threads over H
-    for (int j = threadIdx.x; j < k; j += blockDim.x) {
-        int e_global = topk_i[b*k + j];
-        if (e_global >= peer_base && e_global < peer_base + peer_n) {
-            int slot = atomicAdd(d_send_count, 1);
+    __shared__ int sh_do;
+    __shared__ int sh_slot;
 
-            d_send_token_ids[slot] = b;
-            d_send_topk_i[slot]    = e_global - peer_base; // normalize to peer-local id
-            d_send_topk_v[slot]    = topk_v[b*k + j];
-
-            // Copy the H-dim vector
-            for (int h = threadIdx.x; h < H; h += blockDim.x) {
-                d_send_hidden[(size_t)slot*H + h] = d_t[(size_t)b*H + h];
+    for (int j = 0; j < k; ++j) {
+        if (threadIdx.x == 0) {
+            const int e_global = topk_i[b*k + j];
+            if (e_global >= peer_base && e_global < peer_base + peer_n) {
+                int slot = atomicAdd(d_send_count, 1);
+                if (slot < max_rows) {
+                    d_send_token_ids[slot] = b;
+                    d_send_topk_i[slot]    = e_global - peer_base; // peer-local id
+                    d_send_topk_v[slot]    = topk_v[b*k + j];
+                    sh_slot = slot;
+                    sh_do   = 1;
+                } else {
+                    // overflow: roll back best-effort and skip
+                    atomicSub(d_send_count, 1);
+                    sh_do = 0;
+                }
+            } else {
+                sh_do = 0;
             }
         }
+        __syncthreads(); // unconditional
+
+        if (sh_do) {
+            const size_t rowDst = (size_t)sh_slot * (size_t)H;
+            const size_t rowSrc = (size_t)b       * (size_t)H;
+            for (int h = threadIdx.x; h < H; h += blockDim.x) {
+                d_send_hidden[rowDst + (size_t)h] = d_t[rowSrc + (size_t)h];
+            }
+        }
+        __syncthreads(); // unconditional
     }
 }
+
 
 
 __global__ void permute_subset_local_kernel(
@@ -1389,13 +1410,16 @@ void moe_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size)
     HIP_CHECK(hipMemsetAsync(s->d_send_count, 0, sizeof(int), cpu->sGather));
     if (remote_total > 0) {
         const dim3 grid(batch_size), block(256);
+        const int max_rows = batch_size * k;
         pack_remote_tokens_kernel<<<grid, block, 0, cpu->sGather>>>(
             s->t, s->topk_i, s->topk_v,
             batch_size, H, k,
             peer_base, Le,
+            max_rows,
             s->d_send_token_ids, s->d_send_topk_i, s->d_send_topk_v, s->d_send_hidden,
             s->d_send_count);
         HIP_CHECK(hipGetLastError());
+
     }
 
     HIP_CHECK(hipStreamSynchronize(cpu->sGather));
@@ -1613,7 +1637,9 @@ void moe_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size)
             s->expert_output_buffer,
             s->expert_indices,
             s->expert_weights,
-            local_total, H);
+            local_total, H,
+            batch_size);                 // <-- add this
+        HIP_CHECK(hipGetLastError());
         HIP_CHECK(hipGetLastError());
     }
 
@@ -1654,10 +1680,12 @@ void moe_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size)
         const dim3 grid((elems + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK);
         scatter_expert_outputs_kernel<<<grid, THREADS_PER_BLOCK, 0, cpu->sScatter>>>(
             s->e_agg,
-            /*expert_output_buffer:*/ s->d_recv_hidden,  // contains output rows now
-            /*expert_indices:*/       s->d_recv_token_ids,
-            /*expert_weights:*/       s->d_recv_topk_v,
-            h_back, H);
+            s->expert_output_buffer,
+            s->expert_indices,
+            s->expert_weights,
+            local_total, H,
+            batch_size);                 // <-- add this
+        HIP_CHECK(hipGetLastError());
         HIP_CHECK(hipGetLastError());
     }
 
@@ -1676,226 +1704,6 @@ void moe_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size)
 }
 
 
-void moe_gpu_old(GPUTransformer *gpu_t, int layer_idx, int batch_size)
-{
-    Config *p = &gpu_t->config;
-    GPURunState *s = &gpu_t->state;
-    GPUTransformerWeights *w = &gpu_t->weights;
-    CPUBuffers *cpu_buf = &gpu_t->cpu_buffers;
-    
-    const int hidden_dim = p->hidden_dim;
-    const int intermediate_dim = p->intermediate_dim;
-    const int n_experts = p->n_experts;
-    const int experts_per_token = p->experts_per_token;
-    // ===== per-call events =====
-    hipEvent_t evRouterDone, evPermuteDone;
-    HIP_CHECK(hipEventCreateWithFlags(&evRouterDone, hipEventDisableTiming));
-    HIP_CHECK(hipEventCreateWithFlags(&evPermuteDone, hipEventDisableTiming));
-
-    hipEvent_t evExpertsDone[N_MLP_STREAMS];
-    for (int i = 0; i < N_MLP_STREAMS; ++i)
-        HIP_CHECK(hipEventCreateWithFlags(&evExpertsDone[i], hipEventDisableTiming));
-
-    // Declare total_tokens in function scope để tránh scope issues
-    int total_tokens = 0;
-
-    // ===== 1) FFN RMSNorm + Router on sGather =====
-    {
-        dim3 norm_grid(batch_size);
-        dim3 norm_block(THREADS_PER_BLOCK);
-        rmsnorm_kernel<<<norm_grid, norm_block, 0, cpu_buf->sGather>>>(
-            s->t, s->x, w->rms_ffn_w + (size_t)layer_idx * hidden_dim,
-            batch_size, hidden_dim);
-    }
-    HIP_CHECK(hipGetLastError());
-
-    {
-        // [B,H] x [H,E] -> [B,E]
-        matmul(s->router_score, s->t,
-               w->w_router + (size_t)layer_idx * hidden_dim * n_experts,
-               batch_size, hidden_dim, n_experts, cpu_buf->sGather);
-    }
-    {
-        const int elems = batch_size * n_experts;
-        add_bias_kernel<<<(elems + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK,
-                          THREADS_PER_BLOCK, 0, cpu_buf->sGather>>>(
-            s->router_score, w->b_router + (size_t)layer_idx * n_experts,
-            batch_size, n_experts);
-    }
-    {
-        topk_kernel<<<batch_size, 1, 0, cpu_buf->sGather>>>(
-            s->topk_v, s->topk_i, s->router_score,
-            batch_size, n_experts, experts_per_token);
-    }
-    {
-        dim3 norm_block(THREADS_PER_BLOCK);
-        softmax_kernel<<<batch_size, norm_block, 0, cpu_buf->sGather>>>(
-            s->topk_v, batch_size, experts_per_token);
-    }
-    HIP_CHECK(hipEventRecord(evRouterDone, cpu_buf->sGather));
-
-    // ===== 2) GATHER on sGather: count -> prefix-sum(host) -> offsets H2D -> permute =====
-    {
-
-        HIP_CHECK(hipStreamWaitEvent(cpu_buf->sGather, evRouterDone, 0));
-
-        HIP_CHECK(hipMemsetAsync(s->d_expert_counts, 0, n_experts * sizeof(int), cpu_buf->sGather));
-        const dim3 count_grid((batch_size + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK);
-        count_tokens_per_expert_kernel<<<count_grid, THREADS_PER_BLOCK, 0, cpu_buf->sGather>>>(
-            s->topk_i, s->d_expert_counts, batch_size, experts_per_token);
-        HIP_CHECK(hipGetLastError());
-
-        // counts D2H (async), then sync sGather to use them on CPU
-        HIP_CHECK(hipMemcpyAsync(cpu_buf->expert_counts, s->d_expert_counts,
-                                 n_experts * sizeof(int), hipMemcpyDeviceToHost, cpu_buf->sGather));
-        HIP_CHECK(hipStreamSynchronize(cpu_buf->sGather)); // ensure counts available on host
-
-        // host prefix-sum -> offsets
-        total_tokens = 0;
-        for (int i = 0; i < n_experts; ++i)
-        {
-            cpu_buf->expert_offsets[i] = total_tokens;
-            total_tokens += cpu_buf->expert_counts[i];
-        }
-
-        // offsets H2D (async)
-        HIP_CHECK(hipMemcpyAsync(s->d_expert_offsets, cpu_buf->expert_offsets,
-                                 n_experts * sizeof(int), hipMemcpyHostToDevice, cpu_buf->sGather));
-
-        // permute
-        HIP_CHECK(hipMemsetAsync(s->d_expert_write_idx, 0, n_experts * sizeof(int), cpu_buf->sGather));
-        const dim3 permute_grid(batch_size);
-        const dim3 permute_block(256);
-        int shared_mem_size = experts_per_token * sizeof(int); // For destination_indices
-        permute_expert_inputs_kernel<<<permute_grid, permute_block, shared_mem_size, cpu_buf->sGather>>>(
-            s->t, s->topk_i, s->topk_v, s->d_expert_offsets, s->d_expert_write_idx,
-            batch_size, hidden_dim, experts_per_token,
-            s->expert_input_buffer, s->expert_indices, s->expert_weights);
-        HIP_CHECK(hipGetLastError());
-
-        HIP_CHECK(hipEventRecord(evPermuteDone, cpu_buf->sGather));
-    }
-
-    // ===== CRITICAL FIX: Zero buffer AFTER gather completes =====
-    // Đợi gather hoàn thành trước khi zero buffer trên sScatter
-    HIP_CHECK(hipStreamWaitEvent(cpu_buf->sScatter, evPermuteDone, 0));
-    HIP_CHECK(hipMemsetAsync(s->e_agg, 0,
-                             (size_t)batch_size * hidden_dim * sizeof(float),
-                             cpu_buf->sScatter));
-
-    // ===== 3) EXPERT MLPs on multiple streams, each waits on permute =====
-    for (int expert_id = 0; expert_id < n_experts/2; ++expert_id)
-    {
-        const int h_batch_count = cpu_buf->expert_counts[expert_id];
-        if (h_batch_count == 0)
-            continue;
-
-        hipStream_t st = cpu_buf->sMLP[expert_id % N_MLP_STREAMS];
-        HIP_CHECK(hipStreamWaitEvent(st, evPermuteDone, 0));
-
-        const int expert_tok_off = cpu_buf->expert_offsets[expert_id];
-
-        float *expert_input_ptr = s->expert_input_buffer + (size_t)expert_tok_off * hidden_dim;
-        float *mlp1_out_ptr = s->mlp1_out + (size_t)expert_tok_off * (2 * intermediate_dim);
-        float *gate_ptr = s->gate + (size_t)expert_tok_off * intermediate_dim;
-        float *up_ptr = s->up + (size_t)expert_tok_off * intermediate_dim;
-        float *gate_up_ptr = s->gate_up + (size_t)expert_tok_off * intermediate_dim;
-        float *expert_output_ptr = s->expert_output_buffer + (size_t)expert_tok_off * hidden_dim;
-
-        // MLP1 (Gate/Up) — MXFP4
-        {
-            // FIXED: Use local expert indexing for memory layout
-            const size_t w_off1 = ((size_t)layer_idx * (n_experts/2) + expert_id) * (size_t)(2 * intermediate_dim) * hidden_dim;
-            const size_t w_packed_off1 = w_off1 / 2; // 2 FP4 / byte
-            const size_t w_scale_off1 = w_off1 / MXFP4_BLOCK_SIZE;
-            const size_t total_elems1 = (size_t)(2 * intermediate_dim) * hidden_dim;
-
-            matmul_mxfp4(mlp1_out_ptr, expert_input_ptr,
-                         w->w_mlp1_mxfp4 + w_packed_off1,
-                         w->w_mlp1_scales + w_scale_off1,
-                         h_batch_count, hidden_dim, 2 * intermediate_dim,
-                         total_elems1, st);
-        }
-
-        // split + swiglu
-        {
-            const int elems = h_batch_count * intermediate_dim;
-            const dim3 grid((elems + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK);
-            split_gate_up_kernel<<<grid, THREADS_PER_BLOCK, 0, st>>>(
-                gate_ptr, up_ptr, mlp1_out_ptr,
-                w->b_mlp1 + ((size_t)layer_idx * (n_experts/2) + expert_id) * (size_t)(2 * intermediate_dim),
-                h_batch_count, intermediate_dim);
-        }
-        {
-            const int elems = h_batch_count * intermediate_dim;
-            const dim3 grid((elems + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK);
-            swiglu_kernel<<<grid, THREADS_PER_BLOCK, 0, st>>>(
-                gate_ptr, up_ptr, gate_up_ptr,
-                h_batch_count, intermediate_dim, p->swiglu_limit);
-        }
-
-        // MLP2 (Down) — MXFP4
-        {
-            const size_t w_off2 = ((size_t)layer_idx * (n_experts/2) + expert_id) * (size_t)hidden_dim * intermediate_dim;
-            const size_t w_packed_off2 = w_off2 / 2;
-            const size_t w_scale_off2 = w_off2 / MXFP4_BLOCK_SIZE;
-            const size_t total_elems2 = (size_t)hidden_dim * intermediate_dim;
-
-            matmul_mxfp4(expert_output_ptr, gate_up_ptr,
-                         w->w_mlp2_mxfp4 + w_packed_off2,
-                         w->w_mlp2_scales + w_scale_off2,
-                         h_batch_count, intermediate_dim, hidden_dim,
-                         total_elems2, st);
-        }
-
-        // bias
-        {
-            const int elems = h_batch_count * hidden_dim;
-            const dim3 grid((elems + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK);
-            add_bias_kernel<<<grid, THREADS_PER_BLOCK, 0, st>>>(
-                expert_output_ptr,
-                w->b_mlp2 + ((size_t)layer_idx * (n_experts/2) + expert_id) * (size_t)hidden_dim,
-                h_batch_count, hidden_dim);
-            HIP_CHECK(hipGetLastError());
-        }
-    }
-
-    // record one "done" event per MLP stream (tail of each queue)
-    for (int i = 0; i < N_MLP_STREAMS; ++i)
-        HIP_CHECK(hipEventRecord(evExpertsDone[i], cpu_buf->sMLP[i]));
-
-    // ===== 4) SCATTER on sScatter, after all MLP streams =====
-    for (int i = 0; i < N_MLP_STREAMS; ++i)
-        HIP_CHECK(hipStreamWaitEvent(cpu_buf->sScatter, evExpertsDone[i], 0));
-
-    if (total_tokens > 0)
-    {
-        const int elems = total_tokens * hidden_dim;
-        const dim3 grid((elems + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK);
-        scatter_expert_outputs_kernel<<<grid, THREADS_PER_BLOCK, 0, cpu_buf->sScatter>>>(
-            s->e_agg, s->expert_output_buffer, s->expert_indices, s->expert_weights,
-            total_tokens, hidden_dim);
-        HIP_CHECK(hipGetLastError());
-    }
-
-    // ===== 5) Residual on sScatter =====
-    {
-        const int elems = batch_size * hidden_dim;
-        accumulate_kernel<<<(elems + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK,
-                            THREADS_PER_BLOCK, 0, cpu_buf->sScatter>>>(
-            s->x, s->e_agg, 1.0f, batch_size, hidden_dim);
-        HIP_CHECK(hipGetLastError());
-    }
-
-    // Ensure all computations complete before returning
-    HIP_CHECK(hipStreamSynchronize(cpu_buf->sScatter));
-
-    // destroy events
-    HIP_CHECK(hipEventDestroy(evRouterDone));
-    HIP_CHECK(hipEventDestroy(evPermuteDone));
-    for (int i = 0; i < N_MLP_STREAMS; ++i)
-        HIP_CHECK(hipEventDestroy(evExpertsDone[i]));
-}
 
 float *forward_batch_gpu(GPUTransformer *gpu_t, int *tokens, int batch_size)
 {

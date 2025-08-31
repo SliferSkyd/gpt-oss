@@ -106,7 +106,7 @@ __global__ void gather_expert_inputs_kernel(const float *d_t, const int *topk_i,
 }
 
 // "Scatter" kernel: Adds the expert outputs back to the final aggregation buffer.
-__global__ void scatter_expert_outputs_kernel(float *d_e_agg, const float *expert_output_buffer,
+__global__ void scatter_expert_outputs_kernel_old(float *d_e_agg, const float *expert_output_buffer,
                                               const int *expert_indices, const float *expert_weights,
                                               int batch_count, int hidden_dim)
 {
@@ -128,6 +128,38 @@ __global__ void scatter_expert_outputs_kernel(float *d_e_agg, const float *exper
     // Atomically add the weighted result. This is crucial because multiple
     // experts (if experts_per_token > 1) write to the same d_e_agg location.
     atomicAdd(dst, value * weight);
+}
+
+__global__ void scatter_expert_outputs_kernel(
+    float * __restrict__ d_e_agg,              // [B, H]
+    const float * __restrict__ expert_output_buffer, // [N, H]  (N = compact rows)
+    const int   * __restrict__ expert_indices, // [N]        (token ids in 0..B-1)
+    const float * __restrict__ expert_weights, // [N]
+    int compact_rows,                          // N
+    int hidden_dim,                            // H
+    int B)                                     // <-- NEW: batch size for bounds check
+{
+    size_t idx = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    const size_t total = (size_t)compact_rows * (size_t)hidden_dim;
+    if (idx >= total) return;
+
+    const int row = (int)(idx / (size_t)hidden_dim);  // compact row
+    const int dim = (int)(idx % (size_t)hidden_dim);
+
+    const int token = expert_indices[row];
+    if ((unsigned)token >= (unsigned)B) {
+        // Bad index (e.g., not remapped to origin’s 0..B-1). Skip safely.
+        return;
+    }
+
+    const float w = expert_weights[row];
+    if (w == 0.0f) return;
+
+    const float val = expert_output_buffer[idx] * w;
+
+    // destination element
+    float *dst = d_e_agg + (size_t)token * (size_t)hidden_dim + dim;
+    atomicAdd(dst, val);
 }
 
 
