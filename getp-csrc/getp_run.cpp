@@ -315,10 +315,10 @@ void malloc_gpu_run_state(GPURunState *s, Config *p)
     HIP_CHECK(hipMalloc((void **)&s->router_score, BATCH_SIZE * p->n_experts * sizeof(float)));
     HIP_CHECK(hipMalloc((void **)&s->topk_v, BATCH_SIZE * p->experts_per_token * sizeof(float)));
     HIP_CHECK(hipMalloc((void **)&s->topk_i, BATCH_SIZE * p->experts_per_token * sizeof(int)));
-    HIP_CHECK(hipMalloc((void **)&s->mlp1_out, BATCH_SIZE * 2 * p->intermediate_dim * sizeof(float) * expert_per_token));
-    HIP_CHECK(hipMalloc((void **)&s->gate, BATCH_SIZE * p->intermediate_dim * sizeof(float) * expert_per_token));
-    HIP_CHECK(hipMalloc((void **)&s->up, BATCH_SIZE * p->intermediate_dim * sizeof(float) * expert_per_token));
-    HIP_CHECK(hipMalloc((void **)&s->gate_up, BATCH_SIZE * p->intermediate_dim * sizeof(float) * expert_per_token));
+    HIP_CHECK(hipMalloc((void **)&s->mlp1_out, 2*BATCH_SIZE * 2 * p->intermediate_dim * sizeof(float) * expert_per_token));
+    HIP_CHECK(hipMalloc((void **)&s->gate, 2*BATCH_SIZE * p->intermediate_dim * sizeof(float) * expert_per_token));
+    HIP_CHECK(hipMalloc((void **)&s->up, 2*BATCH_SIZE * p->intermediate_dim * sizeof(float) * expert_per_token));
+    HIP_CHECK(hipMalloc((void **)&s->gate_up, 2*BATCH_SIZE * p->intermediate_dim * sizeof(float) * expert_per_token));
     HIP_CHECK(hipMalloc((void **)&s->e_agg, batch_hidden));
     HIP_CHECK(hipMalloc((void **)&s->current_tokens, BATCH_SIZE * sizeof(int)));
     HIP_CHECK(hipMalloc((void **)&s->positions, BATCH_SIZE * sizeof(int)));
@@ -1114,62 +1114,140 @@ __global__ void permute_subset_local_kernel(
     int B, int H, int k,
     int local_base, int local_n,
     const int * __restrict__ d_local_offsets,    // [local_n]
+    const int * __restrict__ d_local_counts,     // [local_n]  <-- NEW (bounds)
     int * __restrict__ d_local_write_idx,        // [local_n] (zeroed before)
     float * __restrict__ out_hidden,             // [sum_local, H]
     int   * __restrict__ out_indices,            // [sum_local]
     float * __restrict__ out_weights)            // [sum_local]
 {
-    int b = blockIdx.x;
+    const int b = blockIdx.x;
     if (b >= B) return;
 
-    // One block per token; threads copy the H vector for each matched expert
+    // Each block handles token b; threads collaborate on the H-wide copy per match
+    // Iterate the token's k selected experts
     for (int j = 0; j < k; ++j) {
-        int e_global = topk_i[b*k + j];
-        if (e_global >= local_base && e_global < local_base + local_n) {
-            int e_local = e_global - local_base;
-            int write = atomicAdd(&((int*)d_local_write_idx)[e_local], 1);
-            int dst   = d_local_offsets[e_local] + write;
+        // Load global expert id & weight
+        const int e_global = topk_i[(size_t)b * k + j];
+        if (e_global < local_base || e_global >= local_base + local_n) {
+            continue; // not ours
+        }
 
-            // metadata
-            if (threadIdx.x == 0) {
-                out_indices[dst] = b;                 // original token id
-                out_weights[dst] = topk_v[b*k + j];   // router weight
+        const int e_local = e_global - local_base;
+
+        // Reserve a slot within this expert's compact slice (atomic)
+        int write = atomicAdd(&d_local_write_idx[e_local], 1);
+
+        // Defensive bound-check: ensure we do not write past this expert's slice
+        const int cap   = d_local_counts[e_local];
+        if (write >= cap || write < 0) {
+            // Roll back (best effort) to avoid leaking the counter upward forever,
+            // and skip this item. In a debug build you can record a failure metric.
+            atomicSub(&d_local_write_idx[e_local], 1);
+            continue;
+        }
+
+        // Compute destination row within out_* buffers
+        const int base  = d_local_offsets[e_local];
+        const int dst   = base + write;
+
+        // Write metadata from one lane; copy hidden vector from all lanes
+        // (No barrier needed; dst is thread-local scalar, same for all lanes in this block & iteration)
+        if (threadIdx.x == 0) {
+            out_indices[dst] = b;
+            out_weights[dst] = topk_v[(size_t)b * k + j];
+        }
+
+        // Try vectorized copy when H is float4-aligned and dst,b are aligned accordingly.
+        // Falls back to scalar strided copy otherwise.
+        const size_t rowDst = (size_t)dst * (size_t)H;
+        const size_t rowSrc = (size_t)b   * (size_t)H;
+
+        // Vector path: float4 when H % 4 == 0 and pointers are 16B aligned.
+        bool can_vec = ((H & 3) == 0) &&
+                       ((((uintptr_t)(out_hidden + rowDst)) & 0xF) == 0) &&
+                       ((((uintptr_t)(d_t        + rowSrc)) & 0xF) == 0);
+
+        if (can_vec) {
+            const int H4 = H >> 2;
+            const float4* __restrict__ src4 = reinterpret_cast<const float4*>(d_t + rowSrc);
+            float4* __restrict__ dst4       = reinterpret_cast<float4*>(out_hidden + rowDst);
+
+            for (int h4 = threadIdx.x; h4 < H4; h4 += blockDim.x) {
+                dst4[h4] = src4[h4];
             }
-            // vector
+        } else {
             for (int h = threadIdx.x; h < H; h += blockDim.x) {
-                out_hidden[(size_t)dst*H + h] = d_t[(size_t)b*H + h];
+                out_hidden[rowDst + (size_t)h] = d_t[rowSrc + (size_t)h];
             }
         }
     }
 }
 
-
 __global__ void permute_received_to_local_kernel(
-    const float * __restrict__ recv_hidden,  // [R, H]
-    const int   * __restrict__ recv_topk_i,  // [R] local expert ids (0..local_n-1)
-    const float * __restrict__ recv_topk_v,  // [R]
-    const int   * __restrict__ recv_token_ids, // [R] origin token ids (on peer/origin)
+    const float * __restrict__ recv_hidden,   // [R, H]
+    const int   * __restrict__ recv_topk_i,   // [R] local expert ids (0..local_n-1)
+    const float * __restrict__ recv_topk_v,   // [R]
+    const int   * __restrict__ recv_token_ids,// [R] origin token ids (on peer/origin)
     int R, int H,
-    const int * __restrict__ d_offsets,     // [local_n]
-    int * __restrict__ d_write_idx,         // [local_n]
-    float * __restrict__ out_hidden,        // [R, H] (sum over experts == R)
-    int   * __restrict__ out_indices,       // [R]
-    float * __restrict__ out_weights)       // [R]
+    int local_n,                               // <-- NEW
+    const int * __restrict__ d_offsets,        // [local_n]
+    const int * __restrict__ d_counts,         // <-- NEW: [local_n]
+    int * __restrict__ d_write_idx,            // [local_n] (zeroed before)
+    float * __restrict__ out_hidden,           // [sum_recv, H]
+    int   * __restrict__ out_indices,          // [sum_recv]
+    float * __restrict__ out_weights)          // [sum_recv]
 {
-    int r = blockIdx.x;
+    const int r = blockIdx.x;
     if (r >= R) return;
-    int e_local = recv_topk_i[r];
-    int write = atomicAdd(&((int*)d_write_idx)[e_local], 1);
-    int dst   = d_offsets[e_local] + write;
 
+    int e_local = recv_topk_i[r];
+    // Validate local id
+    if ((unsigned)e_local >= (unsigned)local_n) {
+        return; // or record a debug counter
+    }
+
+    // Reserve a slot for this expert (atomic)
+    int write = atomicAdd(&d_write_idx[e_local], 1);
+
+    // Bound check against the expert's capacity
+    const int cap = d_counts[e_local];
+    if (write < 0 || write >= cap) {
+        // best-effort rollback to keep index sane in debug runs
+        atomicSub(&d_write_idx[e_local], 1);
+        return;
+    }
+
+    const int base = d_offsets[e_local];
+    const int dst  = base + write;
+
+    // metadata from lane 0
     if (threadIdx.x == 0) {
         out_indices[dst] = recv_token_ids[r];
         out_weights[dst] = recv_topk_v[r];
     }
-    for (int h = threadIdx.x; h < H; h += blockDim.x) {
-        out_hidden[(size_t)dst*H + h] = recv_hidden[(size_t)r*H + h];
+
+    // copy H floats of the hidden row, vectorized when possible
+    const size_t rowDst = (size_t)dst * (size_t)H;
+    const size_t rowSrc = (size_t)r   * (size_t)H;
+
+    bool can_vec = ((H & 3) == 0) &&
+                   ((((uintptr_t)(out_hidden + rowDst)) & 0xF) == 0) &&
+                   ((((uintptr_t)(recv_hidden + rowSrc)) & 0xF) == 0);
+
+    if (can_vec) {
+        int H4 = H >> 2;
+        const float4* __restrict__ src4 = reinterpret_cast<const float4*>(recv_hidden + rowSrc);
+        float4* __restrict__ dst4       = reinterpret_cast<float4*>(out_hidden + rowDst);
+        for (int i = threadIdx.x; i < H4; i += blockDim.x) {
+            dst4[i] = src4[i];
+        }
+    } else {
+        for (int h = threadIdx.x; h < H; h += blockDim.x) {
+            out_hidden[rowDst + (size_t)h] = recv_hidden[rowSrc + (size_t)h];
+        }
     }
 }
+
 
 
 void moe_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size)
@@ -1257,7 +1335,7 @@ void moe_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size)
     HIP_CHECK(hipMemcpyAsync(cpu->expert_counts, s->d_expert_counts,
                              E * sizeof(int), hipMemcpyDeviceToHost, cpu->sGather));
     HIP_CHECK(hipStreamSynchronize(cpu->sGather));
-    
+
     THREAD_DEBUG("After counting experts on GPU %d:\n", dev);
     
 
@@ -1272,23 +1350,40 @@ void moe_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size)
     }
     remote_total = total_all - local_total;
 
+    HIP_CHECK(hipStreamSynchronize(cpu->sGather));
+    THREAD_DEBUG("  total tokens = %d\n", total_all);
+    THREAD_DEBUG("  local tokens = %d (experts %d..%d)\n", local_total, local_base, local_base+Le-1);
+
     // H2D local offsets; zero local write_idx
     HIP_CHECK(hipMemcpyAsync(s->d_local_expert_offsets, cpu->local_offsets,
                              Le * sizeof(int), hipMemcpyHostToDevice, cpu->sGather));
+    HIP_CHECK(hipStreamSynchronize(cpu->sGather));
+    THREAD_DEBUG("  after memcpy offsets\n");
     HIP_CHECK(hipMemsetAsync(s->d_local_expert_write_idx, 0, Le * sizeof(int), cpu->sGather));
 
+
+    HIP_CHECK(hipStreamSynchronize(cpu->sGather));
+    THREAD_DEBUG("  remote tokens = %d (experts %d..%d)\n", remote_total, peer_base, peer_base+Le-1);
     // ===== [Stage 2a] PERMUTE local subset into expert-compact (LOCAL) =====
     // Output goes to: s->expert_input_buffer / s->expert_indices / s->expert_weights
     {
         const dim3 grid(batch_size), block(256);
+        const int base = local_base;      // first global expert id on this GPU
+        const int *d_local_counts = s->d_expert_counts + base;   // window [base .. base+Le-1]
+
         permute_subset_local_kernel<<<grid, block, 0, cpu->sGather>>>(
             s->t, s->topk_i, s->topk_v,
             batch_size, H, k,
             local_base, Le,
-            s->d_local_expert_offsets, s->d_local_expert_write_idx,
+            s->d_local_expert_offsets,
+            d_local_counts,                        // <-- use slice of global counts
+            s->d_local_expert_write_idx,
             s->expert_input_buffer, s->expert_indices, s->expert_weights);
         HIP_CHECK(hipGetLastError());
     }
+
+    HIP_CHECK(hipStreamSynchronize(cpu->sGather));
+    THREAD_DEBUG("  local permute done\n"); 
 
     // ===== [Stage 2b] PACK remote items linearly for SEND =====
     HIP_CHECK(hipMemsetAsync(s->d_send_count, 0, sizeof(int), cpu->sGather));
@@ -1302,6 +1397,9 @@ void moe_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size)
             s->d_send_count);
         HIP_CHECK(hipGetLastError());
     }
+
+    HIP_CHECK(hipStreamSynchronize(cpu->sGather));
+    THREAD_DEBUG("  remote pack done\n");
 
     // Ensure packing done before we read send_count on host
     HIP_CHECK(hipStreamSynchronize(cpu->sGather));
@@ -1338,6 +1436,8 @@ void moe_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size)
             s->d_send_count, dev,
             sizeof(int), cpu->sScatter));
     }
+
+    THREAD_DEBUG("  GPU %d sending %d tokens to GPU %d\n", dev, h_send_count, peer);
 
     // We will also compute our LOCAL experts immediately. Zero e_agg now.
     HIP_CHECK(hipMemsetAsync(s->e_agg, 0, (size_t)batch_size * H * sizeof(float), cpu->sScatter));
@@ -1390,13 +1490,19 @@ void moe_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size)
         permute_received_to_local_kernel<<<gridR, blockR, 0, cpu->sGather>>>(
             s->d_recv_hidden, s->d_recv_topk_i, s->d_recv_topk_v, s->d_recv_token_ids,
             h_recv_count, H,
-            s->d_peer_expert_offsets, s->d_peer_expert_write_idx,
+            /*local_n*/ Le,
+            s->d_peer_expert_offsets,
+            s->d_peer_expert_counts,     // NEW: bounds per expert
+            s->d_peer_expert_write_idx,
             s->peer_expert_input_buffer, s->peer_expert_indices, s->peer_expert_weights);
+        HIP_CHECK(hipGetLastError());
+
         HIP_CHECK(hipGetLastError());
     }
 
-    THREAD_DEBUG("  GPU %d received %d tokens from GPU %d\n", dev, h_recv_count, peer);
     HIP_CHECK(hipStreamSynchronize(cpu->sGather)); // local & peer permutes done
+    THREAD_DEBUG("  GPU %d received %d tokens from GPU %d\n", dev, h_recv_count, peer);
+
 
     // ===== [Stage 4] Run MLPs for every LOCAL expert (two batches if both have data)
     hipEvent_t evMLPdone[N_MLP_STREAMS];
@@ -1453,11 +1559,15 @@ void moe_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size)
                 const int offB = cpu->peer_offsets[e_local];
                 hipStream_t st = cpu->sMLP[(e_local + 7) % N_MLP_STREAMS]; // just spread
 
+                const int local_total_rows = local_total;          // number of rows in A
+                const int peer_total_rows  = cpu->peer_recv_count; // number of rows in B
+                const int peer_base_rows = local_total_rows;
+
                 float *inB  = s->peer_expert_input_buffer  + (size_t)offB * H;
-                float *m1B  = s->mlp1_out                   + (size_t)offB * (2*I); // reuse temp
-                float *gB   = s->gate                        + (size_t)offB * I;
-                float *uB   = s->up                          + (size_t)offB * I;
-                float *guB  = s->gate_up                     + (size_t)offB * I;
+                float *m1B = s->mlp1_out + (size_t)(peer_base_rows + offB) * (2*I);
+                float *gB  = s->gate     + (size_t)(peer_base_rows + offB) * I;
+                float *uB  = s->up       + (size_t)(peer_base_rows + offB) * I;
+                float *guB = s->gate_up  + (size_t)(peer_base_rows + offB) * I;
                 float *outB = s->peer_expert_output_buffer   + (size_t)offB * H;
 
                 size_t w1_off = ((size_t)layer_idx * Le + e_local) * (size_t)(2*I) * H;
