@@ -1073,60 +1073,75 @@ static inline bool is_local_expert(int expert_id, int local_base, int local_n) {
 static inline int to_local_id(int expert_id, int local_base) {
     return expert_id - local_base; // 0..local_n_experts-1
 }
-
 __global__ void pack_remote_tokens_kernel(
-    const float * __restrict__ d_t,           // [B, H]
-    const int   * __restrict__ topk_i,        // [B, k] global expert ids
-    const float * __restrict__ topk_v,        // [B, k]
+    const float * __restrict__ d_t,      // [B, H]
+    const int   * __restrict__ topk_i,   // [B, k] global ids
+    const float * __restrict__ topk_v,   // [B, k]
     int B, int H, int k,
     int peer_base, int peer_n,
-    int max_rows,                              // = B*k (capacity of d_send_*)
-    int * __restrict__ d_send_token_ids,       // [B*k]
-    int * __restrict__ d_send_topk_i,          // [B*k]
-    float * __restrict__ d_send_topk_v,        // [B*k]
-    float * __restrict__ d_send_hidden,        // [B*k, H]
-    int * __restrict__ d_send_count)           // [1]
+    int max_rows,                         // sức chứa B*k
+    int * __restrict__ d_send_token_ids,  // [max_rows]
+    int * __restrict__ d_send_topk_i,     // [max_rows] (peer-local id)
+    float * __restrict__ d_send_topk_v,   // [max_rows]
+    float * __restrict__ d_send_hidden,   // [max_rows, H]
+    int * __restrict__ d_send_count)      // [1], zero trước
 {
     const int b = blockIdx.x;
     if (b >= B) return;
 
     __shared__ int sh_do;
     __shared__ int sh_slot;
+    __shared__ int sh_peer_local;
 
     for (int j = 0; j < k; ++j) {
         if (threadIdx.x == 0) {
-            const int e_global = topk_i[b*k + j];
+            sh_do = 0;
+            const int e_global = topk_i[(size_t)b*k + j];
             if (e_global >= peer_base && e_global < peer_base + peer_n) {
-                int slot = atomicAdd(d_send_count, 1);
-                if (slot < max_rows) {
-                    d_send_token_ids[slot] = b;
-                    d_send_topk_i[slot]    = e_global - peer_base; // peer-local id
-                    d_send_topk_v[slot]    = topk_v[b*k + j];
-                    sh_slot = slot;
-                    sh_do   = 1;
-                } else {
-                    // overflow: roll back best-effort and skip
-                    atomicSub(d_send_count, 1);
-                    sh_do = 0;
-                }
-            } else {
-                sh_do = 0;
-            }
-        }
-        __syncthreads(); // unconditional
+                const int peer_local = e_global - peer_base;
 
-        if (sh_do) {
-            const size_t rowDst = (size_t)sh_slot * (size_t)H;
-            const size_t rowSrc = (size_t)b       * (size_t)H;
-            for (int h = threadIdx.x; h < H; h += blockDim.x) {
-                d_send_hidden[rowDst + (size_t)h] = d_t[rowSrc + (size_t)h];
+                int slot = atomicAdd(d_send_count, 1);
+                // chặn overflow phòng hờ
+                if (slot < max_rows) {
+                    sh_do = 1;
+                    sh_slot = slot;
+                    sh_peer_local = peer_local;
+
+                    d_send_token_ids[slot] = b;
+                    d_send_topk_i[slot]    = peer_local;
+                    d_send_topk_v[slot]    = topk_v[(size_t)b*k + j];
+                } else {
+                    // rollback nếu vượt sức chứa
+                    atomicSub(d_send_count, 1);
+                }
             }
         }
-        __syncthreads(); // unconditional
+        __syncthreads();
+
+        if (!sh_do) continue;
+
+        // copy 1 hàng H-dim
+        const size_t rowDst = (size_t)sh_slot * (size_t)H;
+        const size_t rowSrc = (size_t)b       * (size_t)H;
+
+        // (tuỳ chọn) vector hoá khi thỏa điều kiện
+        const bool can_vec = ((H & 3) == 0) &&
+                             ((((uintptr_t)(d_send_hidden + rowDst)) & 0xF) == 0) &&
+                             ((((uintptr_t)(d_t           + rowSrc)) & 0xF) == 0);
+        if (can_vec) {
+            const int H4 = H >> 2;
+            const float4* __restrict__ src4 =
+                reinterpret_cast<const float4*>(d_t + rowSrc);
+            float4* __restrict__ dst4 =
+                reinterpret_cast<float4*>(d_send_hidden + rowDst);
+            for (int i = threadIdx.x; i < H4; i += blockDim.x) dst4[i] = src4[i];
+        } else {
+            for (int h = threadIdx.x; h < H; h += blockDim.x)
+                d_send_hidden[rowDst + (size_t)h] = d_t[rowSrc + (size_t)h];
+        }
+        __syncthreads();
     }
 }
-
-
 
 __global__ void permute_subset_local_kernel(
     const float * __restrict__ d_t,              // [B, H]
@@ -1135,8 +1150,8 @@ __global__ void permute_subset_local_kernel(
     int B, int H, int k,
     int local_base, int local_n,
     const int * __restrict__ d_local_offsets,    // [local_n]
-    const int * __restrict__ d_local_counts,     // [local_n]  <-- NEW (bounds)
-    int * __restrict__ d_local_write_idx,        // [local_n] (zeroed before)
+    const int * __restrict__ d_local_counts,     // [local_n]
+    int * __restrict__ d_local_write_idx,        // [local_n]
     float * __restrict__ out_hidden,             // [sum_local, H]
     int   * __restrict__ out_indices,            // [sum_local]
     float * __restrict__ out_weights)            // [sum_local]
@@ -1144,63 +1159,67 @@ __global__ void permute_subset_local_kernel(
     const int b = blockIdx.x;
     if (b >= B) return;
 
-    // Each block handles token b; threads collaborate on the H-wide copy per match
-    // Iterate the token's k selected experts
-    for (int j = 0; j < k; ++j) {
-        // Load global expert id & weight
-        const int e_global = topk_i[(size_t)b * k + j];
-        if (e_global < local_base || e_global >= local_base + local_n) {
-            continue; // not ours
-        }
+    __shared__ int sh_do;   // 0/1: có ghi lần này không
+    __shared__ int sh_dst;  // dòng đích trong buffer compact
 
+    // Mỗi block xử lý 1 token b; lặp qua k expert đã chọn
+    for (int j = 0; j < k; ++j) {
+        // Mặc định không làm gì
+        if (threadIdx.x == 0) sh_do = 0;
+        __syncthreads();
+
+        const int e_global = topk_i[(size_t)b * k + j];
+        // Kiểm tra local
+        const bool is_local =
+            (e_global >= local_base) && (e_global < local_base + local_n);
         const int e_local = e_global - local_base;
 
-        // Reserve a slot within this expert's compact slice (atomic)
-        int write = atomicAdd(&d_local_write_idx[e_local], 1);
+        // Chỉ lane 0 giữ chỗ & tính dst
+        if (threadIdx.x == 0 && is_local) {
+            // Giữ chỗ một lần duy nhất
+            int write = atomicAdd(&d_local_write_idx[e_local], 1);
+            const int cap = d_local_counts[e_local];
+            if (write >= 0 && write < cap) {
+                const int base = d_local_offsets[e_local];
+                sh_dst = base + write;
+                sh_do  = 1;
 
-        // Defensive bound-check: ensure we do not write past this expert's slice
-        const int cap   = d_local_counts[e_local];
-        if (write >= cap || write < 0) {
-            // Roll back (best effort) to avoid leaking the counter upward forever,
-            // and skip this item. In a debug build you can record a failure metric.
-            atomicSub(&d_local_write_idx[e_local], 1);
-            continue;
-        }
-
-        // Compute destination row within out_* buffers
-        const int base  = d_local_offsets[e_local];
-        const int dst   = base + write;
-
-        // Write metadata from one lane; copy hidden vector from all lanes
-        // (No barrier needed; dst is thread-local scalar, same for all lanes in this block & iteration)
-        if (threadIdx.x == 0) {
-            out_indices[dst] = b;
-            out_weights[dst] = topk_v[(size_t)b * k + j];
-        }
-
-        // Try vectorized copy when H is float4-aligned and dst,b are aligned accordingly.
-        // Falls back to scalar strided copy otherwise.
-        const size_t rowDst = (size_t)dst * (size_t)H;
-        const size_t rowSrc = (size_t)b   * (size_t)H;
-
-        // Vector path: float4 when H % 4 == 0 and pointers are 16B aligned.
-        bool can_vec = ((H & 3) == 0) &&
-                       ((((uintptr_t)(out_hidden + rowDst)) & 0xF) == 0) &&
-                       ((((uintptr_t)(d_t        + rowSrc)) & 0xF) == 0);
-
-        if (can_vec) {
-            const int H4 = H >> 2;
-            const float4* __restrict__ src4 = reinterpret_cast<const float4*>(d_t + rowSrc);
-            float4* __restrict__ dst4       = reinterpret_cast<float4*>(out_hidden + rowDst);
-
-            for (int h4 = threadIdx.x; h4 < H4; h4 += blockDim.x) {
-                dst4[h4] = src4[h4];
-            }
-        } else {
-            for (int h = threadIdx.x; h < H; h += blockDim.x) {
-                out_hidden[rowDst + (size_t)h] = d_t[rowSrc + (size_t)h];
+                // Ghi metadata (index, weight) một lần
+                out_indices[sh_dst] = b;
+                out_weights[sh_dst] = topk_v[(size_t)b * k + j];
+            } else {
+                // Rollback nếu vượt capacity
+                if (write >= cap) atomicSub(&d_local_write_idx[e_local], 1);
+                sh_do = 0;
             }
         }
+        __syncthreads(); // Tất cả thread cùng thấy sh_do & sh_dst
+
+        if (sh_do) {
+            // Copy hàng H-dim: mọi thread cùng hợp tác
+            const size_t rowDst = (size_t)sh_dst * (size_t)H;
+            const size_t rowSrc = (size_t)b      * (size_t)H;
+
+            // (Tuỳ chọn) vector hoá nếu thỏa điều kiện
+            const bool can_vec = ((H & 3) == 0) &&
+                                 ((((uintptr_t)(out_hidden + rowDst)) & 0xF) == 0) &&
+                                 ((((uintptr_t)(d_t        + rowSrc)) & 0xF) == 0);
+            if (can_vec) {
+                const int H4 = H >> 2;
+                const float4* __restrict__ src4 =
+                    reinterpret_cast<const float4*>(d_t + rowSrc);
+                float4* __restrict__ dst4 =
+                    reinterpret_cast<float4*>(out_hidden + rowDst);
+                for (int h4 = threadIdx.x; h4 < H4; h4 += blockDim.x) {
+                    dst4[h4] = src4[h4];
+                }
+            } else {
+                for (int h = threadIdx.x; h < H; h += blockDim.x) {
+                    out_hidden[rowDst + (size_t)h] = d_t[rowSrc + (size_t)h];
+                }
+            }
+        }
+        __syncthreads(); // Kết thúc vòng lặp j, đồng bộ block
     }
 }
 
@@ -1208,57 +1227,65 @@ __global__ void permute_received_to_local_kernel(
     const float * __restrict__ recv_hidden,   // [R, H]
     const int   * __restrict__ recv_topk_i,   // [R] local expert ids (0..local_n-1)
     const float * __restrict__ recv_topk_v,   // [R]
-    const int   * __restrict__ recv_token_ids,// [R] origin token ids (on peer/origin)
+    const int   * __restrict__ recv_token_ids,// [R] origin token ids
     int R, int H,
-    int local_n,                               // <-- NEW
-    const int * __restrict__ d_offsets,        // [local_n]
-    const int * __restrict__ d_counts,         // <-- NEW: [local_n]
-    int * __restrict__ d_write_idx,            // [local_n] (zeroed before)
-    float * __restrict__ out_hidden,           // [sum_recv, H]
-    int   * __restrict__ out_indices,          // [sum_recv]
-    float * __restrict__ out_weights)          // [sum_recv]
+    int local_n,
+    const int * __restrict__ d_offsets,       // [local_n]
+    const int * __restrict__ d_counts,        // [local_n]
+    int * __restrict__ d_write_idx,           // [local_n] (zeroed before)
+    float * __restrict__ out_hidden,          // [sum_recv, H]
+    int   * __restrict__ out_indices,         // [sum_recv]
+    float * __restrict__ out_weights)         // [sum_recv]
 {
     const int r = blockIdx.x;
     if (r >= R) return;
 
-    int e_local = recv_topk_i[r];
-    // Validate local id
-    if ((unsigned)e_local >= (unsigned)local_n) {
-        return; // or record a debug counter
-    }
+    __shared__ int sh_do;   // 0/1: có ghi hay không
+    __shared__ int sh_dst;  // dòng đích trong compact buffer
 
-    // Reserve a slot for this expert (atomic)
-    int write = atomicAdd(&d_write_idx[e_local], 1);
-
-    // Bound check against the expert's capacity
-    const int cap = d_counts[e_local];
-    if (write < 0 || write >= cap) {
-        // best-effort rollback to keep index sane in debug runs
-        atomicSub(&d_write_idx[e_local], 1);
-        return;
-    }
-
-    const int base = d_offsets[e_local];
-    const int dst  = base + write;
-
-    // metadata from lane 0
     if (threadIdx.x == 0) {
-        out_indices[dst] = recv_token_ids[r];
-        out_weights[dst] = recv_topk_v[r];
+        sh_do = 0; // default
+        int e_local = recv_topk_i[r];
+
+        // Validate local id
+        if ((unsigned)e_local < (unsigned)local_n) {
+            // Reserve slot exactly ONCE
+            int write = atomicAdd(&d_write_idx[e_local], 1);
+            const int cap = d_counts[e_local];
+
+            if (write >= 0 && write < cap) {
+                const int base = d_offsets[e_local];
+                sh_dst = base + write;
+                sh_do  = 1;
+
+                // metadata: ghi một lần
+                out_indices[sh_dst] = recv_token_ids[r];
+                out_weights[sh_dst] = recv_topk_v[r];
+            } else {
+                // rollback nếu vượt capacity
+                if (write >= cap) atomicSub(&d_write_idx[e_local], 1);
+                sh_do = 0;
+            }
+        }
     }
+    __syncthreads();
 
-    // copy H floats of the hidden row, vectorized when possible
-    const size_t rowDst = (size_t)dst * (size_t)H;
-    const size_t rowSrc = (size_t)r   * (size_t)H;
+    if (!sh_do) return;
 
-    bool can_vec = ((H & 3) == 0) &&
-                   ((((uintptr_t)(out_hidden + rowDst)) & 0xF) == 0) &&
-                   ((((uintptr_t)(recv_hidden + rowSrc)) & 0xF) == 0);
+    // Copy hàng H-dim: cả block cùng copy
+    const size_t rowDst = (size_t)sh_dst * (size_t)H;
+    const size_t rowSrc = (size_t)r      * (size_t)H;
+
+    const bool can_vec = ((H & 3) == 0) &&
+                         ((((uintptr_t)(out_hidden + rowDst)) & 0xF) == 0) &&
+                         ((((uintptr_t)(recv_hidden + rowSrc)) & 0xF) == 0);
 
     if (can_vec) {
-        int H4 = H >> 2;
-        const float4* __restrict__ src4 = reinterpret_cast<const float4*>(recv_hidden + rowSrc);
-        float4* __restrict__ dst4       = reinterpret_cast<float4*>(out_hidden + rowDst);
+        const int H4 = H >> 2;
+        const float4* __restrict__ src4 =
+            reinterpret_cast<const float4*>(recv_hidden + rowSrc);
+        float4* __restrict__ dst4 =
+            reinterpret_cast<float4*>(out_hidden + rowDst);
         for (int i = threadIdx.x; i < H4; i += blockDim.x) {
             dst4[i] = src4[i];
         }
@@ -1271,6 +1298,52 @@ __global__ void permute_received_to_local_kernel(
 
 
 
+/* ========== 1-element device peek helpers ========== */
+static inline void dbg_print_f(const char* tag,
+                               const float* dptr,
+                               size_t idx,
+                               hipStream_t st) {
+    float h = NAN;
+    HIP_CHECK(hipMemcpyAsync(&h, dptr + idx, sizeof(float),
+                             hipMemcpyDeviceToHost, st));
+    HIP_CHECK(hipStreamSynchronize(st));
+    THREAD_DEBUG("%s[%zu] = %.9g\n", tag, idx, h);
+}
+static inline void dbg_print_i(const char* tag,
+                               const int* dptr,
+                               size_t idx,
+                               hipStream_t st) {
+    int h = INT_MIN;
+    HIP_CHECK(hipMemcpyAsync(&h, dptr + idx, sizeof(int),
+                             hipMemcpyDeviceToHost, st));
+    HIP_CHECK(hipStreamSynchronize(st));
+    THREAD_DEBUG("%s[%zu] = %d\n", tag, idx, h);
+}
+static inline void dbg_print_first_f_if_any(const char* tag,
+                                            const float* dptr,
+                                            size_t count,
+                                            hipStream_t st) {
+    if (count == 0) { THREAD_DEBUG("%s <empty>\n", tag); return; }
+    dbg_print_f(tag, dptr, 0, st);
+}
+
+static inline bool ranges_overlap(uintptr_t a, size_t asz, uintptr_t b, size_t bsz) {
+    return (a < b + bsz) && (b < a + asz);
+}
+
+__global__ void fill_f(float* p, size_t n, unsigned int pattern_bits) {
+    float v = __uint_as_float(pattern_bits);
+    for (size_t i = blockIdx.x * blockDim.x + threadIdx.x;
+         i < n; i += gridDim.x * blockDim.x) {
+        p[i] = v;
+    }
+}
+__global__ void fill_i(int* p, size_t n, int v) {
+    for (size_t i = blockIdx.x * blockDim.x + threadIdx.x;
+         i < n; i += gridDim.x * blockDim.x) {
+        p[i] = v;
+    }
+}
 void moe_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size)
 {
     Config *p = &gpu_t->config;
@@ -1316,6 +1389,7 @@ void moe_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size)
         rmsnorm_kernel<<<norm_grid, norm_block, 0, cpu->sGather>>>(
             s->t, s->x, w->rms_ffn_w + (size_t)layer_idx * hidden_dim,
             batch_size, hidden_dim);
+        dbg_print_f("EP:rmsnorm:t", s->t, 0, cpu->sGather);
     }
     HIP_CHECK(hipGetLastError());
 
@@ -1324,6 +1398,7 @@ void moe_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size)
         matmul(s->router_score, s->t,
                w->w_router + (size_t)layer_idx * hidden_dim * n_experts,
                batch_size, hidden_dim, n_experts, cpu->sGather);
+        dbg_print_f("EP:router_score:matmul", s->router_score, 0, cpu->sGather);
     }
     {
         const int elems = batch_size * n_experts;
@@ -1331,16 +1406,20 @@ void moe_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size)
                           THREADS_PER_BLOCK, 0, cpu->sGather>>>(
             s->router_score, w->b_router + (size_t)layer_idx * n_experts,
             batch_size, n_experts);
+        dbg_print_f("EP:router_score:+bias", s->router_score, 0, cpu->sGather);
     }
     {
         topk_kernel<<<batch_size, 1, 0, cpu->sGather>>>(
             s->topk_v, s->topk_i, s->router_score,
             batch_size, n_experts, experts_per_token);
-    }
+        dbg_print_f("EP:topk_v[0]", s->topk_v, 0, cpu->sGather);
+        dbg_print_i("EP:topk_i[0]", s->topk_i, 0, cpu->sGather);
     {
         dim3 norm_block(THREADS_PER_BLOCK);
         softmax_kernel<<<batch_size, norm_block, 0, cpu->sGather>>>(
             s->topk_v, batch_size, experts_per_token);
+        HIP_CHECK(hipGetLastError());
+        dbg_print_f("EP:softmax(topk_v)[0]", s->topk_v, 0, cpu->sGather);
     }
     HIP_CHECK(hipEventRecord(evRouterDone, cpu->sGather));
 
@@ -1350,6 +1429,7 @@ void moe_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size)
     const dim3 count_grid((batch_size + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK);
     count_tokens_per_expert_kernel<<<count_grid, THREADS_PER_BLOCK, 0, cpu->sGather>>>(
         s->topk_i, s->d_expert_counts, batch_size, k);
+    dbg_print_i("EP:d_expert_counts[0]", s->d_expert_counts, 0, cpu->sGather);
     HIP_CHECK(hipGetLastError());
 
     // D2H counts for all experts
@@ -1388,6 +1468,7 @@ void moe_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size)
     // ===== [Stage 2a] PERMUTE local subset into expert-compact (LOCAL) =====
     // Output goes to: s->expert_input_buffer / s->expert_indices / s->expert_weights
     {
+        
         const dim3 grid(batch_size), block(256);
         const int base = local_base;      // first global expert id on this GPU
         const int *d_local_counts = s->d_expert_counts + base;   // window [base .. base+Le-1]
@@ -1401,6 +1482,11 @@ void moe_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size)
             s->d_local_expert_write_idx,
             s->expert_input_buffer, s->expert_indices, s->expert_weights);
         HIP_CHECK(hipGetLastError());
+        HIP_CHECK(hipStreamSynchronize(cpu->sGather));
+        dbg_print_first_f_if_any("EP:local expert_input_buffer[0]",
+        s->expert_input_buffer, (size_t)local_total*H, cpu->sGather);
+        dbg_print_i("EP:local expert_indices[0]", s->expert_indices, 0, cpu->sGather);
+        dbg_print_f("EP:local expert_weights[0]", s->expert_weights, 0, cpu->sGather);
     }
 
     HIP_CHECK(hipStreamSynchronize(cpu->sGather));
@@ -1434,9 +1520,14 @@ void moe_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size)
     int h_send_count = 0;
     HIP_CHECK(hipMemcpy(&h_send_count, s->d_send_count, sizeof(int), hipMemcpyDeviceToHost));
     cpu->peer_send_count = h_send_count;
+    
 
     // ===== [Stage 2c] P2P SEND to peer device =====
     if (h_send_count > 0) {
+        dbg_print_i("EP:send_token_ids[0]", s->d_send_token_ids, 0, cpu->sGather);
+        dbg_print_i("EP:send_topk_i[0]",    s->d_send_topk_i,    0, cpu->sGather);
+        dbg_print_f("EP:send_topk_v[0]",    s->d_send_topk_v,    0, cpu->sGather);
+        dbg_print_f("EP:send_hidden[0]",    s->d_send_hidden,    0, cpu->sGather);
         size_t rows = (size_t)h_send_count;
         HIP_CHECK(hipMemcpyPeerAsync(
             gpu_transformers[peer]->state.d_recv_token_ids, peer,
@@ -1465,6 +1556,7 @@ void moe_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size)
 
     // We will also compute our LOCAL experts immediately. Zero e_agg now.
     HIP_CHECK(hipMemsetAsync(s->e_agg, 0, (size_t)batch_size * H * sizeof(float), cpu->sScatter));
+    dbg_print_f("EP:e_agg:after_zero[0]", s->e_agg, 0, cpu->sScatter);
 
     // ===== Host/peer sync so both sides have sent their payloads =====
     HIP_CHECK(hipStreamSynchronize(cpu->sScatter));
@@ -1510,16 +1602,26 @@ void moe_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size)
         HIP_CHECK(hipMemsetAsync(s->d_peer_expert_write_idx, 0, Le * sizeof(int), cpu->sGather));
 
         // Permute received linear rows into expert-compact buffers
-        const dim3 gridR(h_recv_count), blockR(256);
-        permute_received_to_local_kernel<<<gridR, blockR, 0, cpu->sGather>>>(
+        const dim3 grid(h_recv_count);
+        const dim3 block(256);
+        permute_received_to_local_kernel<<<grid, block, 0, cpu->sGather>>>(
             s->d_recv_hidden, s->d_recv_topk_i, s->d_recv_topk_v, s->d_recv_token_ids,
-            h_recv_count, H,
-            /*local_n*/ Le,
-            s->d_peer_expert_offsets,
-            s->d_peer_expert_counts,     // NEW: bounds per expert
-            s->d_peer_expert_write_idx,
-            s->peer_expert_input_buffer, s->peer_expert_indices, s->peer_expert_weights);
+            h_recv_count, H, Le,
+            s->d_peer_expert_offsets,     // [Le]
+            s->d_peer_expert_counts,      // [Le]
+            s->d_peer_expert_write_idx,   // [Le]
+            s->peer_expert_input_buffer,  // [sum_recv, H]
+            s->peer_expert_indices,       // [sum_recv]
+            s->peer_expert_weights        // [sum_recv]
+        );
         HIP_CHECK(hipGetLastError());
+
+        dbg_print_i("EP:peer_counts[0]", s->d_peer_expert_counts, 0, cpu->sGather);
+        dbg_print_first_f_if_any("EP:peer_expert_input_buffer[0]",
+            s->peer_expert_input_buffer, (size_t)cpu->peer_recv_count*H, cpu->sGather);
+        dbg_print_i("EP:peer_expert_indices[0]", s->peer_expert_indices, 0, cpu->sGather);
+        dbg_print_f("EP:peer_expert_weights[0]", s->peer_expert_weights, 0, cpu->sGather);
+
 
         HIP_CHECK(hipGetLastError());
     }
@@ -1556,14 +1658,18 @@ void moe_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size)
 
             matmul_mxfp4(m1A, inA, w->w_mlp1_mxfp4 + w1_pk, w->w_mlp1_scales + w1_sc,
                          cntA, H, 2*I, (size_t)(2*I)*H, st);
+            dbg_print_f("EP:MLP1_A:mlp1_out[0]", m1A, 0, st);
 
             const dim3 gridSplit((cntA*I + THREADS_PER_BLOCK - 1)/THREADS_PER_BLOCK);
             split_gate_up_kernel<<<gridSplit, THREADS_PER_BLOCK, 0, st>>>(
                 gA, uA, m1A, w->b_mlp1 + ((size_t)layer_idx * Le + e_local) * (size_t)(2*I),
                 cntA, I);
+            dbg_print_f("EP:split_A:gate[0]", gA, 0, st);
+            dbg_print_f("EP:split_A:up[0]",   uA, 0, st);
             const dim3 gridGLU((cntA*I + THREADS_PER_BLOCK - 1)/THREADS_PER_BLOCK);
             swiglu_kernel<<<gridGLU, THREADS_PER_BLOCK, 0, st>>>(
                 gA, uA, guA, cntA, I, p->swiglu_limit);
+            dbg_print_f("EP:swiglu_A:gate_up[0]", guA, 0, st);
 
             matmul_mxfp4(outA, guA, w->w_mlp2_mxfp4 + w2_pk, w->w_mlp2_scales + w2_sc,
                          cntA, I, H, (size_t)H*I, st);
@@ -1572,6 +1678,7 @@ void moe_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size)
             const dim3 gridBias((elems + THREADS_PER_BLOCK - 1)/THREADS_PER_BLOCK);
             add_bias_kernel<<<gridBias, THREADS_PER_BLOCK, 0, st>>>(
                 outA, w->b_mlp2 + ((size_t)layer_idx * Le + e_local) * (size_t)H, cntA, H);
+            dbg_print_f("EP:MLP2_A:out[0]", outA, 0, st);
 
             HIP_CHECK(hipEventRecord(evMLPdone[e_local % N_MLP_STREAMS], st));
         }
@@ -1603,14 +1710,19 @@ void moe_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size)
 
                 matmul_mxfp4(m1B, inB, w->w_mlp1_mxfp4 + w1_pk, w->w_mlp1_scales + w1_sc,
                              cntB, H, 2*I, (size_t)(2*I)*H, st);
+                dbg_print_f("EP:MLP1_B:mlp1_out[0]", m1B, 0, st);
 
                 const dim3 gridSplitB((cntB*I + THREADS_PER_BLOCK - 1)/THREADS_PER_BLOCK);
                 split_gate_up_kernel<<<gridSplitB, THREADS_PER_BLOCK, 0, st>>>(
                     gB, uB, m1B, w->b_mlp1 + ((size_t)layer_idx * Le + e_local) * (size_t)(2*I),
                     cntB, I);
+                dbg_print_f("EP:split_B:gate[0]", gB, 0, st);
+                dbg_print_f("EP:split_B:up[0]",   uB, 0, st);
+  
                 const dim3 gridGLUB((cntB*I + THREADS_PER_BLOCK - 1)/THREADS_PER_BLOCK);
                 swiglu_kernel<<<gridGLUB, THREADS_PER_BLOCK, 0, st>>>(
                     gB, uB, guB, cntB, I, p->swiglu_limit);
+                dbg_print_f("EP:swiglu_B:gate_up[0]", guB, 0, st);
 
                 matmul_mxfp4(outB, guB, w->w_mlp2_mxfp4 + w2_pk, w->w_mlp2_scales + w2_sc,
                              cntB, I, H, (size_t)H*I, st);
@@ -1619,6 +1731,7 @@ void moe_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size)
                 const dim3 gridBiasB((elemsB + THREADS_PER_BLOCK - 1)/THREADS_PER_BLOCK);
                 add_bias_kernel<<<gridBiasB, THREADS_PER_BLOCK, 0, st>>>(
                     outB, w->b_mlp2 + ((size_t)layer_idx * Le + e_local) * (size_t)H, cntB, H);
+                dbg_print_f("EP:MLP2_B:out[0]", outB, 0, st);
 
                 HIP_CHECK(hipEventRecord(evMLPdone[(e_local + 7) % N_MLP_STREAMS], st));
             }
@@ -1639,6 +1752,7 @@ void moe_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size)
             s->expert_weights,
             local_total, H,
             batch_size);                 // <-- add this
+        dbg_print_f("EP:e_agg:after_local_scatter[0]", s->e_agg, 0, cpu->sScatter);
         HIP_CHECK(hipGetLastError());
         HIP_CHECK(hipGetLastError());
     }
@@ -1671,23 +1785,25 @@ void moe_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size)
     #pragma omp barrier
 
     // ===== [Stage 7] SCATTER contributions we just received back from peer =====
+    // ĐÚNG
+    // ===== [Stage 7] SCATTER contributions we just received back from peer =====
     int h_back = 0;
     HIP_CHECK(hipMemcpy(&h_back, s->d_recv_count, sizeof(int), hipMemcpyDeviceToHost));
     if (h_back > 0) {
-        // Reuse your scatter kernel directly on the received linear triplet:
         const int elems = h_back * H;
-        // We scatter using indices/weights we just received back.
         const dim3 grid((elems + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK);
         scatter_expert_outputs_kernel<<<grid, THREADS_PER_BLOCK, 0, cpu->sScatter>>>(
-            s->e_agg,
-            s->expert_output_buffer,
-            s->expert_indices,
-            s->expert_weights,
-            local_total, H,
-            batch_size);                 // <-- add this
-        HIP_CHECK(hipGetLastError());
+            /*d_e_agg*/              s->e_agg,
+            /*expert_output_buffer*/ s->d_recv_hidden,     // output từ peer
+            /*expert_indices*/       s->d_recv_token_ids,  // indices từ peer
+            /*expert_weights*/       s->d_recv_topk_v,     // weights từ peer
+            /*compact_rows*/         h_back,
+            /*hidden_dim*/           H,
+            /*B*/                    batch_size            // <--- THAM SỐ THỨ 7
+        );
         HIP_CHECK(hipGetLastError());
     }
+
 
     // ===== [Stage 8] Residual =====
     {
@@ -1695,12 +1811,14 @@ void moe_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size)
         accumulate_kernel<<<(elems + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK,
                             THREADS_PER_BLOCK, 0, cpu->sScatter>>>(
             s->x, s->e_agg, 1.0f, batch_size, H);
+        dbg_print_f("EP:x:after_residual[0]", s->x, 0, cpu->sScatter);
         HIP_CHECK(hipGetLastError());
     }
 
     HIP_CHECK(hipStreamSynchronize(cpu->sScatter));
     THREAD_DEBUG("  GPU %d finished scatter & residual\n", dev);
     for (int i=0;i<N_MLP_STREAMS;++i) HIP_CHECK(hipEventDestroy(evMLPdone[i]));
+}
 }
 
 
