@@ -53,9 +53,9 @@ typedef struct
     __hip_bfloat16 *b_router; // (n_layers, n_experts)
 
     // MoE weights now use MXFP4 quantization
-    uint8_t *w_mlp1_mxfp4, *w_mlp2_mxfp4; // Packed MXFP4 indices
-    float *w_mlp1_scales, *w_mlp2_scales; // MXFP4 block scales
-    __hip_bfloat16 *b_mlp1, *b_mlp2;      // Biases remain in bfloat16
+    uint8_t *w_mlp1_mxfp4, *w_mlp2_mxfp4; // Packed MXFP4 indices (n_layers, n_experts/2, 2*intermediate_dim, hidden_dim) and (n_layers, n_experts/2, hidden_dim, intermediate_dim)
+    float *w_mlp1_scales, *w_mlp2_scales; // MXFP4 block scales (n_layers, n_experts/2, num_blocks)
+    __hip_bfloat16 *b_mlp1, *b_mlp2;      // Biases remain in bfloat16 (n_layers, n_experts/2, 2*intermediate_dim) and (n_layers, n_experts/2, hidden_dim)
     __hip_bfloat16 *out_w;
     // Output weights
     __hip_bfloat16 *out; // (vocab_size, hidden_dim)
@@ -152,6 +152,9 @@ typedef struct
     GPUTransformerWeights weights; // GPU weights
     GPURunState state;             // GPU run state buffers
     CPUBuffers cpu_buffers;        // CPU buffers for host operations
+
+    int device_id;
+    int peer_device_id;
 } GPUTransformer;
 
 // Global variables for direct access in batched_generate_gpu
@@ -275,8 +278,12 @@ void malloc_gpu_run_state(GPURunState *s, Config *p)
     }
 }
 
-void malloc_gpu_weights(GPUTransformerWeights *w, Config *p)
+void malloc_gpu_weights(GPUTransformerWeights *w, Config *p, int gpu_id)
 {
+
+    // EXPERT PARALLELISM CHANGE: Allocate only half of the MoE weights
+    int n_local_experts = p->n_experts / 2;
+
     // Allocate GPU memory for all weights in bfloat16 format
     HIP_CHECK(hipMalloc((void **)&w->token_embedding_table, p->vocab_size * p->hidden_dim * sizeof(__hip_bfloat16)));
     HIP_CHECK(hipMalloc((void **)&w->rms_attn_w, p->n_layers * p->hidden_dim * sizeof(__hip_bfloat16)));
@@ -294,29 +301,33 @@ void malloc_gpu_weights(GPUTransformerWeights *w, Config *p)
     HIP_CHECK(hipMalloc((void **)&w->w_router, p->n_layers * p->hidden_dim * p->n_experts * sizeof(__hip_bfloat16)));
     HIP_CHECK(hipMalloc((void **)&w->b_router, p->n_layers * p->n_experts * sizeof(__hip_bfloat16)));
 
-    // MoE weights allocation with MXFP4 quantization
-    size_t mlp1_size = p->n_layers * p->n_experts * (2 * p->intermediate_dim) * p->hidden_dim;
-    size_t mlp1_packed_size = (mlp1_size + 1) / 2; // 2 FP4 values per byte
+    // MoE weights allocation for n_local_experts
+    size_t mlp1_size = (size_t)p->n_layers * n_local_experts * (2 * p->intermediate_dim) * p->hidden_dim;
+    size_t mlp1_packed_size = (mlp1_size + 1) / 2;
     size_t mlp1_num_blocks = (mlp1_size + MXFP4_BLOCK_SIZE - 1) / MXFP4_BLOCK_SIZE;
     HIP_CHECK(hipMalloc((void **)&w->w_mlp1_mxfp4, mlp1_packed_size));
     HIP_CHECK(hipMalloc((void **)&w->w_mlp1_scales, mlp1_num_blocks * sizeof(float)));
-    HIP_CHECK(hipMalloc((void **)&w->b_mlp1, p->n_layers * p->n_experts * (2 * p->intermediate_dim) * sizeof(__hip_bfloat16)));
+    HIP_CHECK(hipMalloc((void **)&w->b_mlp1, (size_t)p->n_layers * n_local_experts * (2 * p->intermediate_dim) * sizeof(__hip_bfloat16)));
 
-    size_t mlp2_size = p->n_layers * p->n_experts * p->hidden_dim * p->intermediate_dim;
-    size_t mlp2_packed_size = (mlp2_size + 1) / 2; // 2 FP4 values per byte
+    size_t mlp2_size = (size_t)p->n_layers * n_local_experts * p->hidden_dim * p->intermediate_dim;
+    size_t mlp2_packed_size = (mlp2_size + 1) / 2;
     size_t mlp2_num_blocks = (mlp2_size + MXFP4_BLOCK_SIZE - 1) / MXFP4_BLOCK_SIZE;
     HIP_CHECK(hipMalloc((void **)&w->w_mlp2_mxfp4, mlp2_packed_size));
     HIP_CHECK(hipMalloc((void **)&w->w_mlp2_scales, mlp2_num_blocks * sizeof(float)));
-    HIP_CHECK(hipMalloc((void **)&w->b_mlp2, p->n_layers * p->n_experts * p->hidden_dim * sizeof(__hip_bfloat16)));
+    HIP_CHECK(hipMalloc((void **)&w->b_mlp2, (size_t)p->n_layers * n_local_experts * p->hidden_dim * sizeof(__hip_bfloat16)));
 
     HIP_CHECK(hipMalloc((void **)&w->out, p->hidden_dim * p->vocab_size * sizeof(__hip_bfloat16)));
     HIP_CHECK(hipMalloc((void **)&w->attn_sinks, p->n_layers * p->n_attn_heads * sizeof(__hip_bfloat16)));
 }
 
-void copy_weights_to_gpu(Transformer *transformer, GPUTransformerWeights *gpu_weights)
+void copy_weights_to_gpu(Transformer *transformer, GPUTransformerWeights *gpu_weights, int gpu_id)
 {
     Config *p = &transformer->config;
     TransformerWeights *w = &transformer->weights;
+
+    // EXPERT PARALLELISM CHANGE: Determine which slice of expert weights to copy
+    int n_local_experts = p->n_experts / 2;
+    int expert_start_idx = (gpu_id % 2 == 0) ? 0 : n_local_experts;
 
     // Convert and copy embedding weights
     size_t embedding_size = p->vocab_size * p->hidden_dim;
@@ -389,32 +400,70 @@ void copy_weights_to_gpu(Transformer *transformer, GPUTransformerWeights *gpu_we
     HIP_CHECK(hipMemcpy(gpu_weights->b_router, h_b_router_bf16, b_router_size * sizeof(__hip_bfloat16), hipMemcpyHostToDevice));
     free(h_b_router_bf16);
 
-    size_t mlp1_size = p->n_layers * p->n_experts * (2 * p->intermediate_dim) * p->hidden_dim;
-    MXFP4Weights mlp1_mxfp4;
-    quantize_to_mxfp4(w->w_mlp1, mlp1_mxfp4, mlp1_size);
-    size_t mlp1_packed_size = (mlp1_size + 1) / 2;
-    HIP_CHECK(hipMemcpy(gpu_weights->w_mlp1_mxfp4, mlp1_mxfp4.packed_values, mlp1_packed_size, hipMemcpyHostToDevice));
-    HIP_CHECK(hipMemcpy(gpu_weights->w_mlp1_scales, mlp1_mxfp4.scales, mlp1_mxfp4.num_blocks * sizeof(float), hipMemcpyHostToDevice));
-    free_mxfp4_weights(mlp1_mxfp4);
+    // --- Sao chép các trọng số MoE Expert (phân mảnh) ---
 
-    size_t b_mlp1_size = p->n_layers * p->n_experts * (2 * p->intermediate_dim);
-    __hip_bfloat16 *h_b_mlp1_bf16 = (__hip_bfloat16 *)malloc(b_mlp1_size * sizeof(__hip_bfloat16));
-    convert_float_array_to_bfloat16(w->b_mlp1, h_b_mlp1_bf16, b_mlp1_size);
-    HIP_CHECK(hipMemcpy(gpu_weights->b_mlp1, h_b_mlp1_bf16, b_mlp1_size * sizeof(__hip_bfloat16), hipMemcpyHostToDevice));
+    // Trọng số MLP1 (Gate/Up) - Quantized MXFP4
+    size_t mlp1_full_layer_size = (size_t)p->n_experts * (2 * p->intermediate_dim) * p->hidden_dim;
+    size_t mlp1_local_layer_size = (size_t)n_local_experts * (2 * p->intermediate_dim) * p->hidden_dim;
+    for (int l = 0; l < p->n_layers; ++l)
+    {
+        float *layer_w_mlp1 = w->w_mlp1 + l * mlp1_full_layer_size;
+        float *shard_start = layer_w_mlp1 + expert_start_idx * (2 * p->intermediate_dim) * p->hidden_dim;
+
+        MXFP4Weights mlp1_mxfp4;
+        quantize_to_mxfp4(shard_start, mlp1_mxfp4, mlp1_local_layer_size);
+
+        uint8_t *gpu_w_ptr = gpu_weights->w_mlp1_mxfp4 + l * ((mlp1_local_layer_size + 1) / 2);
+        float *gpu_s_ptr = gpu_weights->w_mlp1_scales + l * ((mlp1_local_layer_size + MXFP4_BLOCK_SIZE - 1) / MXFP4_BLOCK_SIZE);
+
+        HIP_CHECK(hipMemcpy(gpu_w_ptr, mlp1_mxfp4.packed_values, (mlp1_mxfp4.num_elements + 1) / 2, hipMemcpyHostToDevice));
+        HIP_CHECK(hipMemcpy(gpu_s_ptr, mlp1_mxfp4.scales, mlp1_mxfp4.num_blocks * sizeof(float), hipMemcpyHostToDevice));
+        free_mxfp4_weights(mlp1_mxfp4);
+    }
+
+    // Biases MLP1 - bfloat16
+    size_t b_mlp1_full_layer_size = (size_t)p->n_experts * (2 * p->intermediate_dim);
+    size_t b_mlp1_local_layer_size = (size_t)n_local_experts * (2 * p->intermediate_dim);
+    __hip_bfloat16 *h_b_mlp1_bf16 = (__hip_bfloat16 *)malloc(b_mlp1_local_layer_size * sizeof(__hip_bfloat16));
+    for (int l = 0; l < p->n_layers; ++l)
+    {
+        float *layer_b_mlp1 = w->b_mlp1 + l * b_mlp1_full_layer_size;
+        float *shard_start = layer_b_mlp1 + expert_start_idx * (2 * p->intermediate_dim);
+        convert_float_array_to_bfloat16(shard_start, h_b_mlp1_bf16, b_mlp1_local_layer_size);
+        HIP_CHECK(hipMemcpy(gpu_weights->b_mlp1 + l * b_mlp1_local_layer_size, h_b_mlp1_bf16, b_mlp1_local_layer_size * sizeof(__hip_bfloat16), hipMemcpyHostToDevice));
+    }
     free(h_b_mlp1_bf16);
 
-    size_t mlp2_size = p->n_layers * p->n_experts * p->hidden_dim * p->intermediate_dim;
-    MXFP4Weights mlp2_mxfp4;
-    quantize_to_mxfp4(w->w_mlp2, mlp2_mxfp4, mlp2_size);
-    size_t mlp2_packed_size = (mlp2_size + 1) / 2;
-    HIP_CHECK(hipMemcpy(gpu_weights->w_mlp2_mxfp4, mlp2_mxfp4.packed_values, mlp2_packed_size, hipMemcpyHostToDevice));
-    HIP_CHECK(hipMemcpy(gpu_weights->w_mlp2_scales, mlp2_mxfp4.scales, mlp2_mxfp4.num_blocks * sizeof(float), hipMemcpyHostToDevice));
-    free_mxfp4_weights(mlp2_mxfp4);
+    // Trọng số MLP2 (Down) - Quantized MXFP4
+    size_t mlp2_full_layer_size = (size_t)p->n_experts * p->hidden_dim * p->intermediate_dim;
+    size_t mlp2_local_layer_size = (size_t)n_local_experts * p->hidden_dim * p->intermediate_dim;
+    for (int l = 0; l < p->n_layers; ++l)
+    {
+        float *layer_w_mlp2 = w->w_mlp2 + l * mlp2_full_layer_size;
+        float *shard_start = layer_w_mlp2 + expert_start_idx * p->hidden_dim * p->intermediate_dim;
 
-    size_t b_mlp2_size = p->n_layers * p->n_experts * p->hidden_dim;
-    __hip_bfloat16 *h_b_mlp2_bf16 = (__hip_bfloat16 *)malloc(b_mlp2_size * sizeof(__hip_bfloat16));
-    convert_float_array_to_bfloat16(w->b_mlp2, h_b_mlp2_bf16, b_mlp2_size);
-    HIP_CHECK(hipMemcpy(gpu_weights->b_mlp2, h_b_mlp2_bf16, b_mlp2_size * sizeof(__hip_bfloat16), hipMemcpyHostToDevice));
+        MXFP4Weights mlp2_mxfp4;
+        quantize_to_mxfp4(shard_start, mlp2_mxfp4, mlp2_local_layer_size);
+
+        uint8_t *gpu_w_ptr = gpu_weights->w_mlp2_mxfp4 + l * ((mlp2_local_layer_size + 1) / 2);
+        float *gpu_s_ptr = gpu_weights->w_mlp2_scales + l * ((mlp2_local_layer_size + MXFP4_BLOCK_SIZE - 1) / MXFP4_BLOCK_SIZE);
+
+        HIP_CHECK(hipMemcpy(gpu_w_ptr, mlp2_mxfp4.packed_values, (mlp2_mxfp4.num_elements + 1) / 2, hipMemcpyHostToDevice));
+        HIP_CHECK(hipMemcpy(gpu_s_ptr, mlp2_mxfp4.scales, mlp2_mxfp4.num_blocks * sizeof(float), hipMemcpyHostToDevice));
+        free_mxfp4_weights(mlp2_mxfp4);
+    }
+
+    // Biases MLP2 - bfloat16
+    size_t b_mlp2_full_layer_size = (size_t)p->n_experts * p->hidden_dim;
+    size_t b_mlp2_local_layer_size = (size_t)n_local_experts * p->hidden_dim;
+    __hip_bfloat16 *h_b_mlp2_bf16 = (__hip_bfloat16 *)malloc(b_mlp2_local_layer_size * sizeof(__hip_bfloat16));
+    for (int l = 0; l < p->n_layers; ++l)
+    {
+        float *layer_b_mlp2 = w->b_mlp2 + l * b_mlp2_full_layer_size;
+        float *shard_start = layer_b_mlp2 + expert_start_idx * p->hidden_dim;
+        convert_float_array_to_bfloat16(shard_start, h_b_mlp2_bf16, b_mlp2_local_layer_size);
+        HIP_CHECK(hipMemcpy(gpu_weights->b_mlp2 + l * b_mlp2_local_layer_size, h_b_mlp2_bf16, b_mlp2_local_layer_size * sizeof(__hip_bfloat16), hipMemcpyHostToDevice));
+    }
     free(h_b_mlp2_bf16);
 
     // Convert and copy output weights
@@ -426,6 +475,8 @@ void copy_weights_to_gpu(Transformer *transformer, GPUTransformerWeights *gpu_we
 
     printf("Weight conversion and copying completed successfully\n");
 }
+
+
 
 void malloc_cpu_buffers(CPUBuffers *cpu_buf, Config *p)
 {
@@ -463,18 +514,18 @@ void malloc_cpu_buffers(CPUBuffers *cpu_buf, Config *p)
     HIP_CHECK(hipHostMalloc(&cpu_buf->logits, BATCH_SIZE * p->vocab_size * sizeof(float)));
 }
 
-void build_gpu_transformer(GPUTransformer *gpu_t, Transformer *cpu_t)
+void build_gpu_transformer(GPUTransformer *gpu_t, Transformer *cpu_t, int gpu_id)
 {
     // Copy config
     gpu_t->config = cpu_t->config;
 
     // Allocate GPU memory
-    malloc_gpu_weights(&gpu_t->weights, &gpu_t->config);
+    malloc_gpu_weights(&gpu_t->weights, &gpu_t->config, gpu_id);
     malloc_gpu_run_state(&gpu_t->state, &gpu_t->config);
     malloc_cpu_buffers(&gpu_t->cpu_buffers, &gpu_t->config);
 
     // Copy weights to GPU
-    copy_weights_to_gpu(cpu_t, &gpu_t->weights);
+    copy_weights_to_gpu(cpu_t, &gpu_t->weights, gpu_id);
 }
 
 void warm_up(Transformer *transformer, Tokenizer *tokenizer)
@@ -483,18 +534,40 @@ void warm_up(Transformer *transformer, Tokenizer *tokenizer)
     // Create GPU transformer
     // Multi-GPU support: allocate and initialize GPUTransformer for each GPU
     HIP_CHECK(hipGetDeviceCount(&num_gpus));
-    if (num_gpus > MAX_GPUS) num_gpus = MAX_GPUS;
+    if (num_gpus > MAX_GPUS)
+        num_gpus = MAX_GPUS;
+    // EXPERT PARALLELISM CHANGE: Must have an even number of GPUs
+    if (num_gpus % 2 != 0 && num_gpus > 1)
+    {
+        fprintf(stderr, "Expert Parallelism requires an even number of GPUs. Found %d.\n", num_gpus);
+        exit(EXIT_FAILURE);
+    }
 
-    #pragma omp parallel for
-    for (int dev = 0; dev < num_gpus; ++dev) {
+#pragma omp parallel for
+    for (int dev = 0; dev < num_gpus; ++dev)
+    {
         HIP_CHECK(hipSetDevice(dev));
         gpu_transformers[dev] = (GPUTransformer *)malloc(sizeof(GPUTransformer));
         assert(gpu_transformers[dev] != NULL);
 
         GPUTransformer *gpu_transformer = gpu_transformers[dev];
+        gpu_transformer->device_id = dev;
+
+        // EXPERT PARALLELISM CHANGE: Enable peer access
+        if (num_gpus > 1)
+        {
+            gpu_transformer->peer_device_id = (dev % 2 == 0) ? dev + 1 : dev - 1;
+            HIP_CHECK(hipDeviceEnablePeerAccess(gpu_transformer->peer_device_id, 0));
+            printf("GPU %d enabled peer access to GPU %d\n", dev, gpu_transformer->peer_device_id);
+            // Create events for this GPU to signal when it sends data
+        }
+        else
+        {
+            gpu_transformer->peer_device_id = -1;
+        }
 
         gpu_transformer->config = transformer->config;
-        build_gpu_transformer(gpu_transformer, transformer);
+        build_gpu_transformer(gpu_transformer, transformer, dev);
 
         float ntk_beta = 32.0f;
         float ntk_alpha = 1.0f;
@@ -502,9 +575,9 @@ void warm_up(Transformer *transformer, Tokenizer *tokenizer)
         for (int pos = 0; pos < MAX_SEQ_LEN; ++pos)
         {
             compute_cos_sin_getp(pos, p->rope_theta, p->head_dim, p->rope_scaling_factor,
-                                p->initial_context_length, ntk_beta, ntk_alpha,
-                                gpu_transformer->cpu_buffers.cos_vals + (pos * p->head_dim / 2),
-                                gpu_transformer->cpu_buffers.sin_vals + (pos * p->head_dim / 2));
+                                 p->initial_context_length, ntk_beta, ntk_alpha,
+                                 gpu_transformer->cpu_buffers.cos_vals + (pos * p->head_dim / 2),
+                                 gpu_transformer->cpu_buffers.sin_vals + (pos * p->head_dim / 2));
         }
 
         // Copy RoPE values to GPU
@@ -512,7 +585,7 @@ void warm_up(Transformer *transformer, Tokenizer *tokenizer)
                             (p->head_dim / 2) * MAX_SEQ_LEN * sizeof(float), hipMemcpyHostToDevice));
         HIP_CHECK(hipMemcpy(gpu_transformer->state.sin_vals, gpu_transformer->cpu_buffers.sin_vals,
                             (p->head_dim / 2) * MAX_SEQ_LEN * sizeof(float), hipMemcpyHostToDevice));
-    }    
+    }
 }
 
 void free_gpu_weights(GPUTransformerWeights *w)
@@ -991,7 +1064,7 @@ void moe_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size)
                              cpu_buf->sScatter));
 
     // ===== 3) EXPERT MLPs on multiple streams, each waits on permute =====
-    for (int expert_id = 0; expert_id < n_experts; ++expert_id)
+    for (int expert_id = 0; expert_id < n_experts/2; ++expert_id)
     {
         const int h_batch_count = cpu_buf->expert_counts[expert_id];
         if (h_batch_count == 0)
@@ -1011,7 +1084,8 @@ void moe_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size)
 
         // MLP1 (Gate/Up) — MXFP4
         {
-            const size_t w_off1 = ((size_t)layer_idx * n_experts + expert_id) * (size_t)(2 * intermediate_dim) * hidden_dim;
+            // FIXED: Use local expert indexing for memory layout
+            const size_t w_off1 = ((size_t)layer_idx * (n_experts/2) + expert_id) * (size_t)(2 * intermediate_dim) * hidden_dim;
             const size_t w_packed_off1 = w_off1 / 2; // 2 FP4 / byte
             const size_t w_scale_off1 = w_off1 / MXFP4_BLOCK_SIZE;
             const size_t total_elems1 = (size_t)(2 * intermediate_dim) * hidden_dim;
@@ -1029,7 +1103,7 @@ void moe_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size)
             const dim3 grid((elems + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK);
             split_gate_up_kernel<<<grid, THREADS_PER_BLOCK, 0, st>>>(
                 gate_ptr, up_ptr, mlp1_out_ptr,
-                w->b_mlp1 + ((size_t)layer_idx * n_experts + expert_id) * (size_t)(2 * intermediate_dim),
+                w->b_mlp1 + ((size_t)layer_idx * (n_experts/2) + expert_id) * (size_t)(2 * intermediate_dim),
                 h_batch_count, intermediate_dim);
         }
         {
@@ -1042,7 +1116,7 @@ void moe_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size)
 
         // MLP2 (Down) — MXFP4
         {
-            const size_t w_off2 = ((size_t)layer_idx * n_experts + expert_id) * (size_t)hidden_dim * intermediate_dim;
+            const size_t w_off2 = ((size_t)layer_idx * (n_experts/2) + expert_id) * (size_t)hidden_dim * intermediate_dim;
             const size_t w_packed_off2 = w_off2 / 2;
             const size_t w_scale_off2 = w_off2 / MXFP4_BLOCK_SIZE;
             const size_t total_elems2 = (size_t)hidden_dim * intermediate_dim;
@@ -1060,7 +1134,7 @@ void moe_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size)
             const dim3 grid((elems + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK);
             add_bias_kernel<<<grid, THREADS_PER_BLOCK, 0, st>>>(
                 expert_output_ptr,
-                w->b_mlp2 + ((size_t)layer_idx * n_experts + expert_id) * (size_t)hidden_dim,
+                w->b_mlp2 + ((size_t)layer_idx * (n_experts/2) + expert_id) * (size_t)hidden_dim,
                 h_batch_count, hidden_dim);
             HIP_CHECK(hipGetLastError());
         }
