@@ -9,7 +9,8 @@
 
 # Tạo thư mục logs nếu chưa có
 mkdir -p logs
-
+export MODELS_ROOT="/nfs/gpu_trainee/final-project/models"
+export MODELBIN_ROOT="/nfs/gpu_trainee/final-project/modelbin"
 # Lấy hostname của node được assign
 NODE=$(hostname)
 echo "Running on node: $NODE"
