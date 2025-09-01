@@ -1,1 +1,1 @@
-python eval.py -p ../data/input.txt -s ../data/output.txt -r ./refs_openai_gpt5.jsonl 
+python eval.py -p /nfs/gpu_trainee/getp02/gpt-oss/data/input.txt -s /nfs/gpu_trainee/getp02/gpt-oss/data/output_sliding_window.txt -r /nfs/gpu_trainee/getp02/gpt-oss/eval/ref_new_truncated_100.jsonl
