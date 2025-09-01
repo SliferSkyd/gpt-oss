@@ -24,6 +24,11 @@
 #include "kernels/rope.hpp"
 #include "memory/mxfp4.hpp"
 #include <omp.h>
+#include <algorithm>
+#include <numeric>
+#include <queue>
+#include <vector>
+
 
 #ifndef GETP_RUN
 #define GETP_RUN
@@ -883,7 +888,6 @@ void attention_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size)
 }
 
 
-
 void moe_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size)
 {
     TIME_SCOPE(moe);
@@ -985,6 +989,31 @@ void moe_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size)
         HIP_CHECK(hipEventRecord(evPermuteDone, cpu_buf->sGather));
     }
 
+    // --- Load-balanced expert→stream assignment (LPT heuristic) ---
+    std::vector<int> expert_to_stream(n_experts, 0);
+
+    // Min-heap of (current_load, stream_id)
+    using Node = std::pair<int,int>;
+    std::priority_queue<Node, std::vector<Node>, std::greater<Node>> pq;
+    for (int sid = 0; sid < N_MLP_STREAMS; ++sid) pq.emplace(0, sid);
+
+    // Order experts by descending token count
+    std::vector<int> order(n_experts);
+    std::iota(order.begin(), order.end(), 0);
+    std::sort(order.begin(), order.end(), [&](int a, int b){
+        return cpu_buf->expert_counts[a] > cpu_buf->expert_counts[b];
+    });
+
+    // Assign experts to streams with smallest running load
+    for (int e : order) {
+        auto [load, sid] = pq.top(); pq.pop();
+        expert_to_stream[e] = sid;
+        // Use token count as load proxy (works because other dims are constant per expert)
+        load += cpu_buf->expert_counts[e];
+        pq.emplace(load, sid);
+    }
+        // ---------------------------------
+
     // ===== CRITICAL FIX: Zero buffer AFTER gather completes =====
     // Đợi gather hoàn thành trước khi zero buffer trên sScatter
     HIP_CHECK(hipStreamWaitEvent(cpu_buf->sScatter, evPermuteDone, 0));
@@ -999,7 +1028,8 @@ void moe_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size)
         if (h_batch_count == 0)
             continue;
 
-        hipStream_t st = cpu_buf->sMLP[expert_id % N_MLP_STREAMS];
+        // hipStream_t st = cpu_buf->sMLP[expert_id % N_MLP_STREAMS];
+        hipStream_t st = cpu_buf->sMLP[ expert_to_stream[expert_id] ];
         HIP_CHECK(hipStreamWaitEvent(st, evPermuteDone, 0));
 
         const int expert_tok_off = cpu_buf->expert_offsets[expert_id];
