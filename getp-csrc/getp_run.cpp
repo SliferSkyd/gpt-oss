@@ -15,6 +15,9 @@
 #include "config.hpp"
 #include "utils.hpp"
 #include "kernels/attention.hpp"
+#if USE_FP8_KV_CACHE
+#include "kernels/attention_fp8.hpp"
+#endif
 #include "kernels/rmsnorm.hpp"
 #include "kernels/matmul.hpp"
 #include "kernels/softmax.hpp"
@@ -84,9 +87,18 @@ typedef struct
     float *att;  // attention scores (batch_size, n_attn_heads, seq_len)
     float *mask; // attention mask (seq_len, seq_len)
 
-    // KV cache - now using BF16 for 50% memory reduction
+    // KV cache - configurable FP8/BF16 support
+#if USE_FP8_KV_CACHE
+    uint8_t *key_cache;          // FP8 E4M3 format (batch_size, n_layers, seq_len, kv_dim)
+    uint8_t *value_cache;        // FP8 E4M3 format (batch_size, n_layers, seq_len, kv_dim)
+    float *kv_scale;             // Per-layer quantization scales (n_layers * 2)
+    // Mixed precision: keep first few tokens in BF16 for accuracy
+    __hip_bfloat16 *key_cache_bf16;   // (batch_size, n_layers, FP8_MIXED_PRECISION_TOKENS, kv_dim)
+    __hip_bfloat16 *value_cache_bf16; // (batch_size, n_layers, FP8_MIXED_PRECISION_TOKENS, kv_dim)
+#else
     __hip_bfloat16 *key_cache;   // (batch_size, n_layers, seq_len, kv_dim)
     __hip_bfloat16 *value_cache; // (batch_size, n_layers, seq_len, kv_dim)
+#endif
 
     // RoPE buffers
     float *cos_vals; // (head_dim/2, seq_len)
@@ -174,17 +186,38 @@ void malloc_gpu_run_state(GPURunState *s, Config *p)
     s->d_expert_offsets = NULL;
     s->d_expert_write_idx = NULL;
     s->d_total_tokens = NULL;
+#if USE_FP8_KV_CACHE
+    s->key_cache = NULL;
+    s->value_cache = NULL;
+    s->kv_scale = NULL;
+    s->key_cache_bf16 = NULL;
+    s->value_cache_bf16 = NULL;
+#else
+    s->key_cache = NULL;
+    s->value_cache = NULL;
+#endif
 
     // Check memory requirements and print for debugging
     size_t total_memory = 0;
     size_t batch_hidden = BATCH_SIZE * p->hidden_dim * sizeof(float);
     size_t batch_qkv = BATCH_SIZE * p->head_dim * (p->n_attn_heads + 2 * p->n_kv_heads) * sizeof(float);
+    
+#if USE_FP8_KV_CACHE
+    // FP8 KV cache - 75% memory reduction compared to FP32, 50% reduction compared to BF16
+    size_t kv_cache_size = BATCH_SIZE * p->n_layers * MAX_SEQ_LEN * kv_dim * sizeof(uint8_t);
+    size_t kv_cache_bf16_size = BATCH_SIZE * p->n_layers * FP8_MIXED_PRECISION_TOKENS * kv_dim * sizeof(__hip_bfloat16);
+    printf("Allocating GPU memory: batch_size=%d, hidden_dim=%d, seq_len=%d\n",
+           BATCH_SIZE, p->hidden_dim, MAX_SEQ_LEN);
+    printf("KV cache size per batch (FP8 E4M3): %zu MB (75%% reduction from FP32)\n", kv_cache_size / (1024 * 1024));
+    printf("Mixed precision BF16 cache: %zu MB for first %d tokens\n", 
+           kv_cache_bf16_size / (1024 * 1024), FP8_MIXED_PRECISION_TOKENS);
+#else
     // BF16 KV cache - 50% memory reduction compared to FP32
     size_t kv_cache_size = BATCH_SIZE * p->n_layers * MAX_SEQ_LEN * kv_dim * sizeof(__hip_bfloat16);
-
     printf("Allocating GPU memory: batch_size=%d, hidden_dim=%d, seq_len=%d\n",
            BATCH_SIZE, p->hidden_dim, MAX_SEQ_LEN);
     printf("KV cache size per batch (BF16): %zu MB (50%% reduction from FP32)\n", kv_cache_size / (1024 * 1024));
+#endif
 
     // Allocate GPU memory with error checking
     HIP_CHECK(hipMalloc((void **)&s->x, batch_hidden));
@@ -211,8 +244,23 @@ void malloc_gpu_run_state(GPURunState *s, Config *p)
     HIP_CHECK(hipMalloc((void **)&s->d_total_tokens, sizeof(int)));
 
     // KV cache allocation - this is usually the largest allocation
+#if USE_FP8_KV_CACHE
     HIP_CHECK(hipMalloc((void **)&s->key_cache, kv_cache_size));
     HIP_CHECK(hipMalloc((void **)&s->value_cache, kv_cache_size));
+    HIP_CHECK(hipMalloc((void **)&s->kv_scale, p->n_layers * 2 * sizeof(float)));
+    HIP_CHECK(hipMalloc((void **)&s->key_cache_bf16, kv_cache_bf16_size));
+    HIP_CHECK(hipMalloc((void **)&s->value_cache_bf16, kv_cache_bf16_size));
+    // Initialize scales to 1.0 properly
+    float *h_scales = (float*)malloc(p->n_layers * 2 * sizeof(float));
+    for (int i = 0; i < p->n_layers * 2; i++) {
+        h_scales[i] = 1.0f;
+    }
+    HIP_CHECK(hipMemcpy(s->kv_scale, h_scales, p->n_layers * 2 * sizeof(float), hipMemcpyHostToDevice));
+    free(h_scales);
+#else
+    HIP_CHECK(hipMalloc((void **)&s->key_cache, kv_cache_size));
+    HIP_CHECK(hipMalloc((void **)&s->value_cache, kv_cache_size));
+#endif
 
     HIP_CHECK(hipMalloc((void **)&s->att, BATCH_SIZE * p->n_attn_heads * MAX_SEQ_LEN * sizeof(float)));
     HIP_CHECK(hipMalloc((void **)&s->logits, BATCH_SIZE * p->vocab_size * sizeof(float)));
@@ -245,8 +293,15 @@ void malloc_gpu_run_state(GPURunState *s, Config *p)
     HIP_CHECK(hipMemset(s->q, 0, BATCH_SIZE * p->n_attn_heads * p->head_dim * sizeof(float)));
     HIP_CHECK(hipMemset(s->k, 0, BATCH_SIZE * kv_dim * sizeof(float)));
     HIP_CHECK(hipMemset(s->v, 0, BATCH_SIZE * kv_dim * sizeof(float)));
+#if USE_FP8_KV_CACHE
     HIP_CHECK(hipMemset(s->key_cache, 0, kv_cache_size));
     HIP_CHECK(hipMemset(s->value_cache, 0, kv_cache_size));
+    HIP_CHECK(hipMemset(s->key_cache_bf16, 0, kv_cache_bf16_size));
+    HIP_CHECK(hipMemset(s->value_cache_bf16, 0, kv_cache_bf16_size));
+#else
+    HIP_CHECK(hipMemset(s->key_cache, 0, kv_cache_size));
+    HIP_CHECK(hipMemset(s->value_cache, 0, kv_cache_size));
+#endif
     HIP_CHECK(hipMemset(s->att, 0, BATCH_SIZE * p->n_attn_heads * MAX_SEQ_LEN * sizeof(float)));
     HIP_CHECK(hipMemset(s->logits, 0, BATCH_SIZE * p->vocab_size * sizeof(float)));
 
@@ -584,10 +639,23 @@ void free_gpu_run_state(GPURunState *s)
         HIP_CHECK(hipFree(s->att));
     if (s->mask)
         HIP_CHECK(hipFree(s->mask));
+#if USE_FP8_KV_CACHE
     if (s->key_cache)
         HIP_CHECK(hipFree(s->key_cache));
     if (s->value_cache)
         HIP_CHECK(hipFree(s->value_cache));
+    if (s->kv_scale)
+        HIP_CHECK(hipFree(s->kv_scale));
+    if (s->key_cache_bf16)
+        HIP_CHECK(hipFree(s->key_cache_bf16));
+    if (s->value_cache_bf16)
+        HIP_CHECK(hipFree(s->value_cache_bf16));
+#else
+    if (s->key_cache)
+        HIP_CHECK(hipFree(s->key_cache));
+    if (s->value_cache)
+        HIP_CHECK(hipFree(s->value_cache));
+#endif
     if (s->cos_vals)
         HIP_CHECK(hipFree(s->cos_vals));
     if (s->sin_vals)
@@ -802,13 +870,20 @@ void attention_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size)
     HIP_CHECK(hipGetLastError());
 
 
-    // Update KV cache - NEW: Proper GPU kernel
+    // Update KV cache - NEW: Proper GPU kernel with FP8 support
     dim3 kv_grid(batch_size, (kv_dim + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK);
     dim3 kv_block(1, THREADS_PER_BLOCK);
     {
+#if USE_FP8_KV_CACHE
+        update_kv_cache_kernel<<<kv_grid, kv_block>>>(
+            s->key_cache, s->value_cache, s->key_cache_bf16, s->value_cache_bf16,
+            s->k, s->v, s->kv_scale, s->positions, batch_size,
+            p->n_layers, layer_idx, MAX_SEQ_LEN, kv_dim);
+#else
         update_kv_cache_kernel<<<kv_grid, kv_block>>>(
             s->key_cache, s->value_cache, s->k, s->v, s->positions, batch_size,
             p->n_layers, layer_idx, MAX_SEQ_LEN, kv_dim);
+#endif
         HIP_CHECK(hipGetLastError());
     }
 
@@ -828,9 +903,34 @@ void attention_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size)
         const size_t att_cap = apply_window ? (SW_WINDOW + 1) : MAX_SEQ_LEN;
 
         // New layout: s_att[att_cap] + s_partials[warps * head_dim] + s_reduce[warps]
+        // Add extra buffer for FP8 to avoid potential overruns
         const size_t shared_mem_size =
-            (att_cap + (size_t)warps * p->head_dim + warps) * sizeof(float);
+            (att_cap + (size_t)warps * p->head_dim + warps + 256) * sizeof(float);
 
+#if USE_FP8_KV_CACHE
+        hipLaunchKernelGGL(
+            fused_attention_kernel_fp8,
+            grid, block, shared_mem_size, 0 /*stream*/,
+            s->tb,
+            s->q,
+            s->key_cache,
+            s->value_cache,
+            s->key_cache_bf16,
+            s->value_cache_bf16,
+            w->attn_sinks + layer_idx * p->n_attn_heads,
+            s->mask,
+            s->positions,
+            s->kv_scale,
+            batch_size,
+            p->n_attn_heads,
+            p->n_kv_heads,
+            p->head_dim,
+            MAX_SEQ_LEN,
+            p->n_layers,
+            layer_idx,
+            p->sliding_window > 0
+        );
+#else
         hipLaunchKernelGGL(
             fused_attention_kernel,
             grid, block, shared_mem_size, 0 /*stream*/,
@@ -850,6 +950,7 @@ void attention_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size)
             layer_idx,
             p->sliding_window > 0
         );
+#endif
         HIP_CHECK(hipGetLastError());
     }
 

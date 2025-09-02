@@ -27,7 +27,62 @@ __global__ void add_bias_kernel(float *output, const __hip_bfloat16 *bias, int b
     }
 }
 
-// NEW: KV cache update kernel with BF16 quantization
+// Include FP8 conversion utilities
+#include "../config.hpp"
+#if USE_FP8_KV_CACHE
+#include "../memory/fp8_e4m3.hpp"
+#endif
+
+// KV cache update kernel with configurable FP8/BF16 quantization
+#if USE_FP8_KV_CACHE
+__global__ void update_kv_cache_kernel(
+    uint8_t *key_cache, uint8_t *value_cache,
+    __hip_bfloat16 *key_cache_bf16, __hip_bfloat16 *value_cache_bf16,
+    const float *k, const float *v,
+    float *kv_scale,  // Per-layer scales [n_layers * 2]
+    const int *positions, int batch_size,
+    int n_layers, int layer_idx, int seq_len,
+    int kv_dim)
+{
+    size_t batch_idx = blockIdx.x;
+    size_t dim_idx = 1LL * blockIdx.y * blockDim.y + threadIdx.y;
+
+    if (batch_idx >= batch_size || dim_idx >= kv_dim)
+        return;
+
+    int pos = positions[batch_idx];
+    if (pos >= seq_len)
+        return; // Safety check
+
+    float k_val = k[1LL * batch_idx * kv_dim + dim_idx];
+    float v_val = v[1LL * batch_idx * kv_dim + dim_idx];
+    
+    // Mixed precision: keep first few tokens in BF16 for accuracy
+    if (pos < FP8_MIXED_PRECISION_TOKENS) {
+        // Store in BF16 cache
+        size_t k_bf16_idx = batch_idx * n_layers * FP8_MIXED_PRECISION_TOKENS * kv_dim +
+                           layer_idx * FP8_MIXED_PRECISION_TOKENS * kv_dim + 
+                           pos * kv_dim + dim_idx;
+        size_t v_bf16_idx = k_bf16_idx;  // Same structure for value cache
+        
+        key_cache_bf16[k_bf16_idx] = __float2bfloat16(k_val);
+        value_cache_bf16[v_bf16_idx] = __float2bfloat16(v_val);
+    }
+    
+    // Always store in FP8 cache for long-range context
+    size_t cache_idx = batch_idx * n_layers * seq_len * kv_dim +
+                      layer_idx * seq_len * kv_dim + pos * kv_dim + dim_idx;
+    
+    // Get per-layer scales
+    float k_scale = kv_scale[layer_idx * 2];
+    float v_scale = kv_scale[layer_idx * 2 + 1];
+    
+    // Quantize to FP8 with scaling
+    key_cache[cache_idx] = fp8_e4m3::float_to_fp8_e4m3(k_val * k_scale, true);
+    value_cache[cache_idx] = fp8_e4m3::float_to_fp8_e4m3(v_val * v_scale, true);
+}
+#else
+// Original BF16 version
 __global__ void update_kv_cache_kernel(__hip_bfloat16 *key_cache, __hip_bfloat16 *value_cache,
                                        const float *k, const float *v,
                                        const int *positions, int batch_size,
@@ -54,6 +109,7 @@ __global__ void update_kv_cache_kernel(__hip_bfloat16 *key_cache, __hip_bfloat16
                       layer_idx * seq_len * kv_dim + pos * kv_dim + dim_idx;
     value_cache[v_cache_idx] = __float2bfloat16(v[1LL*batch_idx * kv_dim + dim_idx]);
 }
+#endif
 
 
 __global__ void copy_embeddings_kernel(float *output, const __hip_bfloat16 *embeddings,
