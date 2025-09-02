@@ -1041,36 +1041,33 @@ void moe_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size)
         float *gate_up_ptr = s->gate_up + (size_t)expert_tok_off * intermediate_dim;
         float *expert_output_ptr = s->expert_output_buffer + (size_t)expert_tok_off * hidden_dim;
 
-        // MLP1 (Gate/Up) — MXFP4
+        // Old:
+        // matmul_mxfp4(mlp1_out_ptr, expert_input_ptr, ... 2*I ...);
+        // split_gate_up_kernel(... mlp1_out_ptr ...);
+        // swiglu_kernel(... gate_ptr, up_ptr ...);
+
+        // New (single call → writes gate_up_ptr [B, I] directly):
         {
-            const size_t w_off1 = ((size_t)layer_idx * n_experts + expert_id) * (size_t)(2 * intermediate_dim) * hidden_dim;
-            const size_t w_packed_off1 = w_off1 / 2; // 2 FP4 / byte
+            const size_t w_off1       = ((size_t)layer_idx * n_experts + expert_id) * (size_t)(2 * intermediate_dim) * hidden_dim;
+            const size_t w_packed_off1= w_off1 / 2;
             const size_t w_scale_off1 = w_off1 / MXFP4_BLOCK_SIZE;
             const size_t total_elems1 = (size_t)(2 * intermediate_dim) * hidden_dim;
 
-            matmul_mxfp4(mlp1_out_ptr, expert_input_ptr,
-                         w->w_mlp1_mxfp4 + w_packed_off1,
-                         w->w_mlp1_scales + w_scale_off1,
-                         h_batch_count, hidden_dim, 2 * intermediate_dim,
-                         total_elems1, st);
+            matmul_mxfp4_swiglu_fused(
+                /*out_gate_up=*/gate_up_ptr,
+                /*input=*/expert_input_ptr,
+                /*weight_packed=*/w->w_mlp1_mxfp4 + w_packed_off1,
+                /*weight_scales=*/w->w_mlp1_scales + w_scale_off1,
+                /*bias_mlp1=*/w->b_mlp1 + ((size_t)layer_idx * n_experts + expert_id) * (size_t)(2 * intermediate_dim),
+                /*batch_size=*/h_batch_count,
+                /*hidden_dim=*/hidden_dim,
+                /*intermediate_dim=*/intermediate_dim,
+                /*total_weight_elements=*/total_elems1,
+                /*clamp_limit=*/p->swiglu_limit,
+                /*stream=*/st
+            );
         }
 
-        // split + swiglu
-        {
-            const int elems = h_batch_count * intermediate_dim;
-            const dim3 grid((elems + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK);
-            split_gate_up_kernel<<<grid, THREADS_PER_BLOCK, 0, st>>>(
-                gate_ptr, up_ptr, mlp1_out_ptr,
-                w->b_mlp1 + ((size_t)layer_idx * n_experts + expert_id) * (size_t)(2 * intermediate_dim),
-                h_batch_count, intermediate_dim);
-        }
-        {
-            const int elems = h_batch_count * intermediate_dim;
-            const dim3 grid((elems + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK);
-            swiglu_kernel<<<grid, THREADS_PER_BLOCK, 0, st>>>(
-                gate_ptr, up_ptr, gate_up_ptr,
-                h_batch_count, intermediate_dim, p->swiglu_limit);
-        }
 
         // MLP2 (Down) — MXFP4
         {

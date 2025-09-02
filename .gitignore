@@ -39,3 +39,4 @@ logs/
 times.csv
 analysis_report.txt
 kernel_analysis.png
+*.txt
