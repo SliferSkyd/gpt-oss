@@ -46,6 +46,9 @@ std::mutex debug_mutex;
 
 int num_gpus = 1;
 
+// Global team barrier for expert parallelism
+TeamBarrier* g_team_barrier = nullptr;
+
 // GPU Transformer Weights struct - stores all model weights on GPU in bfloat16 format
 typedef struct
 {
@@ -649,6 +652,9 @@ void warm_up(Transformer *transformer, Tokenizer *tokenizer)
         exit(EXIT_FAILURE);
     }
 
+    // Initialize team barrier for expert parallelism
+    g_team_barrier = new TeamBarrier(num_gpus);
+
 #pragma omp parallel for
     for (int dev = 0; dev < num_gpus; ++dev)
     {
@@ -866,6 +872,12 @@ void finish(Transformer *transformer, Tokenizer *tokenizer)
         free(gpu_transformers[dev]);
     }
     free(gpu_transformers);
+    
+    // Clean up team barrier
+    if (g_team_barrier) {
+        delete g_team_barrier;
+        g_team_barrier = nullptr;
+    }
 }
 
 
@@ -1299,7 +1311,7 @@ __global__ void permute_received_to_local_kernel(
 
 
 /* ========== 1-element device peek helpers ========== */
-static inline void dbg_print_f(const char* tag,
+static inline void  dbg_print_f(const char* tag,
                                const float* dptr,
                                size_t idx,
                                hipStream_t st) {
@@ -1307,9 +1319,9 @@ static inline void dbg_print_f(const char* tag,
     HIP_CHECK(hipMemcpyAsync(&h, dptr + idx, sizeof(float),
                              hipMemcpyDeviceToHost, st));
     HIP_CHECK(hipStreamSynchronize(st));
-    THREAD_DEBUG("%s[%zu] = %.9g\n", tag, idx, h);
+    // makeUG("%s[%zu] = %.9g\n", tag, idx, h);
 }
-static inline void dbg_print_i(const char* tag,
+static inline void  dbg_print_i(const char* tag,
                                const int* dptr,
                                size_t idx,
                                hipStream_t st) {
@@ -1317,14 +1329,14 @@ static inline void dbg_print_i(const char* tag,
     HIP_CHECK(hipMemcpyAsync(&h, dptr + idx, sizeof(int),
                              hipMemcpyDeviceToHost, st));
     HIP_CHECK(hipStreamSynchronize(st));
-    THREAD_DEBUG("%s[%zu] = %d\n", tag, idx, h);
+     THREAD_DEBUG("%s[%zu] = %d\n", tag, idx, h);
 }
-static inline void dbg_print_first_f_if_any(const char* tag,
+static inline void  dbg_print_first_f_if_any(const char* tag,
                                             const float* dptr,
                                             size_t count,
                                             hipStream_t st) {
-    if (count == 0) { THREAD_DEBUG("%s <empty>\n", tag); return; }
-    dbg_print_f(tag, dptr, 0, st);
+    if (count == 0) {  THREAD_DEBUG("%s <empty>\n", tag); return; }
+     dbg_print_f(tag, dptr, 0, st);
 }
 
 static inline bool ranges_overlap(uintptr_t a, size_t asz, uintptr_t b, size_t bsz) {
@@ -1365,9 +1377,10 @@ void moe_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size)
     const int peer = gpu_t->peer_device_id;
     const int local_base = local_base_for(dev, E);
     const int peer_base  = peer_base_for(dev, E);
-
-    THREAD_DEBUG("MOE layer %d on GPU %d (local experts %d..%d, peer %d..%d)\n",
-                 layer_idx, dev, local_base, local_base+Le-1, peer_base, peer_base+Le-1);
+    
+    HIP_CHECK(hipDeviceSynchronize());
+    // THREAD_DEBUG("MOE layer %d on GPU %d (local experts %d..%d, peer %d..%d)\n",
+                //  layer_idx, dev, local_base, local_base+Le-1, peer_base, peer_base+Le-1);
 
     // ===== [Stage 1] Norm + Router (unchanged) -> s->topk_i (global), s->topk_v =====
     // ===== per-call events =====
@@ -1389,7 +1402,7 @@ void moe_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size)
         rmsnorm_kernel<<<norm_grid, norm_block, 0, cpu->sGather>>>(
             s->t, s->x, w->rms_ffn_w + (size_t)layer_idx * hidden_dim,
             batch_size, hidden_dim);
-        dbg_print_f("EP:rmsnorm:t", s->t, 0, cpu->sGather);
+        // dbg_print_f("EP:rmsnorm:t", s->t, 0, cpu->sGather);
     }
     HIP_CHECK(hipGetLastError());
 
@@ -1398,7 +1411,7 @@ void moe_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size)
         matmul(s->router_score, s->t,
                w->w_router + (size_t)layer_idx * hidden_dim * n_experts,
                batch_size, hidden_dim, n_experts, cpu->sGather);
-        dbg_print_f("EP:router_score:matmul", s->router_score, 0, cpu->sGather);
+        // dbg_print_f("EP:router_score:matmul", s->router_score, 0, cpu->sGather);
     }
     {
         const int elems = batch_size * n_experts;
@@ -1406,30 +1419,30 @@ void moe_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size)
                           THREADS_PER_BLOCK, 0, cpu->sGather>>>(
             s->router_score, w->b_router + (size_t)layer_idx * n_experts,
             batch_size, n_experts);
-        dbg_print_f("EP:router_score:+bias", s->router_score, 0, cpu->sGather);
+        // dbg_print_f("EP:router_score:+bias", s->router_score, 0, cpu->sGather);
     }
     {
         topk_kernel<<<batch_size, 1, 0, cpu->sGather>>>(
             s->topk_v, s->topk_i, s->router_score,
             batch_size, n_experts, experts_per_token);
-        dbg_print_f("EP:topk_v[0]", s->topk_v, 0, cpu->sGather);
-        dbg_print_i("EP:topk_i[0]", s->topk_i, 0, cpu->sGather);
+        // dbg_print_f("EP:topk_v[0]", s->topk_v, 0, cpu->sGather);
+        // dbg_print_i("EP:topk_i[0]", s->topk_i, 0, cpu->sGather);
     {
         dim3 norm_block(THREADS_PER_BLOCK);
         softmax_kernel<<<batch_size, norm_block, 0, cpu->sGather>>>(
             s->topk_v, batch_size, experts_per_token);
         HIP_CHECK(hipGetLastError());
-        dbg_print_f("EP:softmax(topk_v)[0]", s->topk_v, 0, cpu->sGather);
+        // dbg_print_f("EP:softmax(topk_v)[0]", s->topk_v, 0, cpu->sGather);
     }
     HIP_CHECK(hipEventRecord(evRouterDone, cpu->sGather));
 
-
+    HIP_CHECK(hipStreamWaitEvent(cpu->sGather, evRouterDone, 0));
     // ===== [Stage 2] Count per-expert (global) then split to local/remote on HOST =====
     HIP_CHECK(hipMemsetAsync(s->d_expert_counts, 0, E * sizeof(int), cpu->sGather));
     const dim3 count_grid((batch_size + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK);
     count_tokens_per_expert_kernel<<<count_grid, THREADS_PER_BLOCK, 0, cpu->sGather>>>(
         s->topk_i, s->d_expert_counts, batch_size, k);
-    dbg_print_i("EP:d_expert_counts[0]", s->d_expert_counts, 0, cpu->sGather);
+    // dbg_print_i("EP:d_expert_counts[0]", s->d_expert_counts, 0, cpu->sGather);
     HIP_CHECK(hipGetLastError());
 
     // D2H counts for all experts
@@ -1437,7 +1450,7 @@ void moe_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size)
                              E * sizeof(int), hipMemcpyDeviceToHost, cpu->sGather));
     HIP_CHECK(hipStreamSynchronize(cpu->sGather));
 
-    THREAD_DEBUG("After counting experts on GPU %d:\n", dev);
+    // THREAD_DEBUG("After counting experts on GPU %d:\n", dev);
     
 
     // Build local/remote totals + local offsets on HOST
@@ -1452,19 +1465,19 @@ void moe_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size)
     remote_total = total_all - local_total;
 
     HIP_CHECK(hipStreamSynchronize(cpu->sGather));
-    THREAD_DEBUG("  total tokens = %d\n", total_all);
-    THREAD_DEBUG("  local tokens = %d (experts %d..%d)\n", local_total, local_base, local_base+Le-1);
+    // THREAD_DEBUG("  total tokens = %d\n", total_all);
+    // THREAD_DEBUG("  local tokens = %d (experts %d..%d)\n", local_total, local_base, local_base+Le-1);
 
     // H2D local offsets; zero local write_idx
     HIP_CHECK(hipMemcpyAsync(s->d_local_expert_offsets, cpu->local_offsets,
                              Le * sizeof(int), hipMemcpyHostToDevice, cpu->sGather));
-    HIP_CHECK(hipStreamSynchronize(cpu->sGather));
-    THREAD_DEBUG("  after memcpy offsets\n");
+    // HIP_CHECK(hipStreamSynchronize(cpu->sGather));
+    // THREAD_DEBUG("  after memcpy offsets\n");
     HIP_CHECK(hipMemsetAsync(s->d_local_expert_write_idx, 0, Le * sizeof(int), cpu->sGather));
 
 
-    HIP_CHECK(hipStreamSynchronize(cpu->sGather));
-    THREAD_DEBUG("  remote tokens = %d (experts %d..%d)\n", remote_total, peer_base, peer_base+Le-1);
+    // HIP_CHECK(hipStreamSynchronize(cpu->sGather));
+    // THREAD_DEBUG("  remote tokens = %d (experts %d..%d)\n", remote_total, peer_base, peer_base+Le-1);
     // ===== [Stage 2a] PERMUTE local subset into expert-compact (LOCAL) =====
     // Output goes to: s->expert_input_buffer / s->expert_indices / s->expert_weights
     {
@@ -1483,14 +1496,14 @@ void moe_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size)
             s->expert_input_buffer, s->expert_indices, s->expert_weights);
         HIP_CHECK(hipGetLastError());
         HIP_CHECK(hipStreamSynchronize(cpu->sGather));
-        dbg_print_first_f_if_any("EP:local expert_input_buffer[0]",
-        s->expert_input_buffer, (size_t)local_total*H, cpu->sGather);
-        dbg_print_i("EP:local expert_indices[0]", s->expert_indices, 0, cpu->sGather);
-        dbg_print_f("EP:local expert_weights[0]", s->expert_weights, 0, cpu->sGather);
+        // dbg_print_first_f_if_any("EP:local expert_input_buffer[0]",
+        // s->expert_input_buffer, (size_t)local_total*H, cpu->sGather);
+        // dbg_print_i("EP:local expert_indices[0]", s->expert_indices, 0, cpu->sGather);
+        // dbg_print_f("EP:local expert_weights[0]", s->expert_weights, 0, cpu->sGather);
     }
 
     HIP_CHECK(hipStreamSynchronize(cpu->sGather));
-    THREAD_DEBUG("  local permute done\n"); 
+    // THREAD_DEBUG("  local permute done\n"); 
 
     // ===== [Stage 2b] PACK remote items linearly for SEND =====
     HIP_CHECK(hipMemsetAsync(s->d_send_count, 0, sizeof(int), cpu->sGather));
@@ -1508,14 +1521,14 @@ void moe_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size)
 
     }
 
-    HIP_CHECK(hipStreamSynchronize(cpu->sGather));
-    THREAD_DEBUG("  remote pack done\n");
+    // HIP_CHECK(hipStreamSynchronize(cpu->sGather));
+    // THREAD_DEBUG("  remote pack done\n");
 
     // Ensure packing done before we read send_count on host
     HIP_CHECK(hipStreamSynchronize(cpu->sGather));
 
-    THREAD_DEBUG("  total tokens = %d (local %d, remote %d)\n",
-                 total_all, local_total, remote_total);
+    // THREAD_DEBUG("  total tokens = %d (local %d, remote %d)\n",
+                //  total_all, local_total, remote_total);
 
     int h_send_count = 0;
     HIP_CHECK(hipMemcpy(&h_send_count, s->d_send_count, sizeof(int), hipMemcpyDeviceToHost));
@@ -1524,10 +1537,10 @@ void moe_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size)
 
     // ===== [Stage 2c] P2P SEND to peer device =====
     if (h_send_count > 0) {
-        dbg_print_i("EP:send_token_ids[0]", s->d_send_token_ids, 0, cpu->sGather);
-        dbg_print_i("EP:send_topk_i[0]",    s->d_send_topk_i,    0, cpu->sGather);
-        dbg_print_f("EP:send_topk_v[0]",    s->d_send_topk_v,    0, cpu->sGather);
-        dbg_print_f("EP:send_hidden[0]",    s->d_send_hidden,    0, cpu->sGather);
+        // dbg_print_i("EP:send_token_ids[0]", s->d_send_token_ids, 0, cpu->sGather);
+        // dbg_print_i("EP:send_topk_i[0]",    s->d_send_topk_i,    0, cpu->sGather);
+        // dbg_print_f("EP:send_topk_v[0]",    s->d_send_topk_v,    0, cpu->sGather);
+        // dbg_print_f("EP:send_hidden[0]",    s->d_send_hidden,    0, cpu->sGather);
         size_t rows = (size_t)h_send_count;
         HIP_CHECK(hipMemcpyPeerAsync(
             gpu_transformers[peer]->state.d_recv_token_ids, peer,
@@ -1552,17 +1565,20 @@ void moe_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size)
             sizeof(int), cpu->sScatter));
     }
 
-    THREAD_DEBUG("  GPU %d sending %d tokens to GPU %d\n", dev, h_send_count, peer);
+    // THREAD_DEBUG("  GPU %d sending %d tokens to GPU %d\n", dev, h_send_count, peer);
 
     // We will also compute our LOCAL experts immediately. Zero e_agg now.
     HIP_CHECK(hipMemsetAsync(s->e_agg, 0, (size_t)batch_size * H * sizeof(float), cpu->sScatter));
-    dbg_print_f("EP:e_agg:after_zero[0]", s->e_agg, 0, cpu->sScatter);
+    // dbg_print_f("EP:e_agg:after_zero[0]", s->e_agg, 0, cpu->sScatter);
 
     // ===== Host/peer sync so both sides have sent their payloads =====
     HIP_CHECK(hipStreamSynchronize(cpu->sScatter));
-    THREAD_DEBUG("  GPU %d sent %d tokens to GPU %d\n", dev, h_send_count, peer);
+    // THREAD_DEBUG("  GPU %d sent %d tokens to GPU %d\n", dev, h_send_count, peer);
 
-    #pragma omp barrier
+    // Team-level barrier: only synchronize with peer GPU
+    if (g_team_barrier && peer >= 0) {
+        g_team_barrier->wait();
+    }
 
     // ===== [Stage 3] Compute LOCAL experts for:
     //  (A) tokens we own (local_total rows in s->expert_input_buffer)
@@ -1616,18 +1632,18 @@ void moe_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size)
         );
         HIP_CHECK(hipGetLastError());
 
-        dbg_print_i("EP:peer_counts[0]", s->d_peer_expert_counts, 0, cpu->sGather);
-        dbg_print_first_f_if_any("EP:peer_expert_input_buffer[0]",
-            s->peer_expert_input_buffer, (size_t)cpu->peer_recv_count*H, cpu->sGather);
-        dbg_print_i("EP:peer_expert_indices[0]", s->peer_expert_indices, 0, cpu->sGather);
-        dbg_print_f("EP:peer_expert_weights[0]", s->peer_expert_weights, 0, cpu->sGather);
+        // dbg_print_i("EP:peer_counts[0]", s->d_peer_expert_counts, 0, cpu->sGather);
+        // dbg_print_first_f_if_any("EP:peer_expert_input_buffer[0]",
+            // s->peer_expert_input_buffer, (size_t)cpu->peer_recv_count*H, cpu->sGather);
+        // dbg_print_i("EP:peer_expert_indices[0]", s->peer_expert_indices, 0, cpu->sGather);
+        // dbg_print_f("EP:peer_expert_weights[0]", s->peer_expert_weights, 0, cpu->sGather);
 
 
         HIP_CHECK(hipGetLastError());
     }
 
     HIP_CHECK(hipStreamSynchronize(cpu->sGather)); // local & peer permutes done
-    THREAD_DEBUG("  GPU %d received %d tokens from GPU %d\n", dev, h_recv_count, peer);
+    // THREAD_DEBUG("  GPU %d received %d tokens from GPU %d\n", dev, h_recv_count, peer);
 
 
     // ===== [Stage 4] Run MLPs for every LOCAL expert (two batches if both have data)
@@ -1658,18 +1674,18 @@ void moe_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size)
 
             matmul_mxfp4(m1A, inA, w->w_mlp1_mxfp4 + w1_pk, w->w_mlp1_scales + w1_sc,
                          cntA, H, 2*I, (size_t)(2*I)*H, st);
-            dbg_print_f("EP:MLP1_A:mlp1_out[0]", m1A, 0, st);
+            // dbg_print_f("EP:MLP1_A:mlp1_out[0]", m1A, 0, st);
 
             const dim3 gridSplit((cntA*I + THREADS_PER_BLOCK - 1)/THREADS_PER_BLOCK);
             split_gate_up_kernel<<<gridSplit, THREADS_PER_BLOCK, 0, st>>>(
                 gA, uA, m1A, w->b_mlp1 + ((size_t)layer_idx * Le + e_local) * (size_t)(2*I),
                 cntA, I);
-            dbg_print_f("EP:split_A:gate[0]", gA, 0, st);
-            dbg_print_f("EP:split_A:up[0]",   uA, 0, st);
+            // dbg_print_f("EP:split_A:gate[0]", gA, 0, st);
+            // dbg_print_f("EP:split_A:up[0]",   uA, 0, st);
             const dim3 gridGLU((cntA*I + THREADS_PER_BLOCK - 1)/THREADS_PER_BLOCK);
             swiglu_kernel<<<gridGLU, THREADS_PER_BLOCK, 0, st>>>(
                 gA, uA, guA, cntA, I, p->swiglu_limit);
-            dbg_print_f("EP:swiglu_A:gate_up[0]", guA, 0, st);
+            // dbg_print_f("EP:swiglu_A:gate_up[0]", guA, 0, st);
 
             matmul_mxfp4(outA, guA, w->w_mlp2_mxfp4 + w2_pk, w->w_mlp2_scales + w2_sc,
                          cntA, I, H, (size_t)H*I, st);
@@ -1678,7 +1694,7 @@ void moe_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size)
             const dim3 gridBias((elems + THREADS_PER_BLOCK - 1)/THREADS_PER_BLOCK);
             add_bias_kernel<<<gridBias, THREADS_PER_BLOCK, 0, st>>>(
                 outA, w->b_mlp2 + ((size_t)layer_idx * Le + e_local) * (size_t)H, cntA, H);
-            dbg_print_f("EP:MLP2_A:out[0]", outA, 0, st);
+            // dbg_print_f("EP:MLP2_A:out[0]", outA, 0, st);
 
             HIP_CHECK(hipEventRecord(evMLPdone[e_local % N_MLP_STREAMS], st));
         }
@@ -1710,19 +1726,19 @@ void moe_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size)
 
                 matmul_mxfp4(m1B, inB, w->w_mlp1_mxfp4 + w1_pk, w->w_mlp1_scales + w1_sc,
                              cntB, H, 2*I, (size_t)(2*I)*H, st);
-                dbg_print_f("EP:MLP1_B:mlp1_out[0]", m1B, 0, st);
+                // dbg_print_f("EP:MLP1_B:mlp1_out[0]", m1B, 0, st);
 
                 const dim3 gridSplitB((cntB*I + THREADS_PER_BLOCK - 1)/THREADS_PER_BLOCK);
                 split_gate_up_kernel<<<gridSplitB, THREADS_PER_BLOCK, 0, st>>>(
                     gB, uB, m1B, w->b_mlp1 + ((size_t)layer_idx * Le + e_local) * (size_t)(2*I),
                     cntB, I);
-                dbg_print_f("EP:split_B:gate[0]", gB, 0, st);
-                dbg_print_f("EP:split_B:up[0]",   uB, 0, st);
+                // dbg_print_f("EP:split_B:gate[0]", gB, 0, st);
+                // dbg_print_f("EP:split_B:up[0]",   uB, 0, st);
   
                 const dim3 gridGLUB((cntB*I + THREADS_PER_BLOCK - 1)/THREADS_PER_BLOCK);
                 swiglu_kernel<<<gridGLUB, THREADS_PER_BLOCK, 0, st>>>(
                     gB, uB, guB, cntB, I, p->swiglu_limit);
-                dbg_print_f("EP:swiglu_B:gate_up[0]", guB, 0, st);
+                // dbg_print_f("EP:swiglu_B:gate_up[0]", guB, 0, st);
 
                 matmul_mxfp4(outB, guB, w->w_mlp2_mxfp4 + w2_pk, w->w_mlp2_scales + w2_sc,
                              cntB, I, H, (size_t)H*I, st);
@@ -1731,7 +1747,7 @@ void moe_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size)
                 const dim3 gridBiasB((elemsB + THREADS_PER_BLOCK - 1)/THREADS_PER_BLOCK);
                 add_bias_kernel<<<gridBiasB, THREADS_PER_BLOCK, 0, st>>>(
                     outB, w->b_mlp2 + ((size_t)layer_idx * Le + e_local) * (size_t)H, cntB, H);
-                dbg_print_f("EP:MLP2_B:out[0]", outB, 0, st);
+                // dbg_print_f("EP:MLP2_B:out[0]", outB, 0, st);
 
                 HIP_CHECK(hipEventRecord(evMLPdone[(e_local + 7) % N_MLP_STREAMS], st));
             }
@@ -1740,7 +1756,7 @@ void moe_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size)
 
     
     for (int i=0;i<N_MLP_STREAMS;++i) HIP_CHECK(hipStreamWaitEvent(cpu->sScatter, evMLPdone[i], 0));
-    THREAD_DEBUG("  GPU %d finished MLPs for local experts\n", dev);
+    // THREAD_DEBUG("  GPU %d finished MLPs for local experts\n", dev);
     // ===== [Stage 5] SCATTER local contributions immediately =====
     if (local_total > 0) {
         const int elems = local_total * H;
@@ -1752,7 +1768,7 @@ void moe_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size)
             s->expert_weights,
             local_total, H,
             batch_size);                 // <-- add this
-        dbg_print_f("EP:e_agg:after_local_scatter[0]", s->e_agg, 0, cpu->sScatter);
+        // dbg_print_f("EP:e_agg:after_local_scatter[0]", s->e_agg, 0, cpu->sScatter);
         HIP_CHECK(hipGetLastError());
         HIP_CHECK(hipGetLastError());
     }
@@ -1781,8 +1797,12 @@ void moe_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size)
     }
 
     HIP_CHECK(hipStreamSynchronize(cpu->sScatter));
-    THREAD_DEBUG("  GPU %d sent back %d tokens to GPU %d\n", dev, cpu->peer_recv_count, peer);
-    #pragma omp barrier
+    // THREAD_DEBUG("  GPU %d sent back %d tokens to GPU %d\n", dev, cpu->peer_recv_count, peer);
+    
+    // Team-level barrier: only synchronize with peer GPU
+    if (g_team_barrier && peer >= 0) {
+        g_team_barrier->wait();
+    }
 
     // ===== [Stage 7] SCATTER contributions we just received back from peer =====
     // ĐÚNG
@@ -1811,12 +1831,12 @@ void moe_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size)
         accumulate_kernel<<<(elems + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK,
                             THREADS_PER_BLOCK, 0, cpu->sScatter>>>(
             s->x, s->e_agg, 1.0f, batch_size, H);
-        dbg_print_f("EP:x:after_residual[0]", s->x, 0, cpu->sScatter);
+        // dbg_print_f("EP:x:after_residual[0]", s->x, 0, cpu->sScatter);
         HIP_CHECK(hipGetLastError());
     }
 
     HIP_CHECK(hipStreamSynchronize(cpu->sScatter));
-    THREAD_DEBUG("  GPU %d finished scatter & residual\n", dev);
+    // THREAD_DEBUG("  GPU %d finished scatter & residual\n", dev);
     for (int i=0;i<N_MLP_STREAMS;++i) HIP_CHECK(hipEventDestroy(evMLPdone[i]));
 }
 }

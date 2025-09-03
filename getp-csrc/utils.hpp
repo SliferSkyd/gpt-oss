@@ -216,3 +216,94 @@ void compute_cos_sin_getp(int pos, float base, int head_dim, float scaling_facto
     }
     free(inv_freq);
 }
+
+//------------------------------------------------------------------------------//
+// Team-level synchronization utilities for expert parallelism                   //
+//------------------------------------------------------------------------------//
+
+#include <atomic>
+#include <memory>
+#include <omp.h>
+
+// Team barrier structure for synchronizing only peer GPUs
+struct TeamBarrier {
+    // Each team has its own atomic counter and generation
+    struct TeamSync {
+        std::atomic<int>* count;
+        std::atomic<int>* generation;
+        
+        TeamSync() {
+            count = new std::atomic<int>(0);
+            generation = new std::atomic<int>(0);
+        }
+        
+        ~TeamSync() {
+            delete count;
+            delete generation;
+        }
+        
+        // Delete copy constructor and assignment
+        TeamSync(const TeamSync&) = delete;
+        TeamSync& operator=(const TeamSync&) = delete;
+        
+        // Move constructor
+        TeamSync(TeamSync&& other) noexcept {
+            count = other.count;
+            generation = other.generation;
+            other.count = nullptr;
+            other.generation = nullptr;
+        }
+        
+        // Move assignment
+        TeamSync& operator=(TeamSync&& other) noexcept {
+            if (this != &other) {
+                delete count;
+                delete generation;
+                count = other.count;
+                generation = other.generation;
+                other.count = nullptr;
+                other.generation = nullptr;
+            }
+            return *this;
+        }
+    };
+    
+    std::unique_ptr<TeamSync[]> teams;
+    int num_teams;
+    int threads_per_team;
+    
+    TeamBarrier(int num_threads) : threads_per_team(2) {
+        // Assuming pairs of GPUs (teams of 2)
+        num_teams = (num_threads + 1) / 2;
+        teams.reset(new TeamSync[num_teams]);
+    }
+    
+    void wait() {
+        int thread_id = omp_get_thread_num();
+        int team_id = thread_id / threads_per_team;
+        
+        // Safety check
+        if (team_id >= num_teams) return;
+        
+        TeamSync& team = teams[team_id];
+        int my_generation = team.generation->load();
+        
+        // Increment counter
+        int arrived = team.count->fetch_add(1) + 1;
+        
+        if (arrived == threads_per_team) {
+            // Last thread in team resets counter and advances generation
+            team.count->store(0);
+            team.generation->fetch_add(1);
+        } else {
+            // Wait for generation to change
+            while (team.generation->load() == my_generation) {
+                // Busy wait with yield to reduce CPU usage
+                #pragma omp taskyield
+            }
+        }
+    }
+};
+
+// Global team barrier instance (will be initialized in main code)
+extern TeamBarrier* g_team_barrier;
