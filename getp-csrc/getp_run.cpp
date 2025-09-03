@@ -1672,20 +1672,39 @@ void moe_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size)
             size_t w2_pk  = w2_off / 2;
             size_t w2_sc  = w2_off / MXFP4_BLOCK_SIZE;
 
-            matmul_mxfp4(m1A, inA, w->w_mlp1_mxfp4 + w1_pk, w->w_mlp1_scales + w1_sc,
-                         cntA, H, 2*I, (size_t)(2*I)*H, st);
+            {
+            const size_t total_elems1 = (size_t)(2 * intermediate_dim) * hidden_dim;
+
+            matmul_mxfp4_swiglu_fused(
+                /*out_gate_up=*/guA,
+                /*input=*/inA,
+                /*weight_packed=*/w->w_mlp1_mxfp4 + w1_pk,
+                /*weight_scales=*/w->w_mlp1_scales + w1_sc,
+                /*bias_mlp1=*/w->b_mlp1 + ((size_t)layer_idx * Le + e_local) * (size_t)(2*I),
+                /*batch_size=*/cntA,
+                /*hidden_dim=*/hidden_dim,
+                /*intermediate_dim=*/intermediate_dim,
+                /*total_weight_elements=*/total_elems1,
+                /*clamp_limit=*/p->swiglu_limit,
+                /*stream=*/st
+            );
+            }
+
+
+            // matmul_mxfp4(m1A, inA, w->w_mlp1_mxfp4 + w1_pk, w->w_mlp1_scales + w1_sc,
+            //              cntA, H, 2*I, (size_t)(2*I)*H, st);
             // dbg_print_f("EP:MLP1_A:mlp1_out[0]", m1A, 0, st);
 
-            const dim3 gridSplit((cntA*I + THREADS_PER_BLOCK - 1)/THREADS_PER_BLOCK);
-            split_gate_up_kernel<<<gridSplit, THREADS_PER_BLOCK, 0, st>>>(
-                gA, uA, m1A, w->b_mlp1 + ((size_t)layer_idx * Le + e_local) * (size_t)(2*I),
-                cntA, I);
-            // dbg_print_f("EP:split_A:gate[0]", gA, 0, st);
-            // dbg_print_f("EP:split_A:up[0]",   uA, 0, st);
-            const dim3 gridGLU((cntA*I + THREADS_PER_BLOCK - 1)/THREADS_PER_BLOCK);
-            swiglu_kernel<<<gridGLU, THREADS_PER_BLOCK, 0, st>>>(
-                gA, uA, guA, cntA, I, p->swiglu_limit);
-            // dbg_print_f("EP:swiglu_A:gate_up[0]", guA, 0, st);
+            // const dim3 gridSplit((cntA*I + THREADS_PER_BLOCK - 1)/THREADS_PER_BLOCK);
+            // split_gate_up_kernel<<<gridSplit, THREADS_PER_BLOCK, 0, st>>>(
+            //     gA, uA, m1A, w->b_mlp1 + ((size_t)layer_idx * Le + e_local) * (size_t)(2*I),
+            //     cntA, I);
+            // // dbg_print_f("EP:split_A:gate[0]", gA, 0, st);
+            // // dbg_print_f("EP:split_A:up[0]",   uA, 0, st);
+            // const dim3 gridGLU((cntA*I + THREADS_PER_BLOCK - 1)/THREADS_PER_BLOCK);
+            // swiglu_kernel<<<gridGLU, THREADS_PER_BLOCK, 0, st>>>(
+            //     gA, uA, guA, cntA, I, p->swiglu_limit);
+            // // dbg_print_f("EP:swiglu_A:gate_up[0]", guA, 0, st);
 
             matmul_mxfp4(outA, guA, w->w_mlp2_mxfp4 + w2_pk, w->w_mlp2_scales + w2_sc,
                          cntA, I, H, (size_t)H*I, st);
@@ -1724,22 +1743,39 @@ void moe_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size)
                 size_t w2_pk  = w2_off / 2;
                 size_t w2_sc  = w2_off / MXFP4_BLOCK_SIZE;
 
-                matmul_mxfp4(m1B, inB, w->w_mlp1_mxfp4 + w1_pk, w->w_mlp1_scales + w1_sc,
-                             cntB, H, 2*I, (size_t)(2*I)*H, st);
-                // dbg_print_f("EP:MLP1_B:mlp1_out[0]", m1B, 0, st);
+                // matmul_mxfp4(m1B, inB, w->w_mlp1_mxfp4 + w1_pk, w->w_mlp1_scales + w1_sc,
+                //              cntB, H, 2*I, (size_t)(2*I)*H, st);
+                // // dbg_print_f("EP:MLP1_B:mlp1_out[0]", m1B, 0, st);
 
-                const dim3 gridSplitB((cntB*I + THREADS_PER_BLOCK - 1)/THREADS_PER_BLOCK);
-                split_gate_up_kernel<<<gridSplitB, THREADS_PER_BLOCK, 0, st>>>(
-                    gB, uB, m1B, w->b_mlp1 + ((size_t)layer_idx * Le + e_local) * (size_t)(2*I),
-                    cntB, I);
-                // dbg_print_f("EP:split_B:gate[0]", gB, 0, st);
-                // dbg_print_f("EP:split_B:up[0]",   uB, 0, st);
+                // const dim3 gridSplitB((cntB*I + THREADS_PER_BLOCK - 1)/THREADS_PER_BLOCK);
+                // split_gate_up_kernel<<<gridSplitB, THREADS_PER_BLOCK, 0, st>>>(
+                //     gB, uB, m1B, w->b_mlp1 + ((size_t)layer_idx * Le + e_local) * (size_t)(2*I),
+                //     cntB, I);
+                // // dbg_print_f("EP:split_B:gate[0]", gB, 0, st);
+                // // dbg_print_f("EP:split_B:up[0]",   uB, 0, st);
   
-                const dim3 gridGLUB((cntB*I + THREADS_PER_BLOCK - 1)/THREADS_PER_BLOCK);
-                swiglu_kernel<<<gridGLUB, THREADS_PER_BLOCK, 0, st>>>(
-                    gB, uB, guB, cntB, I, p->swiglu_limit);
-                // dbg_print_f("EP:swiglu_B:gate_up[0]", guB, 0, st);
+                // const dim3 gridGLUB((cntB*I + THREADS_PER_BLOCK - 1)/THREADS_PER_BLOCK);
+                // swiglu_kernel<<<gridGLUB, THREADS_PER_BLOCK, 0, st>>>(
+                //     gB, uB, guB, cntB, I, p->swiglu_limit);
+                // // dbg_print_f("EP:swiglu_B:gate_up[0]", guB, 0, st);
 
+                                {
+                const size_t total_elems1 = (size_t)(2 * intermediate_dim) * hidden_dim;
+
+                matmul_mxfp4_swiglu_fused(
+                    /*out_gate_up=*/guB,
+                    /*input=*/inB,
+                    /*weight_packed=*/w->w_mlp1_mxfp4 + w1_pk,
+                    /*weight_scales=*/w->w_mlp1_scales + w1_sc,
+                    /*bias_mlp1=*/w->b_mlp1 + ((size_t)layer_idx * Le + e_local) * (size_t)(2*I),
+                    /*batch_size=*/cntB,
+                    /*hidden_dim=*/hidden_dim,
+                    /*intermediate_dim=*/intermediate_dim,
+                    /*total_weight_elements=*/total_elems1,
+                    /*clamp_limit=*/p->swiglu_limit,
+                    /*stream=*/st
+                );
+                }
                 matmul_mxfp4(outB, guB, w->w_mlp2_mxfp4 + w2_pk, w->w_mlp2_scales + w2_sc,
                              cntB, I, H, (size_t)H*I, st);
 
