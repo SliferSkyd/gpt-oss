@@ -160,7 +160,7 @@ typedef struct
 } GPUTransformer;
 
 // Global variables for direct access in batched_generate_gpu
-static GPUTransformer *gpu_transformers[MAX_GPUS];
+GPUTransformer *gpu_transformers[MAX_GPUS];
 
 // Memory allocation functions
 void malloc_gpu_run_state(GPURunState *s, Config *p)
@@ -459,13 +459,13 @@ void malloc_cpu_buffers(CPUBuffers *cpu_buf, Config *p)
     }
     cpu_buf->next_request_idx = 0;
 
-    HIP_CHECK(hipHostMalloc(&cpu_buf->expert_counts, p->n_experts * sizeof(int)));
-    HIP_CHECK(hipHostMalloc(&cpu_buf->expert_offsets, p->n_experts * sizeof(int)));
+    cpu_buf->expert_counts = (int*) malloc(p->n_experts * sizeof(int));
+    cpu_buf->expert_offsets = (int*) malloc(p->n_experts * sizeof(int));
     HIP_CHECK(hipStreamCreateWithFlags(&cpu_buf->sGather, hipStreamNonBlocking));
     HIP_CHECK(hipStreamCreateWithFlags(&cpu_buf->sScatter, hipStreamNonBlocking));
     for (int i = 0; i < N_MLP_STREAMS; ++i)
         HIP_CHECK(hipStreamCreateWithFlags(&cpu_buf->sMLP[i], hipStreamNonBlocking));
-    HIP_CHECK(hipHostMalloc(&cpu_buf->logits, BATCH_SIZE * p->vocab_size * sizeof(float)));
+    cpu_buf->logits = (float*) malloc(BATCH_SIZE * p->vocab_size * sizeof(float));
 }
 
 void build_gpu_transformer(GPUTransformer *gpu_t, Transformer *cpu_t)
@@ -693,12 +693,10 @@ void finish(Transformer *transformer, Tokenizer *tokenizer)
     }
 }
 
-static Timer attention("attention", true);
-static Timer moe("moe", true);
 
 void attention_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size)
 {
-    TIME_SCOPE(attention);
+    // TIME_SCOPE(attention);
     Config *p = &gpu_t->config;
     GPURunState *s = &gpu_t->state;
     GPUTransformerWeights *w = &gpu_t->weights;
@@ -884,13 +882,14 @@ void attention_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size)
         );
         HIP_CHECK(hipGetLastError());
     }
+    HIP_CHECK(hipDeviceSynchronize());
     // --- END OF FUSED OUTPUT PROJECTION ---
 }
 
 
 void moe_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size)
 {
-    TIME_SCOPE(moe);
+    // TIME_SCOPE(moe);
     Config *p = &gpu_t->config;
     GPURunState *s = &gpu_t->state;
     GPUTransformerWeights *w = &gpu_t->weights;
