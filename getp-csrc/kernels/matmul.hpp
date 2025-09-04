@@ -358,3 +358,167 @@ void matmul_mxfp4(
         grid, block, shmem_bytes, stream,
         output, input, weight_packed, weight_scales, M, K, N, total_weight_elements);
 }
+
+// ====== FUSED (2-HEAD) MXFP4 GEMM (gate+up in one launch; reuses A) ======
+__global__ void gemm_mfma_uint8_kernel_opt_fused2(
+    float* __restrict__ C,                         // [M, 2*Nhalf] row-major
+    const float* __restrict__ A,                   // [M, K]       row-major (fp32)
+    const uint8_t* __restrict__ Wp0,               // [Nhalf, K]   MXFP4 packed (first half)
+    const float*   __restrict__ scales0,           // scales for first half
+    const uint8_t* __restrict__ Wp1,               // [Nhalf, K]   MXFP4 packed (second half)
+    const float*   __restrict__ scales1,           // scales for second half
+    int M, int K, int Nhalf,
+    size_t total_w_elems_half0,                    // = Nhalf*K (elements, not bytes)
+    size_t total_w_elems_half1)                    // = Nhalf*K (elements, not bytes)
+{
+    const int m0 = blockIdx.y * BLOCK_M;
+    const int n0 = blockIdx.x * BLOCK_N;           // block’s column start within each half
+
+    const int lane   = threadIdx.x;                // 0..63
+    const int wave   = threadIdx.y;                // 0..(WAVES_PER_BLOCK-1)
+    const int wave_m = wave / WAVES_N;
+    const int wave_n = wave % WAVES_N;
+
+    // Dynamic shared memory (raw bytes -> cast to uint16_t for bf16 bits)
+    extern __shared__ unsigned char smem[];
+    uint16_t* sA0  = reinterpret_cast<uint16_t*>(smem);
+    uint16_t* sA1  = sA0  + (BLOCK_M * BLOCK_K);
+
+    uint16_t* sB0h0 = sA1  + (BLOCK_M * BLOCK_K);           // stage 0, half 0
+    uint16_t* sB0h1 = sB0h0 + (BLOCK_K * BLOCK_N);          // stage 0, half 1
+    uint16_t* sB1h0 = sB0h1 + (BLOCK_K * BLOCK_N);          // stage 1, half 0
+    uint16_t* sB1h1 = sB1h0 + (BLOCK_K * BLOCK_N);          // stage 1, half 1
+
+    f32x4 acc0 = {0.f, 0.f, 0.f, 0.f};  // accum: first half (e.g., gate)
+    f32x4 acc1 = {0.f, 0.f, 0.f, 0.f};  // accum: second half (e.g., up)
+
+    const int threadsPerBlock = blockDim.x * blockDim.y;     // 64 * WAVES_PER_BLOCK
+    const int linearT         = wave * blockDim.x + lane;
+
+    auto load_A_tile = [&](uint16_t* dst, int kBase) {
+        // A in LDS as row-major [BLOCK_M x BLOCK_K] of bf16 bits
+        for (int idx = linearT; idx < BLOCK_M * BLOCK_K; idx += threadsPerBlock) {
+            const int r  = idx / BLOCK_K;    // 0..BLOCK_M-1
+            const int c  = idx % BLOCK_K;    // 0..BLOCK_K-1
+            const int gm = m0 + r;
+            const int gk = kBase + c;
+            float a = (gm < M && gk < K) ? A[(size_t)gm * K + gk] : 0.0f;
+            dst[r * BLOCK_K + c] = f32_to_bf16_bits(a);
+        }
+    };
+
+    auto load_B_tile_half = [&](uint16_t* dst, int kBase, int half) {
+        const uint8_t* Wp     = (half == 0) ? Wp0     : Wp1;
+        const float*   scales = (half == 0) ? scales0 : scales1;
+        const size_t   totalW = (half == 0) ? total_w_elems_half0 : total_w_elems_half1;
+
+        // B in LDS as column-major [BLOCK_K x BLOCK_N] (ldB = BLOCK_K)
+        for (int idx = linearT; idx < BLOCK_K * BLOCK_N; idx += threadsPerBlock) {
+            const int c  = idx / BLOCK_K;              // local column within BLOCK_N
+            const int r  = idx % BLOCK_K;              // k within this slice
+            const int gn = n0 + c;                     // column index within the half
+            const int gk = kBase + r;                  // K index
+            float wb = (gk < K && gn < Nhalf)
+                ? dequantize_mxfp4(Wp, scales, (size_t)gn * K + gk, totalW)
+                : 0.0f;
+            dst[c * BLOCK_K + r] = f32_to_bf16_bits(wb);
+        }
+    };
+
+    // ---- Preload stage 0 ----
+    load_A_tile(sA0, 0);
+    load_B_tile_half(sB0h0, 0, /*half=*/0);
+    load_B_tile_half(sB0h1, 0, /*half=*/1);
+    __syncthreads();
+
+    uint16_t* currA  = sA0;
+    uint16_t* nextA  = sA1;
+    uint16_t* currB0 = sB0h0;   // half 0
+    uint16_t* nextB0 = sB1h0;
+    uint16_t* currB1 = sB0h1;   // half 1
+    uint16_t* nextB1 = sB1h1;
+
+    // ---- K loop (16-wide MFMA slices) ----
+    for (int k0 = 0; k0 < K; k0 += BLOCK_K) {
+        // Preload next stage
+        if (k0 + BLOCK_K < K) {
+            const int kBase = k0 + BLOCK_K;
+            load_A_tile(nextA, kBase);
+            load_B_tile_half(nextB0, kBase, /*half=*/0);
+            load_B_tile_half(nextB1, kBase, /*half=*/1);
+        }
+
+        // Build lane operands once for A, twice for B (two halves)
+        const int ldA = BLOCK_K;
+        const int ldB = BLOCK_K;
+        const int aRowBase = wave_m * WM;
+        const int bColBase = wave_n * WN;
+
+        bf16x4 avec = make_a_vec(currA, ldA, aRowBase, lane);
+        bf16x4 b0   = make_b_vec(currB0, ldB, bColBase, lane);
+        bf16x4 b1   = make_b_vec(currB1, ldB, bColBase, lane);
+
+        acc0 = mfma_16x16x16_bf16(avec, b0, acc0);
+        acc1 = mfma_16x16x16_bf16(avec, b1, acc1);
+
+        __syncthreads(); // make sure preloads completed & no LDS hazards
+
+        // swap ping–pong buffers
+        uint16_t* tA = currA;  currA  = nextA;  nextA  = tA;
+        uint16_t* t0 = currB0; currB0 = nextB0; nextB0 = t0;
+        uint16_t* t1 = currB1; currB1 = nextB1; nextB1 = t1;
+    }
+
+    // ---- Stores ----
+    const int Ntot = 2 * Nhalf;                  // full row stride
+    const bool full_tile_h0 = (m0 + BLOCK_M) <= M && (n0 + BLOCK_N) <= Nhalf;
+
+    if (full_tile_h0) {
+        store_c_tile_mfma<true >(C, acc0, M, Ntot, m0, /*n0=*/n0,       wave_m, wave_n, lane);
+    } else {
+        store_c_tile_mfma<false>(C, acc0, M, Ntot, m0, /*n0=*/n0,       wave_m, wave_n, lane);
+    }
+
+    const int n0_h1 = n0 + Nhalf;
+    const bool full_tile_h1 = (m0 + BLOCK_M) <= M && (n0_h1 + BLOCK_N) <= Ntot;
+
+    if (full_tile_h1) {
+        store_c_tile_mfma<true >(C, acc1, M, Ntot, m0, /*n0=*/n0_h1,    wave_m, wave_n, lane);
+    } else {
+        store_c_tile_mfma<false>(C, acc1, M, Ntot, m0, /*n0=*/n0_h1,    wave_m, wave_n, lane);
+    }
+}
+
+// Host wrapper: computes two contiguous halves (each Nhalf) into [M, 2*Nhalf]
+inline void matmul_mxfp4_fused2(
+    float* __restrict__ output,                 // [M, 2*Nhalf]
+    const float* __restrict__ input,            // [M, K]
+    const uint8_t* __restrict__ weight0_packed, // base of first half
+    const float*   __restrict__ scales0,
+    const uint8_t* __restrict__ weight1_packed, // base of second half
+    const float*   __restrict__ scales1,
+    int batch_size, int input_dim, int Nhalf,
+    size_t total_weight_elements_half,          // = Nhalf * input_dim (elements)
+    hipStream_t stream = nullptr)
+{
+    const int M = batch_size, K = input_dim;
+
+    dim3 grid((Nhalf + BLOCK_N - 1) / BLOCK_N,
+              (M     + BLOCK_M - 1) / BLOCK_M);
+    dim3 block(LANE_PER_WAVE, WAVES_PER_BLOCK);
+
+    // Shared memory: 2*A tiles + 4*B tiles, all as bf16 bits (uint16_t)
+    const size_t shmem_bytes =
+        (size_t)(2 * BLOCK_M * BLOCK_K + 4 * BLOCK_K * BLOCK_N) * sizeof(uint16_t);
+
+    hipLaunchKernelGGL(
+        gemm_mfma_uint8_kernel_opt_fused2,
+        grid, block, shmem_bytes, stream,
+        /*C*/  output,
+        /*A*/  input,
+        /*B0*/ weight0_packed, /*S0*/ scales0,
+        /*B1*/ weight1_packed, /*S1*/ scales1,
+        /*dims*/ M, K, Nhalf,
+        /*totals*/ total_weight_elements_half, total_weight_elements_half);
+}
+
