@@ -87,8 +87,8 @@ typedef struct
     float *mask; // attention mask (seq_len, seq_len)
 
     // KV cache - now using BF16 for 50% memory reduction
-    __hip_bfloat16 *key_cache;   // (batch_size, n_layers, seq_len, kv_dim)
-    __hip_bfloat16 *value_cache; // (batch_size, n_layers, seq_len, kv_dim)
+    float *key_cache;   // (batch_size, n_layers, seq_len, kv_dim)
+    float *value_cache; // (batch_size, n_layers, seq_len, kv_dim)
 
     // RoPE buffers
     float *cos_vals; // (head_dim/2, seq_len)
@@ -182,7 +182,7 @@ void malloc_gpu_run_state(GPURunState *s, Config *p)
     size_t batch_hidden = BATCH_SIZE * p->hidden_dim * sizeof(float);
     size_t batch_qkv = BATCH_SIZE * p->head_dim * (p->n_attn_heads + 2 * p->n_kv_heads) * sizeof(float);
     // BF16 KV cache - 50% memory reduction compared to FP32
-    size_t kv_cache_size = BATCH_SIZE * p->n_layers * MAX_SEQ_LEN * kv_dim * sizeof(__hip_bfloat16);
+    size_t kv_cache_size = BATCH_SIZE * p->n_layers * MAX_SEQ_LEN * kv_dim * sizeof(float);
 
     printf("Allocating GPU memory: batch_size=%d, hidden_dim=%d, seq_len=%d\n",
            BATCH_SIZE, p->hidden_dim, MAX_SEQ_LEN);
@@ -693,13 +693,25 @@ void finish(Transformer *transformer, Tokenizer *tokenizer)
     }
 }
 
+int tokenId = 0;
 
 void attention_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size)
 {
-    // TIME_SCOPE(attention);
     Config *p = &gpu_t->config;
     GPURunState *s = &gpu_t->state;
     GPUTransformerWeights *w = &gpu_t->weights;
+
+    static Timer rms_norm_timer("RMSNorm_attention", true);
+    static Timer matmul_timer("MatMul_attention", true);
+    static Timer add_bias_timer("AddBias_attention", true);
+    static Timer apply_rope_timer("ApplyRoPE_attention", true);
+    static Timer update_kv_cache_timer("UpdateKVCache_attention", true);
+    static Timer attention_scores_kernel_timer("AttentionScoresKernel_attention", true);
+    static Timer add_sinks_kernel_timer("AddSinksKernel_attention", true);
+    static Timer softmax_kernel_timer("SoftmaxKernel_attention", true);
+    static Timer matmul_kernel_simple_timer("MatMulKernelSimple_attention", true);
+    static Timer attention_weighted_sum_kernel_timer("AttentionWeightedSumKernel_attention", true);
+    static Timer accumulate_kernel_timer("AccumulateKernel_attention", true);
 
     int head_dim = p->head_dim;
     int hidden_dim = p->hidden_dim;
@@ -709,15 +721,26 @@ void attention_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size)
     dim3 norm_grid(batch_size);
     dim3 norm_block(THREADS_PER_BLOCK);
     {
+        TIME_SCOPE(rms_norm_timer);
         rmsnorm_kernel<<<norm_grid, norm_block>>>(
             s->t, s->x, w->rms_attn_w + layer_idx * hidden_dim, batch_size, hidden_dim);
         HIP_CHECK(hipGetLastError());
     }
-    // HIP_CHECK(hipDeviceSynchronize());
 
+    // if (tokenId == 0) debug(s->t, 10);
+
+    dim3 matmul_grid(batch_size, ((p->n_attn_heads + 2 * p->n_kv_heads) * head_dim + 31) / 32);
+    dim3 matmul_block(32, min(32, THREADS_PER_BLOCK / 32));
     int qkv_weight_offset = layer_idx * hidden_dim * (head_dim * p->n_attn_heads + 2 * head_dim * p->n_kv_heads);
 
+    // Define block and grid dimensions
+    dim3 block_dim(32, 32); // A 2D block, e.g., 32x32 = 1024 threads.
+    dim3 grid_dim;
+    grid_dim.x = batch_size;
+    grid_dim.y = ((p->n_attn_heads + 2 * p->n_kv_heads) * head_dim + block_dim.y - 1) / block_dim.y; // Ceiling division
     {
+        TIME_SCOPE(matmul_timer);
+        // QKV projection using safer matmul kernel - FIXED: Use GPU weight pointer
         matmul(
             s->qkv,
             s->t,
@@ -727,163 +750,153 @@ void attention_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size)
             (p->n_attn_heads + 2 * p->n_kv_heads) * head_dim);
         HIP_CHECK(hipGetLastError());
     }
-    
+
+
     HIP_CHECK(hipGetLastError());
     // Add bias - FIXED: Use GPU bias pointer and proper kernel
     int qkv_bias_offset = layer_idx * (head_dim * p->n_attn_heads + 2 * head_dim * p->n_kv_heads);
     dim3 bias_grid((1LL * batch_size * (p->n_attn_heads + 2 * p->n_kv_heads) * head_dim + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK);
 
     {
+        TIME_SCOPE(add_bias_timer);
         add_bias_kernel<<<bias_grid, THREADS_PER_BLOCK>>>(
             s->qkv, w->b_qkv + qkv_bias_offset, batch_size, (p->n_attn_heads + 2 * p->n_kv_heads) * head_dim);
         HIP_CHECK(hipGetLastError());
     }
-    // HIP_CHECK(hipDeviceSynchronize());
-    /*
+    
+    // if (tokenId == 0) debug(s->qkv, 10);
     // Copy Q, K, V from qkv buffer - SIMPLIFIED AND FIXED
     int q_size = p->n_attn_heads * head_dim;
     int k_size = p->n_kv_heads * head_dim;
     int v_size = p->n_kv_heads * head_dim;
 
     // Copy Q: shape [batch_size, n_attn_heads * head_dim]
-    for (int b = 0; b < batch_size; b++)
+    for (int b = 0; b < BATCH_SIZE; b++)
     {
         float *src = s->qkv + 1LL * b * (p->n_attn_heads + 2 * p->n_kv_heads) * head_dim;
         float *dst = s->q + 1LL * b * q_size;
         HIP_CHECK(hipMemcpy(dst, src, q_size * sizeof(float), hipMemcpyDeviceToDevice));
     }
-    // HIP_CHECK(hipDeviceSynchronize());
-    
+
     // Copy K: shape [batch_size, n_kv_heads * head_dim]
     int k_offset = p->n_attn_heads * head_dim;
-    for (int b = 0; b < batch_size; b++)
+    for (int b = 0; b < BATCH_SIZE; b++)
     {
         float *src = s->qkv + 1LL * b * (p->n_attn_heads + 2 * p->n_kv_heads) * head_dim + k_offset;
         float *dst = s->k + 1LL * b * k_size;
         HIP_CHECK(hipMemcpy(dst, src, k_size * sizeof(float), hipMemcpyDeviceToDevice));
     }
-    // HIP_CHECK(hipDeviceSynchronize());
-    
+
     // Copy V: shape [batch_size, n_kv_heads * head_dim]
     int v_offset = (p->n_attn_heads + p->n_kv_heads) * head_dim;
-    for (int b = 0; b < batch_size; b++)
+    for (int b = 0; b < BATCH_SIZE; b++)
     {
         float *src = s->qkv + 1LL * b * (p->n_attn_heads + 2 * p->n_kv_heads) * head_dim + v_offset;
         float *dst = s->v + 1LL * b * v_size;
         HIP_CHECK(hipMemcpy(dst, src, v_size * sizeof(float), hipMemcpyDeviceToDevice));
     }
-    // HIP_CHECK(hipDeviceSynchronize());
-    
+
     // Apply rotary embeddings
     dim3 rope_grid(batch_size, p->n_attn_heads);
     dim3 rope_block(head_dim / 2);
     {
+        TIME_SCOPE(apply_rope_timer);
         apply_rotary_emb_kernel<<<rope_grid, rope_block>>>(
             s->q, s->cos_vals, s->sin_vals, s->positions, batch_size, p->n_attn_heads, head_dim);
         HIP_CHECK(hipGetLastError());
     }
-    // HIP_CHECK(hipDeviceSynchronize());
-    
+    // if (tokenId == 0) debug(s->k, 10);
     rope_grid.y = p->n_kv_heads;
     apply_rotary_emb_kernel<<<rope_grid, rope_block>>>(
         s->k, s->cos_vals, s->sin_vals, s->positions, batch_size, p->n_kv_heads, head_dim);
     HIP_CHECK(hipGetLastError());
-    // HIP_CHECK(hipDeviceSynchronize());
-    */
-    launch_split_qkv_apply_rotary(
-        /*qkv=*/s->qkv,
-        /*q=*/s->q, /*k=*/s->k, /*v=*/s->v,
-        /*cos/sin=*/s->cos_vals, s->sin_vals,
-        /*pos=*/s->positions,
-        /*sizes=*/batch_size, p->n_attn_heads, p->n_kv_heads, p->head_dim,
-        /*stream=*/0);
-    HIP_CHECK(hipGetLastError());
-
-
+    // if (tokenId == 0) debug(s->q, 10);
+    // if (tokenId == 0) debug(s->k, 10);
     // Update KV cache - NEW: Proper GPU kernel
-    dim3 kv_grid(batch_size, (kv_dim + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK);
-    dim3 kv_block(1, THREADS_PER_BLOCK);
+    dim3 kv_grid(batch_size, (kv_dim + 31) / 32);
+    dim3 kv_block(1, 32);
     {
+        TIME_SCOPE(update_kv_cache_timer);
         update_kv_cache_kernel<<<kv_grid, kv_block>>>(
             s->key_cache, s->value_cache, s->k, s->v, s->positions, batch_size,
             p->n_layers, layer_idx, MAX_SEQ_LEN, kv_dim);
         HIP_CHECK(hipGetLastError());
     }
 
-    // ------------------- FUSED KERNEL LAUNCH (REPLACES 4 OLD KERNELS) -------------------
-    // --- Fused attention launch (matching kernel above) ---
-    
-    
+    // Compute attention scores
+    dim3 att_grid(batch_size, p->n_attn_heads, (MAX_SEQ_LEN + 31) / 32);
+    dim3 att_block(1, 1, 32);
     {
-        dim3 grid(batch_size, p->n_attn_heads);
-        dim3 block(256);  // 4 warps; good for sweeping tokens
+        TIME_SCOPE(attention_scores_kernel_timer);
+        attention_scores_shared_mem_kernel<<<att_grid, att_block>>>(
+            s->att, s->q, s->key_cache, s->mask, s->positions, batch_size, p->n_attn_heads,
+            head_dim, MAX_SEQ_LEN, p->n_layers, layer_idx, p->sliding_window > 0);
+        HIP_CHECK(hipGetLastError());
+    }
+    // Compute attention scores
+    //
 
-        const bool apply_window = (p->sliding_window > 0) && ((layer_idx & 1) == 0);
-        constexpr int HOST_WARPSIZE = 64;
-        const int warps = (block.x + HOST_WARPSIZE - 1) / HOST_WARPSIZE;
-
-        // att capacity: SW path reserves SW_WINDOW+1 (sink included), FULL path reserves MAX_SEQ_LEN
-        const size_t att_cap = apply_window ? (SW_WINDOW + 1) : MAX_SEQ_LEN;
-
-        // New layout: s_att[att_cap] + s_partials[warps * head_dim] + s_reduce[warps]
-        const size_t shared_mem_size =
-            (att_cap + (size_t)warps * p->head_dim + warps) * sizeof(float);
-
-        hipLaunchKernelGGL(
-            fused_attention_kernel,
-            grid, block, shared_mem_size, 0 /*stream*/,
-            s->tb,
-            s->q,
-            s->key_cache,
-            s->value_cache,
-            w->attn_sinks + layer_idx * p->n_attn_heads,  // already layer-offset
-            s->mask,
-            s->positions,
-            batch_size,
-            p->n_attn_heads,
-            p->n_kv_heads,
-            p->head_dim,
-            MAX_SEQ_LEN,
-            p->n_layers,
-            layer_idx,
-            p->sliding_window > 0
-        );
+    // Add attention sinks - FIXED: Use GPU weight pointer
+    dim3 sink_grid(batch_size, p->n_attn_heads);
+    dim3 sink_block(1);
+    {
+        TIME_SCOPE(add_sinks_kernel_timer);
+        add_sinks_kernel<<<sink_grid, sink_block>>>(
+            s->att, w->attn_sinks + layer_idx * p->n_attn_heads, s->positions,
+            MAX_SEQ_LEN, p->n_attn_heads);
         HIP_CHECK(hipGetLastError());
     }
 
+    // Softmax attention weights
+    dim3 soft_grid(batch_size * p->n_attn_heads);
+    dim3 soft_block(THREADS_PER_BLOCK);
+    {
+        TIME_SCOPE(softmax_kernel_timer);
+        softmax_kernel_variable_len<<<soft_grid, soft_block>>>(
+            s->att, s->positions, batch_size, p->n_attn_heads, MAX_SEQ_LEN);
+        HIP_CHECK(hipGetLastError());
+    }
+    
+    // if (tokenId == 0)
+    // debug(s->att, 20);
+    // Weighted sum of values
+    dim3 wsum_grid(batch_size, p->n_attn_heads);
+    dim3 wsum_block(head_dim);
+    {
+        TIME_SCOPE(matmul_kernel_simple_timer);
+        attention_weighted_sum_kernel<<<wsum_grid, wsum_block>>>(
+            s->tb, s->att, s->value_cache, s->positions, batch_size, p->n_attn_heads,
+            head_dim, MAX_SEQ_LEN, p->n_layers, layer_idx);
+        HIP_CHECK(hipGetLastError());
+    }
+    // Output projection - FIXED: Use GPU weight pointer
 
+    grid_dim.y = (hidden_dim + block_dim.y - 1) / block_dim.y; // Ceiling division
 
-    // --------------------------------- END OF FUSED SECTION ---------------------------------
-
-     // --- FUSED OUTPUT PROJECTION: Replaces matmul, add_bias, and residual add ---
     int attn_out_offset = layer_idx * (head_dim * p->n_attn_heads) * hidden_dim;
-    int attn_bias_offset = layer_idx * hidden_dim;
 
     {
-        int M = batch_size;
-        int N = hidden_dim;
-        int K = head_dim * p->n_attn_heads;
-
-        dim3 gridDim((N + BLOCK_N - 1) / BLOCK_N, (M + BLOCK_M - 1) / BLOCK_M);
-        dim3 blockDim(LANE_PER_WAVE, WAVES_PER_BLOCK);
-        
-        // Shared memory: 2 buffers for A [M,K] tiles, 2 for B [K,N] tiles
-        size_t shared_mem_bytes = (2 * BLOCK_M * BLOCK_K + 2 * BLOCK_K * BLOCK_N) * sizeof(uint16_t);
-        
-
-        fused_output_projection_kernel_optimized<<<gridDim, blockDim, shared_mem_bytes>>>(
-            s->x,                       // Residual input and final output
-            s->tb,                      // Input from attention weighted sum
-            w->w_o + attn_out_offset,   // Projection weights
-            w->b_o + attn_bias_offset,  // Projection bias
-            M,                          // M
-            K,                          // K
-            N                           // N
-        );
+        TIME_SCOPE(matmul_kernel_simple_timer);
+        // Launch the simple kernel
+        matmul(
+            s->tb2, s->tb, w->w_o + attn_out_offset, batch_size, head_dim * p->n_attn_heads, hidden_dim);
         HIP_CHECK(hipGetLastError());
     }
-    HIP_CHECK(hipDeviceSynchronize());
-    // --- END OF FUSED OUTPUT PROJECTION ---
+
+    // Add bias and residual connection - FIXED: Use GPU bias pointer
+    int attn_bias_offset = layer_idx * hidden_dim;
+    {
+        TIME_SCOPE(accumulate_kernel_timer);
+        add_bias_kernel<<<bias_grid, THREADS_PER_BLOCK>>>(
+            s->tb2, w->b_o + attn_bias_offset, batch_size, hidden_dim);
+        HIP_CHECK(hipGetLastError());
+    }
+    {
+        TIME_SCOPE(accumulate_kernel_timer);
+        accumulate_kernel<<<(batch_size * hidden_dim + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK, THREADS_PER_BLOCK>>>(
+            s->x, s->tb2, 1.0f, batch_size, hidden_dim);
+        HIP_CHECK(hipGetLastError());
+    }
 }
 
 void moe_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size)
@@ -1123,6 +1136,7 @@ int *forward_batch_gpu(GPUTransformer *gpu_t, int *tokens, int batch_size)
     sample_argmax(s->logits, s->current_tokens, batch_size, p->vocab_size);
     // Copy logits back to CPU (you might want to keep this on GPU for sampling)
     HIP_CHECK(hipMemcpy(cpu_buf->current_tokens, s->current_tokens, batch_size * sizeof(int), hipMemcpyDeviceToHost));
+    ++tokenId;
     return cpu_buf->current_tokens; 
 }
 

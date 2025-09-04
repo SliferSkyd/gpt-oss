@@ -1,4 +1,6 @@
-32
+1
+tabs	and	spaces
+
 Hello
 Hello world
 Write a short haiku about the ocean.

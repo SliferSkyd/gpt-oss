@@ -35,7 +35,6 @@ void debug(float *d_val, int size = 1)
         fprintf(stderr, "Debug value %d: %f\n", i, h_val[i]);
     }
     free(h_val);
-    exit(0);
 }
 
 //------------------------------------------------------------------------------//
