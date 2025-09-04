@@ -54,15 +54,15 @@ __global__ void attention_scores_shared_mem_kernel(
         float4 q_vec = q_ptr_shared[i];
 
         float k_vals[4];
-        k_vals[0] = __bfloat162float(k_head[i * 4 + 0]);
-        k_vals[1] = __bfloat162float(k_head[i * 4 + 1]);
-        k_vals[2] = __bfloat162float(k_head[i * 4 + 2]);
-        k_vals[3] = __bfloat162float(k_head[i * 4 + 3]);
+        k_vals[0] = (k_head[i * 4 + 0]);
+        k_vals[1] = (k_head[i * 4 + 1]);
+        k_vals[2] = (k_head[i * 4 + 2]);
+        k_vals[3] = (k_head[i * 4 + 3]);
 
-        s0 += q_vec.x * k_vals[0];
-        s1 += q_vec.y * k_vals[1];
-        s2 += q_vec.z * k_vals[2];
-        s3 += q_vec.w * k_vals[3];
+        s0 += (double)q_vec.x * k_vals[0];
+        s1 += (double)q_vec.y * k_vals[1];
+        s2 += (double)q_vec.z * k_vals[2];
+        s3 += (double)q_vec.w * k_vals[3];
     }
 
     double score = (s0 + s1) + (s2 + s3);
@@ -135,14 +135,14 @@ __global__ void attention_weighted_sum_kernel(float *output, const float *att,
     const float *att_head = att + 1LL * batch_idx * n_heads * seq_len + 1LL * head_idx * seq_len;
     float *out_head = output + 1LL * batch_idx * n_heads * head_dim + 1LL * head_idx * head_dim;
 
-    float sum = 0.0f;
+    double sum = 0.0f;
     for (int t = 0; t <= pos; t++)
     {
         const float *v_head = value_cache + 1LL * batch_idx * n_layers * seq_len * kv_dim +
                                        1LL * layer_idx * seq_len * kv_dim + 1LL * t * kv_dim + kv_head * head_dim;
         // Convert BF16 value to FP32 for computation
-        float v_val = __bfloat162float(v_head[dim_idx]);
-        sum += att_head[t] * v_val;
+        float v_val = (v_head[dim_idx]);
+        sum += (double)att_head[t] * v_val;
     }
     out_head[dim_idx] = sum;
 }

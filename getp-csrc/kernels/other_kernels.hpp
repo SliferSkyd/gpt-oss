@@ -27,6 +27,21 @@ __global__ void add_bias_kernel(float *output, const __hip_bfloat16 *bias, int b
     }
 }
 
+
+// NEW: Kernel to add bias to matrix multiplication result with bfloat16 bias
+__global__ void add_bias_kernel(float *output, const float *bias, int batch_size, int size)
+{
+    size_t idx = 1LL * blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < batch_size * size)
+    {
+        int dim_idx = idx % size;
+        // Convert bfloat16 bias to fp32 on-the-fly
+        float bias_fp32 = (bias[dim_idx]);
+        output[idx] += bias_fp32;
+    }
+}
+
+
 // NEW: KV cache update kernel with BF16 quantization
 __global__ void update_kv_cache_kernel(float *key_cache, float *value_cache,
                                        const float *k, const float *v,
@@ -56,7 +71,7 @@ __global__ void update_kv_cache_kernel(float *key_cache, float *value_cache,
 }
 
 
-__global__ void copy_embeddings_kernel(float *output, const __hip_bfloat16 *embeddings,
+__global__ void copy_embeddings_kernel(float *output, const float *embeddings,
                                        const int *tokens, int batch_size, int hidden_dim)
 {
     size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
@@ -70,6 +85,6 @@ __global__ void copy_embeddings_kernel(float *output, const __hip_bfloat16 *embe
         return; // Safety check for invalid tokens
 
     // Convert bfloat16 embedding to fp32 on-the-fly
-    float embedding_fp32 = __bfloat162float(embeddings[token * hidden_dim + dim_idx]);
+    float embedding_fp32 = (embeddings[token * hidden_dim + dim_idx]);
     output[idx] = embedding_fp32;
 }

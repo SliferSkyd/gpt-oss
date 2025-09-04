@@ -3,7 +3,7 @@
 #include "../config.hpp"
 
 // GPU kernels with bfloat16 weights support
-__global__ void rmsnorm_kernel(float *output, const float *input, const __hip_bfloat16 *weight,
+__global__ void rmsnorm_kernel(float *output, const float *input, const float *weight,
                                int batch_size, int size)
 {
     size_t batch_idx = blockIdx.x;
@@ -19,10 +19,10 @@ __global__ void rmsnorm_kernel(float *output, const float *input, const __hip_bf
     __shared__ float shared_ss[THREADS_PER_BLOCK];
 
     // Calculate sum of squares
-    float ss = 0.0f;
+    double ss = 0.0f;
     for (int i = tid; i < size; i += blockDim.x)
     {
-        ss += x[i] * x[i];
+        ss += (double)x[i] * x[i];
     }
     shared_ss[tid] = ss;
     __syncthreads();
@@ -51,7 +51,6 @@ __global__ void rmsnorm_kernel(float *output, const float *input, const __hip_bf
     // Normalize and scale - convert bfloat16 weight to fp32 on-the-fly
     for (int i = tid; i < size; i += blockDim.x)
     {
-        float weight_fp32 = __bfloat162float(weight[i]);
-        o[i] = weight_fp32 * (ss * x[i]);
+        o[i] = (double)(weight[i]) * (ss * x[i]);
     }
 }
