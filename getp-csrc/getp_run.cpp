@@ -882,10 +882,9 @@ void attention_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size)
         );
         HIP_CHECK(hipGetLastError());
     }
-    HIP_CHECK(hipDeviceSynchronize());
+    // HIP_CHECK(hipDeviceSynchronize());
     // --- END OF FUSED OUTPUT PROJECTION ---
 }
-
 void moe_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size)
 {
     Config *p = &gpu_t->config;
@@ -893,55 +892,58 @@ void moe_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size)
     GPUTransformerWeights *w = &gpu_t->weights;
     CPUBuffers *cpu_buf = &gpu_t->cpu_buffers;
 
-    const int H = p->hidden_dim;
-    const int D = p->intermediate_dim;
-    const int E = p->n_experts;
-    const int Ktok = p->experts_per_token;
+    const int H     = p->hidden_dim;
+    const int D     = p->intermediate_dim;
+    const int E     = p->n_experts;
+    const int Ktok  = p->experts_per_token;
 
-    hipEvent_t evRouterDone, evPermuteDone;
-    HIP_CHECK(hipEventCreateWithFlags(&evRouterDone, hipEventDisableTiming));
-    HIP_CHECK(hipEventCreateWithFlags(&evPermuteDone, hipEventDisableTiming));
-
-    // 1) FFN RMSNorm + router (sGather stream)
+    // =========================
+    // 1) FFN RMSNorm + router
+    // =========================
     {
         dim3 norm_grid(batch_size), norm_block(THREADS_PER_BLOCK);
-        rmsnorm_kernel<<<norm_grid, norm_block, 0, cpu_buf->sGather>>>(
+        // default stream (0) — launches are ordered
+        rmsnorm_kernel<<<norm_grid, norm_block>>>(
             s->t, s->x, w->rms_ffn_w + (size_t)layer_idx * H, batch_size, H);
         HIP_CHECK(hipGetLastError());
 
+        // keep same matmul, but route it to default stream (pass 0 if it takes a stream)
         matmul(s->router_score, s->t,
                w->w_router + (size_t)layer_idx * H * E,
-               batch_size, H, E, cpu_buf->sGather);
+               batch_size, H, E, /*stream=*/0);
 
         const int elems = batch_size * E;
         add_bias_kernel<<<(elems + THREADS_PER_BLOCK - 1)/THREADS_PER_BLOCK,
-                          THREADS_PER_BLOCK, 0, cpu_buf->sGather>>>(
+                          THREADS_PER_BLOCK>>>(
             s->router_score, w->b_router + (size_t)layer_idx * E, batch_size, E);
         HIP_CHECK(hipGetLastError());
 
-        topk_kernel<<<batch_size, 1, 0, cpu_buf->sGather>>>(
+        topk_kernel<<<batch_size, 1>>>(
             s->topk_v, s->topk_i, s->router_score, batch_size, E, Ktok);
+        HIP_CHECK(hipGetLastError());
 
-        softmax_kernel<<<batch_size, THREADS_PER_BLOCK, 0, cpu_buf->sGather>>>(
+        softmax_kernel<<<batch_size, THREADS_PER_BLOCK>>>(
             s->topk_v, batch_size, Ktok);
-
-        HIP_CHECK(hipEventRecord(evRouterDone, cpu_buf->sGather));
+        HIP_CHECK(hipGetLastError());
     }
 
-    // 2) Count -> host prefix -> offsets D2H/D2D -> permute (sGather)
+    // =========================================================
+    // 2) Count -> host prefix -> offsets H2D -> permute
+    //    (use blocking copies so CPU reads are safe)
+    // =========================================================
     int total_tokens = 0;
     {
-        HIP_CHECK(hipStreamWaitEvent(cpu_buf->sGather, evRouterDone, 0));
+        // zero device counts (blocking or ordered-before next ops)
+        HIP_CHECK(hipMemset(s->d_expert_counts, 0, E * sizeof(int)));
 
-        HIP_CHECK(hipMemsetAsync(s->d_expert_counts, 0, E * sizeof(int), cpu_buf->sGather));
         const dim3 count_grid((batch_size + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK);
-        count_tokens_per_expert_kernel<<<count_grid, THREADS_PER_BLOCK, 0, cpu_buf->sGather>>>(
+        count_tokens_per_expert_kernel<<<count_grid, THREADS_PER_BLOCK>>>(
             s->topk_i, s->d_expert_counts, batch_size, Ktok);
         HIP_CHECK(hipGetLastError());
 
-        HIP_CHECK(hipMemcpyAsync(cpu_buf->expert_counts, s->d_expert_counts,
-                                 E * sizeof(int), hipMemcpyDeviceToHost, cpu_buf->sGather));
-        HIP_CHECK(hipStreamSynchronize(cpu_buf->sGather));
+        // D2H blocking so CPU can build prefix safely
+        HIP_CHECK(hipMemcpy(cpu_buf->expert_counts, s->d_expert_counts,
+                            E * sizeof(int), hipMemcpyDeviceToHost));
 
         total_tokens = 0;
         for (int e = 0; e < E; ++e) {
@@ -949,30 +951,30 @@ void moe_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size)
             total_tokens += cpu_buf->expert_counts[e];
         }
 
-        HIP_CHECK(hipMemcpyAsync(s->d_expert_offsets, cpu_buf->expert_offsets,
-                                 E * sizeof(int), hipMemcpyHostToDevice, cpu_buf->sGather));
+        // H2D blocking: device sees offsets before subsequent kernels
+        HIP_CHECK(hipMemcpy(s->d_expert_offsets, cpu_buf->expert_offsets,
+                            E * sizeof(int), hipMemcpyHostToDevice));
 
-        HIP_CHECK(hipMemsetAsync(s->d_expert_write_idx, 0, E * sizeof(int), cpu_buf->sGather));
+        // zero per-expert write indices
+        HIP_CHECK(hipMemset(s->d_expert_write_idx, 0, E * sizeof(int)));
 
         const dim3 permute_grid(batch_size), permute_block(256);
         const int  shared_mem_size = Ktok * sizeof(int);
-        permute_expert_inputs_kernel<<<permute_grid, permute_block, shared_mem_size, cpu_buf->sGather>>>(
+        permute_expert_inputs_kernel<<<permute_grid, permute_block, shared_mem_size>>>(
             s->t, s->topk_i, s->topk_v, s->d_expert_offsets, s->d_expert_write_idx,
             batch_size, H, Ktok,
             s->expert_input_buffer, s->expert_indices, s->expert_weights);
         HIP_CHECK(hipGetLastError());
-
-        HIP_CHECK(hipEventRecord(evPermuteDone, cpu_buf->sGather));
     }
 
     // Early out if no tokens routed
     if (total_tokens == 0) {
-        HIP_CHECK(hipEventDestroy(evRouterDone));
-        HIP_CHECK(hipEventDestroy(evPermuteDone));
         return;
     }
 
-    // 3) Build m-tile prefix (host) -> D2D (tiny)
+    // ===============================================
+    // 3) Build m-tile prefix (host) -> copy to device
+    // ===============================================
     std::vector<int> h_mtiles(E+1, 0);
     for (int e = 0; e < E; ++e) {
         int mtiles = (cpu_buf->expert_counts[e] + BLOCK_M - 1) / BLOCK_M;
@@ -982,18 +984,18 @@ void moe_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size)
 
     int *d_mtile_prefix = nullptr;
     HIP_CHECK(hipMalloc((void**)&d_mtile_prefix, (E+1) * sizeof(int)));
-    HIP_CHECK(hipMemcpy(d_mtile_prefix, h_mtiles.data(), (E+1)*sizeof(int), hipMemcpyHostToDevice));
+    HIP_CHECK(hipMemcpy(d_mtile_prefix, h_mtiles.data(),
+                        (E+1) * sizeof(int), hipMemcpyHostToDevice));
 
-    // Wait for permute; from here we run on sScatter as the single pipeline stream
-    HIP_CHECK(hipStreamWaitEvent(cpu_buf->sScatter, evPermuteDone, 0));
+    // Zero aggregation buffer once (ordered before downstream kernels)
+    HIP_CHECK(hipMemset(s->e_agg, 0, (size_t)batch_size * H * sizeof(float)));
 
-    // Zero aggregation buffer (once)
-    HIP_CHECK(hipMemsetAsync(s->e_agg, 0, (size_t)batch_size * H * sizeof(float), cpu_buf->sScatter));
-
-    // ------- GROUPED MLP1 (all experts) -------
+    // =========================
+    // GROUPED MLP1 (all experts)
+    // =========================
     {
-        const size_t seg1_elems        = (size_t)(2 * D) * H;                 // N*K
-        const size_t seg1_packed_bytes = (seg1_elems + 1) / 2;                // FIX 1/2 -> ( +1)/2
+        const size_t seg1_elems        = (size_t)(2 * D) * H;
+        const size_t seg1_packed_bytes = (seg1_elems + 1) / 2; // keep your FIX
         const size_t seg1_blocks       = (seg1_elems + MXFP4_BLOCK_SIZE - 1) / MXFP4_BLOCK_SIZE;
 
         const size_t layer1_elem_off   = (size_t)layer_idx * E * seg1_elems;
@@ -1009,7 +1011,7 @@ void moe_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size)
             (size_t)(2*BLOCK_M*BLOCK_K + 2*BLOCK_K*BLOCK_N) * sizeof(uint16_t);
 
         hipLaunchKernelGGL(grouped_mlp1_mxfp4_kernel,
-            grid, block, shmem, cpu_buf->sScatter,
+            grid, block, shmem, /*stream=*/0,
             /*C=*/s->mlp1_out,
             /*A=*/s->expert_input_buffer,
             /*Wp_layer=*/Wp1_layer, /*Sc_layer=*/Sc1_layer,
@@ -1019,7 +1021,9 @@ void moe_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size)
         HIP_CHECK(hipGetLastError());
     }
 
-    // ------- fused bias+SiLU(gate)*up over [total_tokens, D] -------
+    // ------------------------------------------------------
+    // fused bias+SiLU(gate)*up over [total_tokens, D]
+    // ------------------------------------------------------
     {
         const __hip_bfloat16* b1_layer =
             w->b_mlp1 + (size_t)layer_idx * E * (2*D);
@@ -1028,17 +1032,19 @@ void moe_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size)
         const int T = 256;
         const dim3 grid((work + T - 1)/T), block(T);
 
-        bias_swiglu_epilogue_kernel<<<grid, block, 0, cpu_buf->sScatter>>>(
+        bias_swiglu_epilogue_kernel<<<grid, block>>>(
             s->mlp1_out, b1_layer,
             s->d_expert_offsets, s->d_expert_counts, E,
             s->gate_up, D, total_tokens, p->swiglu_limit, 1.702f);
         HIP_CHECK(hipGetLastError());
     }
 
-    // ------- GROUPED MLP2 (all experts) + bias add -------
+    // =========================
+    // GROUPED MLP2 + bias add
+    // =========================
     {
         const size_t seg2_elems        = (size_t)H * D;
-        const size_t seg2_packed_bytes = (seg2_elems + 1) / 2;                // FIX 1/2 -> ( +1)/2
+        const size_t seg2_packed_bytes = (seg2_elems + 1) / 2; // keep your FIX
         const size_t seg2_blocks       = (seg2_elems + MXFP4_BLOCK_SIZE - 1) / MXFP4_BLOCK_SIZE;
 
         const size_t layer2_elem_off   = (size_t)layer_idx * E * seg2_elems;
@@ -1057,7 +1063,7 @@ void moe_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size)
             (size_t)(2*BLOCK_M*BLOCK_K + 2*BLOCK_K*BLOCK_N) * sizeof(uint16_t);
 
         hipLaunchKernelGGL(grouped_mlp2_mxfp4_bias_kernel,
-            grid, block, shmem, cpu_buf->sScatter,
+            grid, block, shmem, /*stream=*/0,
             /*C=*/s->expert_output_buffer,
             /*A=*/s->gate_up,
             /*Wp,Sc*/ Wp2_layer, Sc2_layer, b2_layer,
@@ -1067,11 +1073,13 @@ void moe_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size)
         HIP_CHECK(hipGetLastError());
     }
 
-    // ------- single scatter & residual -------
+    // =========================
+    // single scatter & residual
+    // =========================
     {
         const int elems = total_tokens * H;
         const dim3 grid((elems + THREADS_PER_BLOCK - 1)/THREADS_PER_BLOCK);
-        scatter_expert_outputs_kernel<<<grid, THREADS_PER_BLOCK, 0, cpu_buf->sScatter>>>(
+        scatter_expert_outputs_kernel<<<grid, THREADS_PER_BLOCK>>>(
             s->e_agg, s->expert_output_buffer, s->expert_indices, s->expert_weights,
             total_tokens, H);
         HIP_CHECK(hipGetLastError());
@@ -1079,15 +1087,14 @@ void moe_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size)
     {
         const int elems = batch_size * H;
         accumulate_kernel<<<(elems + THREADS_PER_BLOCK - 1)/THREADS_PER_BLOCK,
-                            THREADS_PER_BLOCK, 0, cpu_buf->sScatter>>>(
+                            THREADS_PER_BLOCK>>>(
             s->x, s->e_agg, 1.0f, batch_size, H);
         HIP_CHECK(hipGetLastError());
     }
 
-    HIP_CHECK(hipStreamSynchronize(cpu_buf->sScatter));
+    // Ensure all queued work is complete before freeing temp buffers
+    // HIP_CHECK(hipDeviceSynchronize());
     HIP_CHECK(hipFree(d_mtile_prefix));
-    HIP_CHECK(hipEventDestroy(evRouterDone));
-    HIP_CHECK(hipEventDestroy(evPermuteDone));
 }
 
 int *forward_batch_gpu(GPUTransformer *gpu_t, int *tokens, int batch_size)
