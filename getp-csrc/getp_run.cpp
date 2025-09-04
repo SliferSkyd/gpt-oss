@@ -1262,6 +1262,7 @@ long long continuous_batching_inference(Tokenizer *tokenizer,
         }
 
         // Fill initial batch with first requests
+        int filled_slots = 0;
         for (int slot = 0; slot < BATCH_SIZE && cpu_buf->next_request_idx < end_request; slot++)
         {
             int req_idx = cpu_buf->next_request_idx++;
@@ -1285,6 +1286,19 @@ long long continuous_batching_inference(Tokenizer *tokenizer,
             cpu_buf->positions[slot] = 0;
             cpu_buf->finished[slot] = false;
             cpu_buf->current_tokens[slot] = cpu_buf->prompt_tokens[slot][0];
+            filled_slots++;
+        }
+
+        // Initialize remaining empty slots with valid padding tokens to avoid kernel errors
+        for (int slot = filled_slots; slot < BATCH_SIZE; slot++)
+        {
+            cpu_buf->slot_active_cpu[slot] = false;
+            cpu_buf->request_mapping_cpu[slot] = -1;
+            cpu_buf->seq_lengths_cpu[slot] = 0;
+            cpu_buf->positions[slot] = 0;
+            cpu_buf->finished[slot] = true;
+            cpu_buf->current_tokens[slot] = 0; // Use padding token (0) for empty slots
+            cpu_buf->prompt_lens[slot] = 0;
         }
 
         // Copy initial state to GPU
@@ -1384,6 +1398,9 @@ long long continuous_batching_inference(Tokenizer *tokenizer,
                         // No more requests, deactivate slot
                         cpu_buf->slot_active_cpu[slot] = false;
                         cpu_buf->request_mapping_cpu[slot] = -1;
+                        cpu_buf->current_tokens[slot] = 0; // Set valid padding token for inactive slot
+                        cpu_buf->seq_lengths_cpu[slot] = 0;
+                        cpu_buf->positions[slot] = 0;
                     }
                 }
                 else

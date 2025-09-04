@@ -93,47 +93,12 @@ __global__ void copy_embeddings_kernel(float *output, const __hip_bfloat16 *embe
 #define MAX(x, y) (((x) > (y)) ? (x) : (y))
 #define MIN(x, y) (((x) < (y)) ? (x) : (y))
 
-__global__ void rmsnorm_kernel(float *o, float *x, __hip_bfloat16 *weight, int size) {
-  extern __shared__ float smem[];
-  float *ss_ptr = &smem[blockDim.x];
-  int tid = threadIdx.x;
-  // blockIdx.y equal to batch index
-  // shift o,x to the corresponding batch
-  o += blockIdx.y * size;
-  x += blockIdx.y * size;
-  smem[tid] = 0;
-  for (int offset = 0; offset < size; offset += blockDim.x) {
-    if (tid + offset < size) {
-      float t = x[tid + offset];
-      smem[tid] += t * t;
-    }
-  }
-  __syncthreads();
-  for (int stride = blockDim.x / 2; stride > 0; stride /= 2) {
-    if (tid < stride) smem[tid] += smem[tid + stride];
-    __syncthreads();
-  }
-  if (tid == 0) *ss_ptr = smem[0];
-  __syncthreads();
-  float ss = *ss_ptr;
-  ss /= size;
-  ss += 1e-5f;
-  ss = 1.0f / sqrtf(ss);
-  for (int offset = 0; offset < size; offset += blockDim.x) {
-    if (tid + offset < size) {
-      float weight_fp32 = __bfloat162float(weight[tid + offset]);
-      o[tid + offset] = weight_fp32 * (ss * x[tid + offset]);
-    }
-  }
-}
-
 
 void getp_rmsnorm(float *o, float *x, __hip_bfloat16 *weight, int batch_size, int dim) {
   // PROFILE_FUNCTION();
-  dim3 blockDim(1024);
-  dim3 gridDim(1, batch_size);
-  rmsnorm_kernel<<<gridDim, blockDim, sizeof(float) * (blockDim.x + 1)>>>(
-      o, x, weight, dim);
+  dim3 blockDim(THREADS_PER_BLOCK);
+  dim3 gridDim(batch_size);
+  rmsnorm_kernel<<<gridDim, blockDim>>>(o, x, weight, batch_size, dim);
   //HIP_CHECK(hipDeviceSynchronize());
 }
 
