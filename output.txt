@@ -13,4 +13,4 @@ rope theta: 150000.000000
 rope_scaling_factor: 32.000000
 sliding window: 128
 swiglu_limit: 7.000000
-requests size = 67174400 B
+requests size = 8396800 B

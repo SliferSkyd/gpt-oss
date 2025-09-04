@@ -282,3 +282,352 @@ __global__ void permute_expert_inputs_kernel(const float *d_t, const int *topk_i
         }
     }
 }
+
+// ============ helpers: map a block-idx (m-tile) -> expert ============
+
+__device__ __forceinline__ int map_tile_to_expert(int tileIdx,
+                                                  const int* __restrict__ mtile_prefix,
+                                                  int n_experts) {
+    // binary search on prefix (mtile_prefix[0]=0, ..., [n_experts]=total)
+    int lo = 0, hi = n_experts;
+    while (lo < hi) {
+        int mid = (lo + hi) >> 1;
+        if (mtile_prefix[mid+1] <= tileIdx) lo = mid + 1;
+        else hi = mid;
+    }
+    return lo; // expert id
+}
+
+// Variant of store that adds bf16 bias (same col bias for 4 rows)
+template<bool InteriorStore>
+__device__ inline void store_c_tile_addbias(
+    float* __restrict__ C, const f32x4& acc,
+    const __hip_bfloat16* __restrict__ bias,
+    int M, int N, int m0, int n0, int wave_m, int wave_n, int lane)
+{
+    const int rowBase = m0 + wave_m * WM + lane_group(lane) * 4;
+    const int col     = n0 + wave_n * WN + lane_row(lane);
+
+    float b = 0.f;
+    if constexpr (InteriorStore) {
+        b = __bfloat162float(bias[col]);
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            C[(size_t)(rowBase + i) * N + col] = acc[i] + b;
+        }
+    } else {
+        if (col < N) {
+            b = __bfloat162float(bias[col]);
+#pragma unroll
+            for (int i = 0; i < 4; ++i) {
+                const int row = rowBase + i;
+                if (row < M) C[(size_t)row * N + col] = acc[i] + b;
+            }
+        }
+    }
+}
+
+// ==== GROUPED MLP1 (MXFP4) across all experts: FIXED LAYER-RELATIVE DEQUANT ====
+__global__ void grouped_mlp1_mxfp4_kernel(
+    float* __restrict__ C,                     // mlp1_out [sum_tokens, 2*D]
+    const float* __restrict__ A,               // expert_input_buffer [sum_tokens, H]
+    const uint8_t* __restrict__ Wp_layer,      // layer base (packed)
+    const float* __restrict__ Sc_layer,        // layer base (scales)
+    const int* __restrict__ expert_offsets,    // [n_experts]
+    const int* __restrict__ expert_counts,     // [n_experts]
+    const int* __restrict__ mtile_prefix,      // [n_experts+1]
+    int n_experts,
+    int K,                                     // H
+    int N,                                     // 2*D
+    size_t seg_elems,                          // per-expert elems in W (N*K) -- used for indexing
+    size_t /*seg_packed_bytes*/,               // kept for ABI; unused here
+    size_t /*seg_blocks*/                      // kept for ABI; unused here
+){
+    // which expert does this m-tile belong to?
+    const int mTileGlobal = blockIdx.y;
+    const int e = map_tile_to_expert(mTileGlobal, mtile_prefix, n_experts);
+    const int mTileLocal  = mTileGlobal - mtile_prefix[e];
+
+    const int M_e = expert_counts[e];
+    if (M_e == 0) return;
+
+    // tile origins
+    const int m0 = mTileLocal * BLOCK_M;
+    const int n0 = blockIdx.x * BLOCK_N;
+
+    const int lane   = threadIdx.x;
+    const int wave   = threadIdx.y;
+    const int wave_m = wave / WAVES_N;
+    const int wave_n = wave % WAVES_N;
+
+    extern __shared__ uint8_t smemRaw[];
+    uint16_t* sA0 = reinterpret_cast<uint16_t*>(smemRaw);
+    uint16_t* sA1 = sA0 + (BLOCK_M * BLOCK_K);
+    uint16_t* sB0 = sA1 + (BLOCK_M * BLOCK_K);
+    uint16_t* sB1 = sB0 + (BLOCK_K * BLOCK_N);
+
+    const int threadsPerBlock = blockDim.x * blockDim.y;
+    const int linearT = wave * blockDim.x + lane;
+
+    // per-expert row/col bases into the *layer* tensor
+    // layer is laid out as [n_experts, N, K] flattened, so expert e starts at:
+    const size_t e_elem_base = (size_t)e * seg_elems;            // element offset
+    const size_t layer_elems = (size_t)n_experts * seg_elems;    // handy for bounds in dequant
+
+    // slice pointers for A and C for this expert
+    const float* A_e = A + (size_t)expert_offsets[e] * K;
+    float*       C_e = C + (size_t)expert_offsets[e] * N;
+
+    f32x4 acc = {0.f, 0.f, 0.f, 0.f};
+
+    // --- preload k-slice 0 (double-buffered) ---
+    {
+        // A: [M_e, K] -> sA0 [BLOCK_M x BLOCK_K]
+        for (int idx = linearT; idx < BLOCK_M*BLOCK_K; idx += threadsPerBlock) {
+            const int r  = idx / BLOCK_K;         // row in tile
+            const int ck = idx % BLOCK_K;         // k within slice
+            const int gm = m0 + r;
+            const int gk = ck;
+            float a = (gm < M_e && gk < K) ? A_e[(size_t)gm * K + gk] : 0.f;
+            sA0[r * BLOCK_K + ck] = f32_to_bf16_bits(a);
+        }
+        // B: dequant from layer base using layer-relative element indices
+        // store as sB0 [BLOCK_N x BLOCK_K] (note the col-major-ish packing used by mfma path)
+        for (int idx = linearT; idx < BLOCK_K*BLOCK_N; idx += threadsPerBlock) {
+            const int cN = idx / BLOCK_K;         // N-col within the tile
+            const int rK = idx % BLOCK_K;         // K within the slice
+            const int gn = n0 + cN;
+            const int gk = rK;
+            float wb = (gk < K && gn < N)
+                ? dequantize_mxfp4(Wp_layer, Sc_layer,
+                                   e_elem_base + (size_t)gn * K + gk, layer_elems)
+                : 0.f;
+            sB0[cN * BLOCK_K + rK] = f32_to_bf16_bits(wb);
+        }
+    }
+    __syncthreads();
+
+    uint16_t* currA = sA0; uint16_t* nextA = sA1;
+    uint16_t* currB = sB0; uint16_t* nextB = sB1;
+
+    // --- main K loop (double buffering on shared mem) ---
+    for (int k0 = 0; k0 < K; k0 += BLOCK_K) {
+        if (k0 + BLOCK_K < K) {
+            const int kBase = k0 + BLOCK_K;
+
+            // preload next A-slice
+            for (int idx = linearT; idx < BLOCK_M*BLOCK_K; idx += threadsPerBlock) {
+                const int r  = idx / BLOCK_K;
+                const int ck = idx % BLOCK_K;
+                const int gm = m0 + r;
+                const int gk = kBase + ck;
+                float a = (gm < M_e && gk < K) ? A_e[(size_t)gm * K + gk] : 0.f;
+                nextA[r * BLOCK_K + ck] = f32_to_bf16_bits(a);
+            }
+            // preload next B-slice from layer base
+            for (int idx = linearT; idx < BLOCK_K*BLOCK_N; idx += threadsPerBlock) {
+                const int cN = idx / BLOCK_K;
+                const int rK = idx % BLOCK_K;
+                const int gn = n0 + cN;
+                const int gk = kBase + rK;
+                float wb = (gk < K && gn < N)
+                    ? dequantize_mxfp4(Wp_layer, Sc_layer,
+                                       e_elem_base + (size_t)gn * K + gk, layer_elems)
+                    : 0.f;
+                nextB[cN * BLOCK_K + rK] = f32_to_bf16_bits(wb);
+            }
+        }
+
+        // MFMA on current tiles
+        const int ldA = BLOCK_K, ldB = BLOCK_K;
+        const int aRowBase = wave_m * WM;
+        const int bColBase = wave_n * WN;
+        bf16x4 avec = make_a_vec(currA, ldA, aRowBase, lane);
+        bf16x4 bvec = make_b_vec(currB, ldB, bColBase, lane);
+        acc = mfma_16x16x16_bf16(avec, bvec, acc);
+
+        __syncthreads(); // before swapping the buffers
+        uint16_t* tA = currA; currA = nextA; nextA = tA;
+        uint16_t* tB = currB; currB = nextB; nextB = tB;
+    }
+
+    // store C (guarded for edges)
+    const bool interior = (m0 + BLOCK_M) <= M_e && (n0 + BLOCK_N) <= N;
+    if (interior) {
+        store_c_tile_mfma<true>(C_e, acc, M_e, N, m0, n0, wave_m, wave_n, lane);
+    } else {
+        store_c_tile_mfma<false>(C_e, acc, M_e, N, m0, n0, wave_m, wave_n, lane);
+    }
+}
+
+
+// ============ fused bias+SiLU(gate)*up over concatenated tokens ============
+__global__ void bias_swiglu_epilogue_kernel(
+    const float* __restrict__ mlp1_out,     // [sum_tokens, 2*D]
+    const __hip_bfloat16* __restrict__ b1,  // layer base, per-expert segments [n_experts, 2*D]
+    const int* __restrict__ expert_offsets, // [n_experts]
+    const int* __restrict__ expert_counts,  // [n_experts]
+    int n_experts,
+    float* __restrict__ gate_up,            // [sum_tokens, D]
+    int D,                                  // intermediate_dim
+    int sum_tokens,
+    float clamp_limit,
+    float alpha_silu = 1.702f)
+{
+    size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    size_t total = (size_t)sum_tokens * D;
+    if (idx >= total) return;
+
+    int t = idx / D;     // token id in concatenated buffer
+    int d = idx % D;
+
+    // map token -> expert (binary search over offsets)
+    int lo = 0, hi = n_experts;
+    while (lo < hi) {
+        int mid = (lo + hi) >> 1;
+        int start = expert_offsets[mid];
+        int end   = start + expert_counts[mid];
+        if (t >= end) lo = mid + 1;
+        else if (t < start) hi = mid;
+        else { lo = mid; break; }
+    }
+    int e = lo;
+
+    const int t_local = t - expert_offsets[e];
+    const float bg = __bfloat162float(b1[(size_t)e * (2*D) + 2*d + 0]);
+    const float bu = __bfloat162float(b1[(size_t)e * (2*D) + 2*d + 1]);
+
+    float g = mlp1_out[(size_t)t * (2*D) + (2*d + 0)] + bg;
+    float u = mlp1_out[(size_t)t * (2*D) + (2*d + 1)] + bu;
+
+    // fast, stable-ish SiLU approximation with clamp
+    g = fminf(fmaxf(g, -clamp_limit), clamp_limit);
+    u = fminf(fmaxf(u, -clamp_limit), clamp_limit);
+
+    g *= (1.0f / (1.0f + expf(-alpha_silu * g)));
+    g *= (u + 1.0f);
+    gate_up[(size_t)t * D + d] = g;
+}
+// ==== GROUPED MLP2 (MXFP4) across all experts + bias: FIXED LAYER-RELATIVE DEQUANT ====
+__global__ void grouped_mlp2_mxfp4_bias_kernel(
+    float* __restrict__ C,                      // expert_output_buffer [sum_tokens, H]
+    const float* __restrict__ A,                // gate_up [sum_tokens, D]
+    const uint8_t* __restrict__ Wp_layer,       // layer base (packed)
+    const float* __restrict__ Sc_layer,         // layer base (scales)
+    const __hip_bfloat16* __restrict__ b2_layer,// bias per expert [n_experts, H]
+    const int* __restrict__ expert_offsets,     // [n_experts]
+    const int* __restrict__ expert_counts,      // [n_experts]
+    const int* __restrict__ mtile_prefix,       // [n_experts+1]
+    int n_experts,
+    int K,                                      // D
+    int N,                                      // H
+    size_t seg_elems,                           // per-expert elems in W (N*K)
+    size_t /*seg_packed_bytes*/,                // kept for ABI; unused here
+    size_t /*seg_blocks*/                       // kept for ABI; unused here
+){
+    const int mTileGlobal = blockIdx.y;
+    const int e = map_tile_to_expert(mTileGlobal, mtile_prefix, n_experts);
+    const int mTileLocal  = mTileGlobal - mtile_prefix[e];
+
+    const int M_e = expert_counts[e];
+    if (M_e == 0) return;
+
+    const int m0 = mTileLocal * BLOCK_M;
+    const int n0 = blockIdx.x * BLOCK_N;
+
+    const int lane   = threadIdx.x;
+    const int wave   = threadIdx.y;
+    const int wave_m = wave / WAVES_N;
+    const int wave_n = wave % WAVES_N;
+
+    extern __shared__ uint8_t smemRaw[];
+    uint16_t* sA0 = reinterpret_cast<uint16_t*>(smemRaw);
+    uint16_t* sA1 = sA0 + (BLOCK_M * BLOCK_K);
+    uint16_t* sB0 = sA1 + (BLOCK_M * BLOCK_K);
+    uint16_t* sB1 = sB0 + (BLOCK_K * BLOCK_N);
+
+    const int threadsPerBlock = blockDim.x * blockDim.y;
+    const int linearT = wave * blockDim.x + lane;
+
+    // layer-relative bases for this expert
+    const size_t e_elem_base = (size_t)e * seg_elems;
+    const size_t layer_elems = (size_t)n_experts * seg_elems;
+
+    const float*        A_e  = A + (size_t)expert_offsets[e] * K;
+    float*              C_e  = C + (size_t)expert_offsets[e] * N;
+    const __hip_bfloat16* b2_e = b2_layer + (size_t)e * N;
+
+    f32x4 acc = {0.f, 0.f, 0.f, 0.f};
+
+    // --- preload k-slice 0 ---
+    {
+        for (int idx = linearT; idx < BLOCK_M*BLOCK_K; idx += threadsPerBlock) {
+            const int r  = idx / BLOCK_K;
+            const int ck = idx % BLOCK_K;
+            const int gm = m0 + r;
+            const int gk = ck;
+            float a = (gm < M_e && gk < K) ? A_e[(size_t)gm * K + gk] : 0.f;
+            sA0[r * BLOCK_K + ck] = f32_to_bf16_bits(a);
+        }
+        for (int idx = linearT; idx < BLOCK_K*BLOCK_N; idx += threadsPerBlock) {
+            const int cN = idx / BLOCK_K;
+            const int rK = idx % BLOCK_K;
+            const int gn = n0 + cN;
+            const int gk = rK;
+            float wb = (gk < K && gn < N)
+                ? dequantize_mxfp4(Wp_layer, Sc_layer,
+                                   e_elem_base + (size_t)gn * K + gk, layer_elems)
+                : 0.f;
+            sB0[cN * BLOCK_K + rK] = f32_to_bf16_bits(wb);
+        }
+    }
+    __syncthreads();
+
+    uint16_t* currA = sA0; uint16_t* nextA = sA1;
+    uint16_t* currB = sB0; uint16_t* nextB = sB1;
+
+    for (int k0 = 0; k0 < K; k0 += BLOCK_K) {
+        if (k0 + BLOCK_K < K) {
+            const int kBase = k0 + BLOCK_K;
+
+            for (int idx = linearT; idx < BLOCK_M*BLOCK_K; idx += threadsPerBlock) {
+                const int r  = idx / BLOCK_K;
+                const int ck = idx % BLOCK_K;
+                const int gm = m0 + r;
+                const int gk = kBase + ck;
+                float a = (gm < M_e && gk < K) ? A_e[(size_t)gm * K + gk] : 0.f;
+                nextA[r * BLOCK_K + ck] = f32_to_bf16_bits(a);
+            }
+            for (int idx = linearT; idx < BLOCK_K*BLOCK_N; idx += threadsPerBlock) {
+                const int cN = idx / BLOCK_K;
+                const int rK = idx % BLOCK_K;
+                const int gn = n0 + cN;
+                const int gk = kBase + rK;
+                float wb = (gk < K && gn < N)
+                    ? dequantize_mxfp4(Wp_layer, Sc_layer,
+                                       e_elem_base + (size_t)gn * K + gk, layer_elems)
+                    : 0.f;
+                nextB[cN * BLOCK_K + rK] = f32_to_bf16_bits(wb);
+            }
+        }
+
+        const int ldA = BLOCK_K, ldB = BLOCK_K;
+        const int aRowBase = wave_m * WM;
+        const int bColBase = wave_n * WN;
+        bf16x4 avec = make_a_vec(currA, ldA, aRowBase, lane);
+        bf16x4 bvec = make_b_vec(currB, ldB, bColBase, lane);
+        acc = mfma_16x16x16_bf16(avec, bvec, acc);
+
+        __syncthreads();
+        uint16_t* tA = currA; currA = nextA; nextA = tA;
+        uint16_t* tB = currB; currB = nextB; nextB = tB;
+    }
+
+    // store + add bf16 bias per output column
+    const bool interior = (m0 + BLOCK_M) <= M_e && (n0 + BLOCK_N) <= N;
+    if (interior) {
+        store_c_tile_addbias<true>(C_e, acc, b2_e, M_e, N, m0, n0, wave_m, wave_n, lane);
+    } else {
+        store_c_tile_addbias<false>(C_e, acc, b2_e, M_e, N, m0, n0, wave_m, wave_n, lane);
+    }
+}
