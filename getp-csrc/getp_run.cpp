@@ -818,8 +818,8 @@ void attention_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size)
     {
         TIME_SCOPE(update_kv_cache_timer);
         update_kv_cache_kernel<<<kv_grid, kv_block>>>(
-            s->key_cache, s->value_cache, s->k, s->v, s->positions, batch_size,
-            p->n_layers, layer_idx, MAX_SEQ_LEN, kv_dim);
+            s->key_cache, s->value_cache, s->k, s->v, s->positions, s->slot_active,
+            batch_size, p->n_layers, layer_idx, MAX_SEQ_LEN, kv_dim);
         HIP_CHECK(hipGetLastError());
     }
 
@@ -1097,15 +1097,14 @@ int *forward_batch_gpu(GPUTransformer *gpu_t, int *tokens, int batch_size)
 
     int hidden_dim = p->hidden_dim;
 
-    // Copy tokens to GPU
-    HIP_CHECK(hipMemcpy(s->current_tokens, tokens, batch_size * sizeof(int), hipMemcpyHostToDevice));
-    HIP_CHECK(hipMemcpy(s->positions, cpu_buf->positions, batch_size * sizeof(int), hipMemcpyHostToDevice));
+    // Note: current_tokens and positions are already on GPU from continuous_batching_inference
+    // They are updated at the end of each iteration in the main loop
 
-    // Copy token embeddings
+    // Copy token embeddings - use version with slot_active check
     dim3 embed_grid((batch_size * hidden_dim + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK);
     {
-        copy_embeddings_kernel<<<embed_grid, THREADS_PER_BLOCK>>>(
-            s->x, w->token_embedding_table, s->current_tokens, batch_size, hidden_dim);
+        copy_embeddings_kernel_with_active<<<embed_grid, THREADS_PER_BLOCK>>>(
+            s->x, w->token_embedding_table, s->current_tokens, s->slot_active, batch_size, hidden_dim);
         HIP_CHECK(hipGetLastError());
     }
     // Forward through all layers - UNCOMMENTED: All layers now enabled
@@ -1176,7 +1175,8 @@ long long continuous_batching_inference(Tokenizer *tokenizer,
             cpu_buf->finished[slot] = true;
         }
 
-        // Fill initial batch with first requests
+        // Fill initial batch with first requests (only up to available requests)
+        int initial_slots = 0;
         for (int slot = 0; slot < BATCH_SIZE && cpu_buf->next_request_idx < end_request; slot++)
         {
             int req_idx = cpu_buf->next_request_idx++;
@@ -1200,6 +1200,14 @@ long long continuous_batching_inference(Tokenizer *tokenizer,
             cpu_buf->positions[slot] = 0;
             cpu_buf->finished[slot] = false;
             cpu_buf->current_tokens[slot] = cpu_buf->prompt_tokens[slot][0];
+            initial_slots++;
+            // fprintf(stderr, "GPU %d: Initial assignment - Slot %d -> Request %d\n", gpu_id, slot, req_idx);
+        }
+        
+        // CRITICAL FIX: Ensure remaining slots are properly marked as inactive
+        for (int slot = initial_slots; slot < BATCH_SIZE; slot++)
+        {
+            cpu_buf->current_tokens[slot] = 0; // Invalid token for inactive slots
         }
 
         // Copy initial state to GPU
@@ -1208,6 +1216,11 @@ long long continuous_batching_inference(Tokenizer *tokenizer,
         HIP_CHECK(hipMemcpy(state->request_mapping, cpu_buf->request_mapping_cpu,
                             BATCH_SIZE * sizeof(int), hipMemcpyHostToDevice));
         HIP_CHECK(hipMemcpy(state->seq_lengths, cpu_buf->seq_lengths_cpu,
+                            BATCH_SIZE * sizeof(int), hipMemcpyHostToDevice));
+        // CRITICAL FIX: Copy initial positions and tokens to GPU
+        HIP_CHECK(hipMemcpy(state->positions, cpu_buf->positions,
+                            BATCH_SIZE * sizeof(int), hipMemcpyHostToDevice));
+        HIP_CHECK(hipMemcpy(state->current_tokens, cpu_buf->current_tokens,
                             BATCH_SIZE * sizeof(int), hipMemcpyHostToDevice));
 
         // Main generation loop
@@ -1231,17 +1244,18 @@ long long continuous_batching_inference(Tokenizer *tokenizer,
                 int pos = cpu_buf->positions[slot];
 
                 int next_token;
-                // Advance position first
-                pos++;
-
-                if (pos < cpu_buf->prompt_lens[slot])
+                
+                // Check if we're still processing the prompt
+                if (pos < cpu_buf->prompt_lens[slot] - 1)
                 {
-                    // Still processing prompt - force next prompt token
+                    // Still processing prompt - advance to next prompt token
+                    pos++;
                     next_token = cpu_buf->prompt_tokens[slot][pos];
                 }
                 else
                 {
-                    // Generate new token
+                    // We've processed the full prompt, now generate
+                    pos++;
                     next_token = next_tokens[slot];
 
                     // Save generated token
@@ -1275,6 +1289,10 @@ long long continuous_batching_inference(Tokenizer *tokenizer,
                         // Get next request
                         req_idx = cpu_buf->next_request_idx++;
                         const char *input_seq = get_str_req_ptr(requests, req_idx);
+                        
+                        // Debug: Log slot reassignment
+                        // fprintf(stderr, "GPU %d: Slot %d reassigned from request %d to request %d at pos %d\n", 
+                        //         gpu_id, slot, cpu_buf->request_mapping_cpu[slot], req_idx, pos);
 
                         // Encode prompt
                         encode(tokenizer, input_seq, -1, -1, cpu_buf->prompt_tokens[slot],
@@ -1287,11 +1305,26 @@ long long continuous_batching_inference(Tokenizer *tokenizer,
                             cpu_buf->prompt_tokens[slot][0] = 1; // BOS token
                         }
 
+                        // CRITICAL FIX: Clear KV cache for this slot before reusing
+                        int kv_dim = p->n_kv_heads * p->head_dim;
+                        
+                        // Use our clearing kernel with proper dimensions
+                        // Clear all layers and all positions for this slot
+                        for (int layer = 0; layer < p->n_layers; layer++) {
+                            dim3 clear_grid((MAX_SEQ_LEN + 31) / 32, (kv_dim + 31) / 32);
+                            dim3 clear_block(32, 32);
+                            clear_kv_cache_layer_kernel<<<clear_grid, clear_block>>>(
+                                state->key_cache, state->value_cache, slot, layer, MAX_SEQ_LEN, kv_dim, p->n_layers);
+                            HIP_CHECK(hipGetLastError());
+                        }
+                        HIP_CHECK(hipDeviceSynchronize()); // Ensure KV cache is fully cleared before reuse
+
                         // Reinitialize slot with new request
                         cpu_buf->request_mapping_cpu[slot] = req_idx;
                         cpu_buf->positions[slot] = 0;
                         cpu_buf->seq_lengths_cpu[slot] = 0;
                         cpu_buf->current_tokens[slot] = cpu_buf->prompt_tokens[slot][0];
+                        cpu_buf->finished[slot] = false;  // Reset finished flag
                         // Slot remains active
                     }
                     else
@@ -1316,6 +1349,9 @@ long long continuous_batching_inference(Tokenizer *tokenizer,
             HIP_CHECK(hipMemcpy(state->seq_lengths, cpu_buf->seq_lengths_cpu,
                                 BATCH_SIZE * sizeof(int), hipMemcpyHostToDevice));
             HIP_CHECK(hipMemcpy(state->positions, cpu_buf->positions,
+                                BATCH_SIZE * sizeof(int), hipMemcpyHostToDevice));
+            // CRITICAL: Also update current_tokens for reassigned slots
+            HIP_CHECK(hipMemcpy(state->current_tokens, cpu_buf->current_tokens,
                                 BATCH_SIZE * sizeof(int), hipMemcpyHostToDevice));
         }
     }

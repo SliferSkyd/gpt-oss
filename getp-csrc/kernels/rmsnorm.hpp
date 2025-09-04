@@ -18,13 +18,14 @@ __global__ void rmsnorm_kernel(float *output, const float *input, const __hip_bf
     // Shared memory for reduction
     __shared__ float shared_ss[THREADS_PER_BLOCK];
 
-    // Calculate sum of squares
-    float ss = 0.0f;
+    // Calculate sum of squares with double precision
+    double ss = 0.0;
     for (int i = tid; i < size; i += blockDim.x)
     {
-        ss += x[i] * x[i];
+        double val = (double)x[i];
+        ss += val * val;
     }
-    shared_ss[tid] = ss;
+    shared_ss[tid] = (float)ss;
     __syncthreads();
 
     // Reduction
@@ -48,10 +49,12 @@ __global__ void rmsnorm_kernel(float *output, const float *input, const __hip_bf
 
     ss = shared_ss[0];
 
-    // Normalize and scale - convert bfloat16 weight to fp32 on-the-fly
+    // Normalize and scale - use double precision for intermediate calculation
     for (int i = tid; i < size; i += blockDim.x)
     {
-        float weight_fp32 = __bfloat162float(weight[i]);
-        o[i] = weight_fp32 * (ss * x[i]);
+        double weight_fp64 = (double)__bfloat162float(weight[i]);
+        double x_val = (double)x[i];
+        double ss_val = (double)ss;
+        o[i] = (float)(weight_fp64 * (ss_val * x_val));
     }
 }

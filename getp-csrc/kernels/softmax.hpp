@@ -37,14 +37,14 @@ __global__ void softmax_kernel(float *x, int batch_size, int size)
     max_val = shared_max[0];
     __syncthreads();
 
-    // Compute exp and sum
-    float sum = 0.0f;
+    // Compute exp and sum with double precision
+    double sum = 0.0;
     for (int i = tid; i < size; i += blockDim.x)
     {
         batch_x[i] = expf(batch_x[i] - max_val);
-        sum += batch_x[i];
+        sum += (double)batch_x[i];
     }
-    shared_sum[tid] = sum;
+    shared_sum[tid] = (float)sum;
     __syncthreads();
 
     // Reduction for sum
@@ -109,14 +109,14 @@ __global__ void softmax_kernel_variable_len(float *x, const int *positions,
     max_val = shared_max[0];
     __syncthreads();
 
-    // Compute exp and sum over the valid range
-    float sum = 0.0f;
+    // Compute exp and sum over the valid range with double precision
+    double sum = 0.0;
     for (int i = tid; i < size; i += blockDim.x)
     {
         batch_head_x[i] = expf(batch_head_x[i] - max_val);
-        sum += batch_head_x[i];
+        sum += (double)batch_head_x[i];
     }
-    shared_sum[tid] = sum;
+    shared_sum[tid] = (float)sum;
     __syncthreads();
 
     // Reduction for sum
