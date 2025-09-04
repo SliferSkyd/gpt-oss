@@ -126,6 +126,10 @@ typedef struct
     int *seq_lengths;     // Current sequence length for each slot [BATCH_SIZE]
     bool *slot_active;    // Whether slot is processing a request [BATCH_SIZE]
     int *request_mapping; // Maps batch slot -> request index in Requests [BATCH_SIZE]
+
+    int   *local_ids;   // [BATCH_SIZE * K]
+  float *local_wts;   // [BATCH_SIZE * K]
+  int   *n_local;     // [BATCH_SIZE]
 } GPURunState;
 
 // CPU buffers for warmup and host-side operations
@@ -251,6 +255,12 @@ void malloc_gpu_run_state(GPURunState *s, Config *p)
     HIP_CHECK(hipMemset(s->value_cache, 0, kv_cache_size));
     HIP_CHECK(hipMemset(s->att, 0, BATCH_SIZE * p->n_attn_heads * MAX_SEQ_LEN * sizeof(float)));
     HIP_CHECK(hipMemset(s->logits, 0, BATCH_SIZE * p->vocab_size * sizeof(float)));
+
+
+    HIP_CHECK(hipMalloc((void **)&s->local_ids, BATCH_SIZE * p->experts_per_token * sizeof(int)));
+    HIP_CHECK(hipMalloc((void **)&s->local_wts, BATCH_SIZE * p->experts_per_token * sizeof(float)));
+    HIP_CHECK(hipMalloc((void **)&s->n_local, BATCH_SIZE * sizeof(int)));
+
 
     // Initialize continuous batching fields
     HIP_CHECK(hipMemset(s->seq_lengths, 0, BATCH_SIZE * sizeof(int)));
@@ -886,7 +896,7 @@ void attention_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size)
     // --- END OF FUSED OUTPUT PROJECTION ---
 }
 
-void moe_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size)
+void moe_gpu_old(GPUTransformer *gpu_t, int layer_idx, int batch_size)
 {
     Config *p = &gpu_t->config;
     GPURunState *s = &gpu_t->state;
@@ -1075,6 +1085,95 @@ void moe_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size)
     HIP_CHECK(hipEventDestroy(evPermuteDone));
 }
 
+
+struct GPUWorker {
+  int device_index;
+
+  int expert_start;
+  int expert_end;
+
+  int request_start;
+  int request_end;
+};
+void moe_gpu(GPUTransformer *gpu_t, int l, int batch_size)
+{
+Config *p = &gpu_t->config;
+GPURunState *dev_s = &gpu_t->state;
+GPUTransformerWeights *dev_w = &gpu_t->weights;
+CPUBuffers *cpu_buf = &gpu_t->cpu_buffers;
+// ExpertiseExt *ext = &cpu_buf->expertise_ext;
+GPUWorker *worker = nullptr;
+worker = (GPUWorker *)malloc(sizeof(GPUWorker));
+worker->device_index = 0;
+worker->expert_start = 0;
+worker->expert_end = p->n_experts;
+worker->request_start = 0;
+worker->request_end = batch_size;
+float *dev_x = dev_s->x;
+
+int hidden_dim = p->hidden_dim;
+int n_experts = p->n_experts;
+
+    {
+      getp_rmsnorm(dev_s->t, dev_x, dev_w->rms_ffn_w + 1ll * l * hidden_dim,
+                BATCH_SIZE, hidden_dim);
+
+  __hip_bfloat16 *dev_w_router =
+      dev_w->w_router + 1ll * l * hidden_dim * n_experts;
+  __hip_bfloat16 *dev_b_router = dev_w->b_router + 1ll * l * n_experts;
+  getp_matmul<__hip_bfloat16>(dev_s->router_score, dev_s->t, dev_w_router,
+                              dev_b_router, hidden_dim, n_experts,
+                              BATCH_SIZE);
+
+  getp_router_topk_softmax_batch(dev_s->router_score, n_experts,
+                                  p->experts_per_token, dev_s->topk_v,
+                                  dev_s->topk_i, BATCH_SIZE);
+
+  getp_map_global_to_local_batch(dev_s->topk_i, dev_s->topk_v, dev_s->local_ids,
+                                  dev_s->local_wts, dev_s->n_local,
+                                  p->experts_per_token, worker->expert_start,
+                                  worker->expert_end, BATCH_SIZE);
+
+  HIP_CHECK(hipMemset(dev_s->e_agg, 0,
+                      (size_t)BATCH_SIZE * hidden_dim * sizeof(float)));
+                  }
+
+  int experts_per_device = worker->expert_end - worker->expert_start;
+
+  __hip_bfloat16 *w1_base = dev_w->w_mlp1 + 1ll * l * experts_per_device * 2 *
+                                                p->intermediate_dim *
+                                                hidden_dim;
+  __hip_bfloat16 *b1_base =
+      dev_w->b_mlp1 + 1ll * l * experts_per_device * 2 * p->intermediate_dim;
+
+  {
+    // PROFILE_BLOCK("mlp1");
+    getp_mlp1_swiglu_bf16_batch_gridy(
+      dev_s->gate_up, dev_s->t, w1_base, b1_base, hidden_dim,
+      p->intermediate_dim, experts_per_device, dev_s->local_ids, dev_s->n_local,
+      p->experts_per_token, BATCH_SIZE, p->swiglu_limit);
+    }
+
+  __hip_bfloat16 *w2_base = dev_w->w_mlp2 + 1ll * l * experts_per_device *
+                                                hidden_dim *
+                                                p->intermediate_dim;
+  __hip_bfloat16 *b2_base =
+      dev_w->b_mlp2 + 1ll * l * experts_per_device * hidden_dim;
+
+  {
+    // PROFILE_BLOCK("mlp2");
+    getp_mlp2_accum_bf16_batch_gridy(
+      dev_s->e_agg, dev_s->gate_up, w2_base, b2_base, dev_s->local_ids,
+      dev_s->local_wts, dev_s->n_local, p->experts_per_token, BATCH_SIZE,
+      p->intermediate_dim, hidden_dim);
+    }
+
+  {
+    // PROFILE_BLOCK("add");
+    // add to residual
+  getp_vecadd(dev_x, dev_s->e_agg, hidden_dim, BATCH_SIZE);
+  }
+}
 int *forward_batch_gpu(GPUTransformer *gpu_t, int *tokens, int batch_size)
 {
     Config *p = &gpu_t->config;
