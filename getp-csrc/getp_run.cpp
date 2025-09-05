@@ -63,7 +63,7 @@ typedef struct
     __hip_bfloat16 *w_mlp2;  // (n_layers, n_experts, H,   D) row-major [O=H,  I=D]
     __hip_bfloat16 *b_mlp1, *b_mlp2;
     // Output weights
-    __hip_bfloat16 *out; // (vocab_size, hidden_dim)
+    float *out; // (vocab_size, hidden_dim)
 } GPUTransformerWeights;
 
 // GPU Run State struct - stores all activation buffers on GPU
@@ -322,7 +322,7 @@ void malloc_gpu_weights(GPUTransformerWeights *w, Config *p)
     HIP_CHECK(hipMalloc((void **)&w->b_mlp2,
                         (size_t)p->n_layers * p->n_experts * p->hidden_dim * sizeof(__hip_bfloat16)));
 
-    HIP_CHECK(hipMalloc((void **)&w->out, p->hidden_dim * p->vocab_size * sizeof(__hip_bfloat16)));
+    HIP_CHECK(hipMalloc((void **)&w->out, p->hidden_dim * p->vocab_size * sizeof(float)));
     HIP_CHECK(hipMalloc((void **)&w->attn_sinks, p->n_layers * p->n_attn_heads * sizeof(__hip_bfloat16)));
 }
 
@@ -413,10 +413,7 @@ void copy_weights_to_gpu(Transformer *transformer, GPUTransformerWeights *gpu_we
 
     // Convert and copy output weights
     size_t out_size = p->hidden_dim * p->vocab_size;
-    __hip_bfloat16 *h_out_bf16 = (__hip_bfloat16 *)malloc(out_size * sizeof(__hip_bfloat16));
-    convert_float_array_to_bfloat16(w->out, h_out_bf16, out_size);
-    HIP_CHECK(hipMemcpy(gpu_weights->out, h_out_bf16, out_size * sizeof(__hip_bfloat16), hipMemcpyHostToDevice));
-    free(h_out_bf16);
+    HIP_CHECK(hipMemcpy(gpu_weights->out, w->out, out_size * sizeof(float), hipMemcpyHostToDevice));
 
     printf("Weight conversion and copying completed successfully\n");
 }
@@ -1120,7 +1117,7 @@ int *forward_batch_gpu(GPUTransformer *gpu_t, int *tokens, int batch_size)
 
     {
         // Launch the simple kernel
-        matmul(
+        matmul_mc(
             s->logits, s->x, w->out, batch_size, hidden_dim, p->vocab_size);
     }
     sample_argmax(s->logits, s->current_tokens, batch_size, p->vocab_size);

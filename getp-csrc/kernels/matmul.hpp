@@ -6,9 +6,6 @@
 #include "../config.hpp"
 #include "../memory/mxfp4.hpp"
 #include <hip/hip_fp16.h>
-
-#include <hip/hip_runtime.h>
-#include <hip/hip_fp16.h>
 #include <hip/hip_bfloat16.h>
 
 // ===== Tunables (same defaults you had) =====
@@ -118,7 +115,7 @@ float* __restrict__ C, const f32x4& acc,
 __global__ void gemm_mfma_bf16_kernel_opt(
     float* __restrict__ C,                     // [M, N]
     const float* __restrict__ A,               // [M, K] FP32
-    const __hip_bfloat16* __restrict__ Wbf16,  // [N, K] row-major (weights)
+    const float* __restrict__ Wbf16,  // [N, K] row-major (weights)
     int M, int K, int N)
 {
     const int m0 = blockIdx.y * BLOCK_M;
@@ -160,8 +157,8 @@ __global__ void gemm_mfma_bf16_kernel_opt(
             const int r = idx % BLOCK_K;  // k inside this slice
             const int gn = n0 + c;
             const int gk = r;
-            __hip_bfloat16 wb = (gk < K && gn < N) ? Wbf16[(size_t)gn * K + gk] : __float2bfloat16(0.0f);
-            sB0[c * BLOCK_K + r] = hipbf16_to_bits(wb);
+            float wb = (gk < K && gn < N) ? Wbf16[(size_t)gn * K + gk] : 0.0f;
+            sB0[c * BLOCK_K + r] = f32_to_bf16_bits(wb);
         }
     }
     __syncthreads();
@@ -190,8 +187,8 @@ __global__ void gemm_mfma_bf16_kernel_opt(
                 const int r = idx % BLOCK_K;
                 const int gn = n0 + c;
                 const int gk = kBase + r;
-                __hip_bfloat16 wb = (gk < K && gn < N) ? Wbf16[(size_t)gn * K + gk] : __float2bfloat16(0.0f);
-                nextB[c * BLOCK_K + r] = hipbf16_to_bits(wb);
+                float wb = (gk < K && gn < N) ? Wbf16[(size_t)gn * K + gk] : 0.0f;
+                nextB[c * BLOCK_K + r] = f32_to_bf16_bits(wb);
             }
         }
 
@@ -219,110 +216,28 @@ __global__ void gemm_mfma_bf16_kernel_opt(
     }
 }
 
-// ===== MXFP4 (packed 4-bit) path: dequantize -> BF16 -> MFMA =====
-__global__ void gemm_mfma_uint8_kernel_opt(
-    float* __restrict__ C,                        // [M, N]
-    const float* __restrict__ A,                  // [M, K] FP32
-    const uint8_t* __restrict__ Wp,               // [N, K] packed (MXFP4)
-    const float* __restrict__ weight_scales,      // [N / 32] (or your layout)
-    int M, int K, int N, size_t total_weight_elements)
+
+// ===== Host wrappers (unchanged API) =====
+void matmul_mc(
+    float* __restrict__ output,                 // [B, O]
+    const float* __restrict__ input,            // [B, I]
+    const float* __restrict__ weight,  // [O, I] bf16 row-major
+    int batch_size, int input_dim, int output_dim,
+    hipStream_t stream = nullptr)
 {
-    const int m0 = blockIdx.y * BLOCK_M;
-    const int n0 = blockIdx.x * BLOCK_N;
+    const int M = batch_size, K = input_dim, N = output_dim;
+    dim3 grid((N + BLOCK_N - 1) / BLOCK_N, (M + BLOCK_M - 1) / BLOCK_M);
+    dim3 block(LANE_PER_WAVE, WAVES_PER_BLOCK);
 
-    const int lane = threadIdx.x;
-    const int wave = threadIdx.y;
-    const int wave_m = wave / WAVES_N;
-    const int wave_n = wave % WAVES_N;
+    // Double-buffered A/B only (no sC spill needed; we mask-ed store)
+    size_t shmem_bytes =
+        (size_t)(2 * BLOCK_M * BLOCK_K + 2 * BLOCK_K * BLOCK_N) * sizeof(uint16_t);
 
-    extern __shared__ uint8_t smemRaw[];
-    auto* sA0 = reinterpret_cast<uint16_t*>(smemRaw);
-    auto* sA1 = sA0 + (BLOCK_M * BLOCK_K);
-    auto* sB0 = sA1 + (BLOCK_M * BLOCK_K);
-    auto* sB1 = sB0 + (BLOCK_K * BLOCK_N);
-
-    f32x4 acc = {0.f, 0.f, 0.f, 0.f};
-
-    const int threadsPerBlock = blockDim.x * blockDim.y;
-    const int linearT = wave * blockDim.x + lane;
-
-    auto load_B_tile = [&](uint16_t* dst, int kBase) {
-        for (int idx = linearT; idx < BLOCK_K * BLOCK_N; idx += threadsPerBlock) {
-            const int c = idx / BLOCK_K;       // col within block
-            const int r = idx % BLOCK_K;       // k within slice
-            const int gn = n0 + c;
-            const int gk = kBase + r;
-            float wb = (gk < K && gn < N)
-                ? dequantize_mxfp4(Wp, weight_scales, (size_t)gn * K + gk, total_weight_elements)
-                : 0.0f;
-            dst[c * BLOCK_K + r] = f32_to_bf16_bits(wb);
-        }
-    };
-
-    // Preload stage 0
-    {
-        for (int idx = linearT; idx < BLOCK_M * BLOCK_K; idx += threadsPerBlock) {
-            const int r = idx / BLOCK_K;
-            const int c = idx % BLOCK_K;
-            const int gm = m0 + r;
-            const int gk = c;
-            float a = (gm < M && gk < K) ? A[(size_t)gm * K + gk] : 0.0f;
-            sA0[r * BLOCK_K + c] = f32_to_bf16_bits(a);
-        }
-        load_B_tile(sB0, /*kBase=*/0);
-    }
-    __syncthreads();
-
-    auto* currA = sA0;
-    auto* currB = sB0;
-    auto* nextA = sA1;
-    auto* nextB = sB1;
-
-    for (int k0 = 0; k0 < K; k0 += BLOCK_K) {
-        if (k0 + BLOCK_K < K) {
-            const int kBase = k0 + BLOCK_K;
-
-            for (int idx = linearT; idx < BLOCK_M * BLOCK_K; idx += threadsPerBlock) {
-                const int r = idx / BLOCK_K;
-                const int c = idx % BLOCK_K;
-                const int gm = m0 + r;
-                const int gk = kBase + c;
-                float a = (gm < M && gk < K) ? A[(size_t)gm * K + gk] : 0.0f;
-                nextA[r * BLOCK_K + c] = f32_to_bf16_bits(a);
-            }
-            load_B_tile(nextB, kBase);
-        }
-
-        const int ldA = BLOCK_K;
-        const int ldB = BLOCK_K;
-        const int aRowBase = wave_m * WM;
-        const int bColBase = wave_n * WN;
-
-        bf16x4 avec = make_a_vec(currA, ldA, aRowBase, lane);
-        bf16x4 bvec = make_b_vec(currB, ldB, bColBase, lane);
-        acc = mfma_16x16x16_bf16(avec, bvec, acc);
-
-        __syncthreads();
-        auto* tmpA = currA; currA = nextA; nextA = tmpA;
-        auto* tmpB = currB; currB = nextB; nextB = tmpB;
-    }
-
-    const bool interior = (m0 + BLOCK_M) <= M && (n0 + BLOCK_N) <= N;
-    if (interior) {
-        store_c_tile_mfma<true>(C, acc, M, N, m0, n0, wave_m, wave_n, lane);
-    } else {
-        store_c_tile_mfma<false>(C, acc, M, N, m0, n0, wave_m, wave_n, lane);
-    }
+    hipLaunchKernelGGL(
+        gemm_mfma_bf16_kernel_opt,
+        grid, block, shmem_bytes, stream,
+        output, input, weight, M, K, N);
 }
-
-#pragma once
-
-// mfma_gemm_gfx90a.hpp (FMA-only version)
-#include <hip/hip_runtime.h>
-#include <hip/hip_bfloat16.h>
-#include "../config.hpp"
-#include "../memory/mxfp4.hpp"
-#include <hip/hip_fp16.h>
 
 // ===== Tile Tunables (FMA path) =====
 // Workgroup computes BM x BN tile of C
@@ -359,6 +274,20 @@ __device__ __forceinline__ float bfloat16_to_float(__hip_bfloat16 x) {
 }
 
 // ====== FMA GEMM (A: FP32 row-major [M,K], B: BF16 row-major [N,K]) ======
+// Keep your BM/BN/BK/TB_X/TB_Y/TM/TN as-is
+
+#ifndef LDS_PAD_A
+#define LDS_PAD_A 1   // pad A's leading dimension by +1 column
+#endif
+#ifndef PAD_SB
+#define PAD_SB 1      // add one padded row to B tile
+#endif
+
+// Derived LDS strides with padding
+constexpr int LD_SA = BK + LDS_PAD_A;  // sA: [BM x (BK+pad)] row-major
+constexpr int LD_SB = BN;              // sB: [(BK+pad_row) x BN] row-major
+
+__launch_bounds__(TB_X * TB_Y, 2)
 __global__ void gemm_fma_bf16_kernel_opt(
     float* __restrict__ C,                     // [M, N]
     const float* __restrict__ A,               // [M, K]
@@ -369,53 +298,61 @@ __global__ void gemm_fma_bf16_kernel_opt(
     const int m0 = blockIdx.y * BM;
     const int n0 = blockIdx.x * BN;
 
-    // Per-thread coordinates within the block
-    const int tx = threadIdx.x; // 0..TB_X-1 maps across N
-    const int ty = threadIdx.y; // 0..TB_Y-1 maps across M
+    // Thread coords
+    const int tx = threadIdx.x; // 0..TB_X-1 across N
+    const int ty = threadIdx.y; // 0..TB_Y-1 across M
 
-    // Each thread computes a TM x TN microtile
+    // Per-thread microtile
     const int rowBase = m0 + ty * TM;
     const int colBase = n0 + tx * TN;
 
-    // Double-buffered shared memory: sA: [BM x BK], sB: [BK x BN], both float32
+    // Shared memory (double-buffered) WITH PADDING
     extern __shared__ float smem[];
     float* sA0 = smem;
-    float* sA1 = sA0 + (BM * BK);
-    float* sB0 = sA1 + (BM * BK);
-    float* sB1 = sB0 + (BK * BN);
+    float* sA1 = sA0 + (BM * LD_SA);
+    float* sB0 = sA1 + (BM * LD_SA);
+    float* sB1 = sB0 + ((BK + PAD_SB) * LD_SB);   // extra padded row if PAD_SB=1
 
-    double acc[TM][TN];
+    // FP32 accumulators
+    float acc[TM][TN];
 #pragma unroll
     for (int i = 0; i < TM; ++i)
 #pragma unroll
         for (int j = 0; j < TN; ++j)
-            acc[i][j] = 0.0;
+            acc[i][j] = 0.0f;
 
     const int threadsPerBlock = TB_X * TB_Y;
     const int linearT = ty * TB_X + tx;
 
-    // Helper lambdas to cooperatively load tiles from global -> shared
-    auto loadA = [&](float* dst, int kBase) {
-        // row-major [BM x BK]
+    // Cooperative loaders (global -> shared), updated strides + zero the pad
+    auto loadA = [&](float* __restrict__ dst, int kBase) {
+        // Write real BK columns
         for (int idx = linearT; idx < BM * BK; idx += threadsPerBlock) {
-            int r = idx / BK;
-            int c = idx % BK;
+            int r = idx / BK;           // 0..BM-1
+            int c = idx - r * BK;       // 0..BK-1
             int gm = m0 + r;
             int gk = kBase + c;
             float a = (gm < M && gk < K) ? A[(size_t)gm * K + gk] : 0.0f;
-            dst[r * BK + c] = a;
+            dst[r * LD_SA + c] = a;     // NOTE: LD_SA (BK+pad)
         }
+        // Zero the padding column to keep LDS clean
+        if (linearT < BM) dst[linearT * LD_SA + BK] = 0.0f;
     };
-    auto loadB = [&](float* dst, int kBase) {
-        // We store sB as row-major [BK x BN] for unit-stride kk access
+
+    auto loadB = [&](float* __restrict__ dst, int kBase) {
+        // Row-major [BK x BN]; optionally add one extra zero row at r=BK
         for (int idx = linearT; idx < BK * BN; idx += threadsPerBlock) {
-            int r = idx / BN; // 0..BK-1  (k within this slice)
-            int c = idx % BN; // 0..BN-1  (n within this block)
+            int r = idx / BN;           // 0..BK-1
+            int c = idx - r * BN;       // 0..BN-1
             int gk = kBase + r;
             int gn = n0 + c;
             float b = (gk < K && gn < N) ? bfloat16_to_float(Wbf16[(size_t)gn * K + gk]) : 0.0f;
-            dst[r * BN + c] = b;
+            dst[r * LD_SB + c] = b;     // NOTE: LD_SB = BN
         }
+#if PAD_SB
+        // Zero the padded row to avoid stale values
+        if (linearT < LD_SB) dst[BK * LD_SB + linearT] = 0.0f;
+#endif
     };
 
     // Preload k-slice 0
@@ -426,152 +363,35 @@ __global__ void gemm_fma_bf16_kernel_opt(
     float* currA = sA0; float* nextA = sA1;
     float* currB = sB0; float* nextB = sB1;
 
-    // Compute across K in BK chunks
-    for (int k0 = 0; k0 < K; k0 += BK) {
-        // Preload next if any
-        if (k0 + BK < K) {
-            loadA(nextA, k0 + BK);
-            loadB(nextB, k0 + BK);
-        }
-
-        // Compute: for kk in [0..BK)
-#pragma unroll
-        for (int kk = 0; kk < BK; ++kk) {
-            float aFrag[TM];
-#pragma unroll
-            for (int i = 0; i < TM; ++i) {
-                int r = ty * TM + i;
-                int rr = r; // within [0..BM)
-                aFrag[i] = currA[rr * BK + kk];
-            }
-
-            float bFrag[TN];
-#pragma unroll
-            for (int j = 0; j < TN; ++j) {
-                int c = tx * TN + j; // within [0..BN)
-                bFrag[j] = currB[kk * BN + c];
-            }
-
-#pragma unroll
-            for (int i = 0; i < TM; ++i) {
-#pragma unroll
-                for (int j = 0; j < TN; ++j) {
-                    acc[i][j] += (double)aFrag[i] * bFrag[j];
-                }
-            }
-        }
-
-        __syncthreads();
-        // Swap buffers
-        float* tA = currA; currA = nextA; nextA = tA;
-        float* tB = currB; currB = nextB; nextB = tB;
-    }
-
-    // Store back to C with bounds checks
-#pragma unroll
-    for (int i = 0; i < TM; ++i) {
-        int gm = rowBase + i;
-        if (gm >= M) break;
-#pragma unroll
-        for (int j = 0; j < TN; ++j) {
-            int gn = colBase + j;
-            if (gn < N) {
-                C[(size_t)gm * N + gn] = acc[i][j];
-            }
-        }
-    }
-}
-
-// ====== FMA GEMM (A: FP32 row-major [M,K], B: MXFP4 packed + scales -> dequant to FP32) ======
-__global__ void gemm_fma_uint8_kernel_opt(
-    float* __restrict__ C,                        // [M, N]
-    const float* __restrict__ A,                  // [M, K]
-    const uint8_t* __restrict__ Wp,               // [N, K] packed (MXFP4)
-    const float* __restrict__ weight_scales,      // per-block scales (your layout)
-    int M, int K, int N, size_t total_weight_elements)
-{
-    const int m0 = blockIdx.y * BM;
-    const int n0 = blockIdx.x * BN;
-
-    const int tx = threadIdx.x;
-    const int ty = threadIdx.y;
-
-    const int rowBase = m0 + ty * TM;
-    const int colBase = n0 + tx * TN;
-
-    extern __shared__ float smem[];
-    float* sA0 = smem;
-    float* sA1 = sA0 + (BM * BK);
-    float* sB0 = sA1 + (BM * BK);
-    float* sB1 = sB0 + (BK * BN);
-
-    double acc[TM][TN];
-#pragma unroll
-    for (int i = 0; i < TM; ++i)
-#pragma unroll
-        for (int j = 0; j < TN; ++j)
-            acc[i][j] = 0.0f;
-
-    const int threadsPerBlock = TB_X * TB_Y;
-    const int linearT = ty * TB_X + tx;
-
-    auto loadA = [&](float* dst, int kBase) {
-        for (int idx = linearT; idx < BM * BK; idx += threadsPerBlock) {
-            int r = idx / BK;
-            int c = idx % BK;
-            int gm = m0 + r;
-            int gk = kBase + c;
-            float a = (gm < M && gk < K) ? A[(size_t)gm * K + gk] : 0.0f;
-            dst[r * BK + c] = a;
-        }
-    };
-    auto loadB = [&](float* dst, int kBase) {
-        for (int idx = linearT; idx < BK * BN; idx += threadsPerBlock) {
-            int r = idx / BN; // kk within this slice
-            int c = idx % BN; // n within this block
-            int gk = kBase + r;
-            int gn = n0 + c;
-            float wb = (gk < K && gn < N)
-                ? dequantize_mxfp4(Wp, weight_scales, (size_t)gn * K + gk, total_weight_elements)
-                : 0.0f;
-            dst[r * BN + c] = wb;
-        }
-    };
-
-    loadA(sA0, 0);
-    loadB(sB0, 0);
-    __syncthreads();
-
-    float* currA = sA0; float* nextA = sA1;
-    float* currB = sB0; float* nextB = sB1;
-
+    // Main loop over K
+#pragma unroll 1
     for (int k0 = 0; k0 < K; k0 += BK) {
         if (k0 + BK < K) {
             loadA(nextA, k0 + BK);
             loadB(nextB, k0 + BK);
         }
 
+        // kk loop (use padded strides)
 #pragma unroll
         for (int kk = 0; kk < BK; ++kk) {
+            // A fragment: TM rows, same kk column, stride LD_SA
+            const float* __restrict__ Arow = currA + (ty * TM) * LD_SA + kk;
             float aFrag[TM];
 #pragma unroll
-            for (int i = 0; i < TM; ++i) {
-                int r = ty * TM + i;
-                aFrag[i] = currA[r * BK + kk];
-            }
+            for (int i = 0; i < TM; ++i) aFrag[i] = Arow[i * LD_SA];
+
+            // B fragment: TN cols, same kk row, stride 1 across cols (LD_SB = BN)
+            const float* __restrict__ Brow = currB + kk * LD_SB + (tx * TN);
             float bFrag[TN];
 #pragma unroll
-            for (int j = 0; j < TN; ++j) {
-                int c = tx * TN + j;
-                bFrag[j] = currB[kk * BN + c];
-            }
+            for (int j = 0; j < TN; ++j) bFrag[j] = Brow[j];
+
+            // Outer product
 #pragma unroll
-            for (int i = 0; i < TM; ++i) {
+            for (int i = 0; i < TM; ++i)
 #pragma unroll
-                for (int j = 0; j < TN; ++j) {
-                    acc[i][j] += (double)aFrag[i] * bFrag[j];
-                }
-            }
+                for (int j = 0; j < TN; ++j)
+                    acc[i][j] = fmaf(aFrag[i], bFrag[j], acc[i][j]);
         }
 
         __syncthreads();
@@ -579,6 +399,8 @@ __global__ void gemm_fma_uint8_kernel_opt(
         float* tB = currB; currB = nextB; nextB = tB;
     }
 
+    // Store to C (unchanged)
+    float* __restrict__ Cout = C + (size_t)rowBase * N + colBase;
 #pragma unroll
     for (int i = 0; i < TM; ++i) {
         int gm = rowBase + i;
@@ -586,10 +408,9 @@ __global__ void gemm_fma_uint8_kernel_opt(
 #pragma unroll
         for (int j = 0; j < TN; ++j) {
             int gn = colBase + j;
-            if (gn < N) {
-                C[(size_t)gm * N + gn] = acc[i][j];
-            }
+            if (gn < N) Cout[j] = acc[i][j];
         }
+        Cout += N;
     }
 }
 
@@ -605,36 +426,13 @@ void matmul(
     dim3 grid((N + BN - 1) / BN, (M + BM - 1) / BM);
     dim3 block(TB_X, TB_Y);
 
-    // Double-buffered sA,sB
-    size_t shmem_bytes = (size_t)(2 * (BM * BK + BK * BN)) * sizeof(float);
+    size_t shmem_bytes = sizeof(float) * (2*(BM*LD_SA) + 2*((BK + PAD_SB)*LD_SB));
 
     hipLaunchKernelGGL(
         gemm_fma_bf16_kernel_opt,
         grid, block, shmem_bytes, stream,
         output, input, weight, M, K, N);
 }
-
-void matmul_mxfp4(
-    float* __restrict__ output,
-    const float* __restrict__ input,
-    const uint8_t* __restrict__ weight_packed,
-    const float* __restrict__ weight_scales,
-    int batch_size, int input_dim, int output_dim,
-    size_t total_weight_elements,
-    hipStream_t stream = nullptr)
-{
-    const int M = batch_size, K = input_dim, N = output_dim;
-    dim3 grid((N + BN - 1) / BN, (M + BM - 1) / BM);
-    dim3 block(TB_X, TB_Y);
-
-    size_t shmem_bytes = (size_t)(2 * (BM * BK + BK * BN)) * sizeof(float);
-
-    hipLaunchKernelGGL(
-        gemm_fma_uint8_kernel_opt,
-        grid, block, shmem_bytes, stream,
-        output, input, weight_packed, weight_scales, M, K, N, total_weight_elements);
-}
-
 
 
 // ====== FMA GEMM (A: FP32 row-major [M,K], B: BF16 row-major [N,K]) ======
