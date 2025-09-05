@@ -386,8 +386,8 @@ __device__ inline float blockReduceSum(float v, float *smem) {
 __global__ void fused_attention_kernel(
     float * __restrict__ output,               // [batch, n_heads, head_dim]
     const float * __restrict__ q,              // [batch, n_heads * head_dim]
-    const __hip_bfloat16 * __restrict__ key_cache,   // [batch, n_layers, seq_len, kv_dim]
-    const __hip_bfloat16 * __restrict__ value_cache, // [batch, n_layers, seq_len, kv_dim]
+    const float * __restrict__ key_cache,   // [batch, n_layers, seq_len, kv_dim]
+    const float * __restrict__ value_cache, // [batch, n_layers, seq_len, kv_dim]
     const __hip_bfloat16 * __restrict__ sinks,       // [n_heads] (already layer-offset on host)
     const float * __restrict__ mask,                 // [seq_len, seq_len]
     const int * __restrict__ positions,              // [batch]
@@ -416,9 +416,9 @@ __global__ void fused_attention_kernel(
     const int kv_dim     = head_dim * n_kv_heads;
 
     const float *q_head = q + 1LL * b * n_heads * head_dim + 1LL * h * head_dim;
-    const __hip_bfloat16 *k_base =
+    const float *k_base =
         key_cache + 1LL * b * n_layers * seq_len * kv_dim + 1LL * layer_idx * seq_len * kv_dim;
-    const __hip_bfloat16 *v_base =
+    const float *v_base =
         value_cache + 1LL * b * n_layers * seq_len * kv_dim + 1LL * layer_idx * seq_len * kv_dim;
     float *out_head =
         output + 1LL * b * n_heads * head_dim + 1LL * h * head_dim;
@@ -441,15 +441,15 @@ __global__ void fused_attention_kernel(
     // ---- Pass 1: compute attention scores into s_att[0..win_core_len-1] (all warps participate)
     for (int w = wid; w < win_core_len; w += WARPS) {
         const int t = win_start + w;
-        const __hip_bfloat16 *k_vec = k_base + 1LL * t * kv_dim + 1LL * kv_h * head_dim;
+        const float *k_vec = k_base + 1LL * t * kv_dim + 1LL * kv_h * head_dim;
 
         float prod = 0.f;
         if (lane < head_dim) {
-            prod = q_lane * __bfloat162float(k_vec[lane]);
+            prod = (float)q_lane * (k_vec[lane]);
         }
         float dot = warpReduceSum(prod);  // 64-lane sum
         if (lane == 0) {
-            float acc = dot * inv_sqrt_d;
+            float acc = (double)dot * inv_sqrt_d;
             if (apply_window) {
                 acc += mask[1LL * pos * seq_len + t];
             }
@@ -489,8 +489,8 @@ __global__ void fused_attention_kernel(
         float partial = 0.f;
         for (int w = wid; w < win_core_len; w += WARPS) {
             const int t = win_start + w;
-            const __hip_bfloat16 *v_vec = v_base + 1LL * t * kv_dim + 1LL * kv_h * head_dim;
-            partial += s_att[w] * __bfloat162float(v_vec[lane]);
+            const float *v_vec = v_base + 1LL * t * kv_dim + 1LL * kv_h * head_dim;
+            partial += (double)s_att[w] * (v_vec[lane]);
         }
         s_partials[wid * head_dim + lane] = partial;
     }
@@ -791,7 +791,7 @@ __global__ void fused_output_projection_kernel(
 template<bool Interior>
 __device__ inline void store_and_fuse_tile(
     float* __restrict__ x, // In/Out buffer
-    const __hip_bfloat16* __restrict__ bias,
+    const float* __restrict__ bias,
     const f32x4& acc,
     int M, int N,
     int m0, int n0,
@@ -810,7 +810,7 @@ __device__ inline void store_and_fuse_tile(
 
         // Fused operations: add bias and residual
         float Cvalue = acc[i];
-        Cvalue += __bfloat162float(bias[col]);
+        Cvalue += (bias[col]);
         Cvalue += x[(size_t)row * N + col];
         x[(size_t)row * N + col] = Cvalue;
     }
@@ -827,8 +827,8 @@ __device__ inline void store_and_fuse_tile(
 __global__ void fused_output_projection_kernel_optimized(
     float *__restrict__ x,                     // Residual input [M,N], and final output [M,N]
     const float *__restrict__ input,           // Input from attention layers [M, K]
-    const __hip_bfloat16 *__restrict__ weight, // Projection weights [N, K]
-    const __hip_bfloat16 *__restrict__ bias,   // Projection bias [N]
+    const float *__restrict__ weight, // Projection weights [N, K]
+    const float *__restrict__ bias,   // Projection bias [N]
     int M,                                     // Batch size
     int K,                                     // Attention output dimension
     int N                                      // Hidden dimension
@@ -872,8 +872,8 @@ __global__ void fused_output_projection_kernel_optimized(
             const int r = idx % BLOCK_K; // Row in block (0..BLOCK_K-1)
             const int gn = n0 + c;
             const int gk = r;
-            __hip_bfloat16 val = (gk < K && gn < N) ? weight[(size_t)gn * K + gk] : __float2bfloat16(0.0f);
-            sB0[c * BLOCK_K + r] = hipbf16_to_bits(val);
+            float val = (gk < K && gn < N) ? weight[(size_t)gn * K + gk] : 0.0f;
+            sB0[c * BLOCK_K + r] = f32_to_bf16_bits(val);
         }
     }
     __syncthreads();
@@ -901,8 +901,8 @@ __global__ void fused_output_projection_kernel_optimized(
                 const int r = idx % BLOCK_K;
                 const int gn = n0 + c;
                 const int gk = kBase + r;
-                __hip_bfloat16 val = (gk < K && gn < N) ? weight[(size_t)gn * K + gk] : __float2bfloat16(0.0f);
-                nextB[c * BLOCK_K + r] = hipbf16_to_bits(val);
+                float val = (gk < K && gn < N) ? weight[(size_t)gn * K + gk] : 0.0f;
+                nextB[c * BLOCK_K + r] = f32_to_bf16_bits(val);
             }
         }
 
@@ -941,9 +941,9 @@ extern "C" void launch_output_projection_optimized_kernel(
     int N = size2;
     int K = size3;
     
-    const __hip_bfloat16* weight = reinterpret_cast<const __hip_bfloat16*>(input2);
+    const float* weight = reinterpret_cast<const float*>(input2);
     // Bias is located immediately after the weight matrix in memory
-    const __hip_bfloat16* bias = weight + (size_t)N * K;
+    const float* bias = weight + (size_t)N * K;
     
     // --- MFMA Launch Configuration ---
     dim3 gridDim((N + BLOCK_N - 1) / BLOCK_N, (M + BLOCK_M - 1) / BLOCK_M);

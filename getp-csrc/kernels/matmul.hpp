@@ -327,17 +327,17 @@ __global__ void gemm_mfma_uint8_kernel_opt(
 // ===== Tile Tunables (FMA path) =====
 // Workgroup computes BM x BN tile of C
 #ifndef BM
-#define BM 128
+#define BM 32
 #endif
 #ifndef BN
 #define BN 64
 #endif
 #ifndef BK
-#define BK 32
+#define BK 64
 #endif
 // Per-thread micro-tile (TM x TN) -> BM/BN must be multiples of TM/TN * block dims
 #ifndef TM
-#define TM 8
+#define TM 2
 #endif
 #ifndef TN
 #define TN 4
