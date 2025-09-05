@@ -1110,3 +1110,44 @@ void transpose_inplace_gpu(float *data, int rows, int cols)
     HIP_CHECK(hipGetLastError());
     HIP_CHECK(hipDeviceSynchronize());
 }
+
+
+#ifndef TILE_DIM
+#define TILE_DIM 32
+#endif
+#ifndef BLOCK_ROWS
+#define BLOCK_ROWS 8
+#endif
+
+// Transpose src [rows, cols] row-major → dst [cols, rows] row-major
+// rows = N (outputs), cols = K (inputs) for QKV per layer.
+__global__ void transpose_tiled_kernel(
+    const float *__restrict__ src,
+    float *__restrict__ dst,
+    int rows, int cols)
+{
+    __shared__ float tile[TILE_DIM][TILE_DIM + 1]; // +1 avoids bank conflicts
+
+    int x = blockIdx.x * TILE_DIM + threadIdx.x; // col in src
+    int y = blockIdx.y * TILE_DIM + threadIdx.y; // row in src
+
+    #pragma unroll
+    for (int j = 0; j < TILE_DIM; j += BLOCK_ROWS) {
+        if (x < cols && (y + j) < rows) {
+            tile[threadIdx.y + j][threadIdx.x] = src[(y + j) * cols + x];
+        }
+    }
+    __syncthreads();
+
+    // Write transposed
+    int tx = blockIdx.y * TILE_DIM + threadIdx.x; // col in dst
+    int ty = blockIdx.x * TILE_DIM + threadIdx.y; // row in dst
+
+    #pragma unroll
+    for (int j = 0; j < TILE_DIM; j += BLOCK_ROWS) {
+        if (tx < rows && (ty + j) < cols) {
+            // dst is [cols, rows], leading dim = rows
+            dst[(ty + j) * rows + tx] = tile[threadIdx.x][threadIdx.y + j];
+        }
+    }
+}

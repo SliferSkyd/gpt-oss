@@ -317,27 +317,175 @@ __global__ void gemm_mfma_bf16_kernel_opt(
     }
 }
 
-// ===== Host wrappers (unchanged API) =====
-void matmul_mc(
-    float* __restrict__ output,                 // [B, N]
-    const float* __restrict__ input,            // [B, K]
-    const float* __restrict__ weight,           // B as [K, N] row-major; if B_IN_HBM_IS_BF16, this is a bitcasted bf16*
-    int batch_size, int input_dim, int output_dim,
-    hipStream_t stream = nullptr)
+// #ifndef MM_TILE
+// #define MM_TILE 32
+// #endif
+
+// __global__ void matmul_mc_kernel(
+//     float *__restrict__ C,          // [M, N]
+//     const float *__restrict__ A,    // [M, K]
+//     const float *__restrict__ B,    // [K, N]  (transposed weights)
+//     int M, int K, int N)
+// {
+//     __shared__ float As[MM_TILE][MM_TILE];
+//     __shared__ float Bs[MM_TILE][MM_TILE];
+
+//     int row = blockIdx.y * MM_TILE + threadIdx.y;
+//     int col = blockIdx.x * MM_TILE + threadIdx.x;
+
+//     float acc = 0.0f;
+
+//     const int tiles = (K + MM_TILE - 1) / MM_TILE;
+
+//     for (int t = 0; t < tiles; ++t) {
+//         int Acol = t * MM_TILE + threadIdx.x;
+//         int Brow = t * MM_TILE + threadIdx.y;
+
+//         // Guarded loads
+//         As[threadIdx.y][threadIdx.x] =
+//             (row < M && Acol < K) ? A[row * K + Acol] : 0.0f;
+
+//         Bs[threadIdx.y][threadIdx.x] =
+//             (Brow < K && col < N) ? B[Brow * N + col] : 0.0f;
+
+//         __syncthreads();
+
+//         #pragma unroll
+//         for (int k = 0; k < MM_TILE; ++k) {
+//             acc += As[threadIdx.y][k] * Bs[k][threadIdx.x];
+//         }
+//         __syncthreads();
+//     }
+
+//     if (row < M && col < N) {
+//         C[row * N + col] = acc;
+//     }
+// }
+
+// static inline void matmul_mc(
+//     float *out, const float *A, const float *B_T, // B_T is [K,N]
+//     int M, int K, int N)
+// {
+//     dim3 block(MM_TILE, MM_TILE);
+//     dim3 grid((N + MM_TILE - 1) / MM_TILE, (M + MM_TILE - 1) / MM_TILE);
+//     matmul_mc_kernel<<<grid, block>>>(out, A, B_T, M, K, N);
+//     HIP_CHECK(hipGetLastError());
+// }
+
+
+#if !defined(MM_TILE)
+#define MM_TILE 32
+#endif
+
+
+// LDS stores in BF16 (bit-patterns)
+__global__ __launch_bounds__(LANE_PER_WAVE * WAVES_PER_BLOCK)
+void matmul_mc_kernel_mfma_bf16(
+    float* __restrict__ C,          // [M, N]
+    const float* __restrict__ A,    // [M, K]
+    const float* __restrict__ B,    // [K, N]
+    int M, int K, int N)
 {
-    const int M = batch_size, K = input_dim, N = output_dim;
-    dim3 grid((N + BLOCK_N - 1) / BLOCK_N, (M + BLOCK_M - 1) / BLOCK_M);
-    dim3 block(LANE_PER_WAVE, WAVES_PER_BLOCK);
+    // --- Block tile this kernel computes ---
+    const int m0 = blockIdx.y * BLOCK_M;
+    const int n0 = blockIdx.x * BLOCK_N;
 
-    // Double-buffered A/B only (no sC spill needed; we mask-ed store)
-    size_t shmem_bytes =
-        (size_t)(2 * BLOCK_M * BLOCK_K + 2 * BLOCK_K * BLOCK_N) * sizeof(uint16_t);
+    // --- Wave/lane mapping ---
+    const int lane     = threadIdx.x & (LANE_PER_WAVE - 1);   // 0..63
+    const int wave_id  = threadIdx.x >> 6;                    // 0..(WAVES_PER_BLOCK-1)
+    const int wave_m   = wave_id % WAVES_M;                   // which 16x on M
+    const int wave_n   = wave_id / WAVES_M;                   // which 16x on N
 
-    hipLaunchKernelGGL(
-        gemm_mfma_bf16_kernel_opt,
-        grid, block, shmem_bytes, stream,
-        output, input, weight, M, K, N);
+    // --- Shared tiles (BF16 bit patterns) ---
+    __shared__ uint16_t sA[BLOCK_M * BLOCK_K];                // row-major, ldA=BLOCK_K
+    __shared__ uint16_t sB[BLOCK_K * BLOCK_N];                // column-major, ldB=BLOCK_K with XOR swizzle on row
+
+    // --- FP32 accumulators (4 per lane, forms 16x16 tile per wave) ---
+    f32x4 acc = {0.f, 0.f, 0.f, 0.f};
+
+    // How many 16-wide K-chunks
+    const int tilesK = (K + BLOCK_K - 1) / BLOCK_K;
+    const int tid    = threadIdx.x;
+    const int tsize  = blockDim.x; // 64 * WAVES_PER_BLOCK
+
+    // Bounds for "interior tile" fast stores
+    const bool interiorM = (m0 + BLOCK_M) <= M;
+    const bool interiorN = (n0 + BLOCK_N) <= N;
+
+    for (int tk = 0; tk < tilesK; ++tk) {
+        const int k0 = tk * BLOCK_K;
+
+        // === Global -> LDS: A (M x 16), row-major in BF16 ===
+        // Every thread helps; unit-stride along BLOCK_K for coalescing
+        for (int idx = tid; idx < BLOCK_M * BLOCK_K; idx += tsize) {
+            const int r = idx / BLOCK_K;           // 0..BLOCK_M-1
+            const int c = idx - r * BLOCK_K;       // 0..15
+            const int gr = m0 + r;
+            const int gc = k0 + c;
+            uint16_t v = 0;
+            if (gr < M && gc < K) {
+                v = f32_to_bf16_bits(A[(size_t)gr * K + gc]);
+            }
+            sA[idx] = v;
+        }
+
+        // === Global -> LDS: B (16 x N), column-major in BF16 with XOR swizzle on row ===
+        // Indexing matches make_b_vec_swizzled: sB[col * ldB + r_sw], ldB=BLOCK_K
+        for (int idx = tid; idx < BLOCK_N * BLOCK_K; idx += tsize) {
+            const int col = idx / BLOCK_K;         // 0..BLOCK_N-1
+            const int r   = idx - col * BLOCK_K;   // 0..15
+            const int gr  = k0 + r;
+            const int gc  = n0 + col;
+            uint16_t vb = 0;
+#if defined(B_IN_HBM_IS_BF16)
+            if (gr < K && gc < N) {
+                const uint16_t* __restrict__ BB = reinterpret_cast<const uint16_t*>(B);
+                vb = BB[(size_t)gr * N + gc];
+            }
+#else
+            if (gr < K && gc < N) {
+                vb = f32_to_bf16_bits(B[(size_t)gr * N + gc]);
+            }
+#endif
+            const int r_sw = r ^ (col & 0xF);      // column-dependent XOR to break LDS bank conflicts
+            sB[col * BLOCK_K + r_sw] = vb;
+        }
+
+        __syncthreads();
+
+        // === One MFMA per 16 K-elements ===
+        // A-subtile is at rows [wave_m*WM .. +15]
+        // B-subtile is at cols [wave_n*WN .. +15]
+        const bf16x4 a_vec = make_a_vec(sA, BLOCK_K, wave_m * WM, lane);
+        const bf16x4 b_vec = make_b_vec_swizzled(sB, BLOCK_K, wave_n * WN, lane);
+        acc = mfma_16x16x16_bf16(a_vec, b_vec, acc);
+
+        __syncthreads();
+    }
+
+    // === Store C ===
+    if (interiorM && interiorN) {
+        store_c_tile_mfma<true>(C, acc, M, N, m0, n0, wave_m, wave_n, lane);
+    } else {
+        store_c_tile_mfma<false>(C, acc, M, N, m0, n0, wave_m, wave_n, lane);
+    }
 }
+
+static inline void matmul_mc(
+    float *out, const float *A, const float *B_T, // B_T is [K,N]
+    int M, int K, int N)
+{
+    // One block computes BLOCK_M x BLOCK_N with WAVES_PER_BLOCK wavefronts (64 lanes each)
+    constexpr int THREADS = LANE_PER_WAVE * WAVES_PER_BLOCK; // e.g. 64 * 16 = 1024
+    dim3 block(THREADS, 1, 1);
+    dim3 grid((N + BLOCK_N - 1) / BLOCK_N,
+              (M + BLOCK_M - 1) / BLOCK_M,
+              1);
+    matmul_mc_kernel_mfma_bf16<<<grid, block>>>(out, A, B_T, M, K, N);
+    HIP_CHECK(hipGetLastError());
+}
+
+
 
 // ===== Tile Tunables (FMA path) =====
 // Workgroup computes BM x BN tile of C
