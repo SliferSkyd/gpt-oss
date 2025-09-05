@@ -825,7 +825,7 @@ struct GPUWorker {
   int request_start;
   int request_end;
 };
-void moe_gpu(GPUTransformer *gpu_t, int l, int batch_size)
+void moe_gpu_old(GPUTransformer *gpu_t, int l, int batch_size)
 {
 Config *p = &gpu_t->config;
 GPURunState *dev_s = &gpu_t->state;
@@ -906,7 +906,7 @@ int n_experts = p->n_experts;
 }
 
 
-void moe_gpu_old(GPUTransformer *gpu_t, int layer_idx, int batch_size)
+void moe_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size)
 {
    Config *p = &gpu_t->config;
    GPURunState *s = &gpu_t->state;
