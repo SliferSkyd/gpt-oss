@@ -349,6 +349,11 @@ void copy_weights_to_gpu(Transformer *transformer, GPUTransformerWeights *gpu_we
     size_t qkv_size = p->n_layers * p->hidden_dim * (p->n_attn_heads + 2 * p->n_kv_heads) * p->head_dim;
     HIP_CHECK(hipMemcpy(gpu_weights->w_qkv, w->w_qkv, qkv_size * sizeof(float), hipMemcpyHostToDevice));
 
+    for (int i = 0; i < p->n_layers; i++) {
+        transpose_inplace_gpu(gpu_weights->w_qkv + i * p->hidden_dim * (p->n_attn_heads + 2 * p->n_kv_heads) * p->head_dim,
+                              (p->n_attn_heads + 2 * p->n_kv_heads) * p->head_dim, p->hidden_dim);
+    }
+
     size_t b_qkv_size = p->n_layers * (p->n_attn_heads + 2 * p->n_kv_heads) * p->head_dim;
     HIP_CHECK(hipMemcpy(gpu_weights->b_qkv, w->b_qkv, b_qkv_size * sizeof(float), hipMemcpyHostToDevice));
 
@@ -414,6 +419,8 @@ void copy_weights_to_gpu(Transformer *transformer, GPUTransformerWeights *gpu_we
     // Convert and copy output weights
     size_t out_size = p->hidden_dim * p->vocab_size;
     HIP_CHECK(hipMemcpy(gpu_weights->out, w->out, out_size * sizeof(float), hipMemcpyHostToDevice));
+
+    transpose_inplace_gpu(gpu_weights->out, p->vocab_size, p->hidden_dim);
 
     printf("Weight conversion and copying completed successfully\n");
 }
@@ -950,7 +957,7 @@ void moe_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size)
     softmax_kernel<<<batch_size, THREADS_PER_BLOCK, 0, s0>>>(
        s->topk_v, batch_size, Ktok);
 
-    HIP_CHECK(hipStreamSynchronize(s0));
+    // HIP_CHECK(hipStreamSynchronize(s0));
    }
 
    // 2) Count -> host prefix -> offsets -> permute
@@ -987,7 +994,7 @@ void moe_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size)
        batch_size, H, Ktok,
        s->expert_input_buffer, s->expert_indices, s->expert_weights);
      HIP_CHECK(hipGetLastError());
-    HIP_CHECK(hipStreamSynchronize(s0));
+    // HIP_CHECK(hipStreamSynchronize(s0));
    }
 
    if (total_tokens == 0) {
@@ -1075,7 +1082,7 @@ void moe_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size)
      HIP_CHECK(hipGetLastError());
    }
 
-  HIP_CHECK(hipStreamSynchronize(s0));
+  // HIP_CHECK(hipStreamSynchronize(s0));
    HIP_CHECK(hipFree(d_mtile_prefix));
 
 }

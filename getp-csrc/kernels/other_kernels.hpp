@@ -1079,3 +1079,34 @@ static inline void getp_argmax_rows(
 }
 
 
+
+
+
+__global__ void transpose_inplace(float *data, int rows, int cols)
+{
+    size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    size_t total = 1LL * rows * cols;
+
+    if (idx < total)
+    {
+        int r = idx / cols;
+        int c = idx % cols;
+        int new_id = c * rows + r;
+        if (idx < new_id) // Avoid double swapping
+        {
+            float temp = data[idx];
+            data[idx] = data[new_id];
+            data[new_id] = temp;
+        }
+    }
+}
+
+void transpose_inplace_gpu(float *data, int rows, int cols)
+{
+    size_t total = 1LL * rows * cols;
+    size_t blockSize = 256;
+    size_t numBlocks = (total + blockSize - 1) / blockSize;
+    transpose_inplace<<<numBlocks, blockSize>>>(data, rows, cols);
+    HIP_CHECK(hipGetLastError());
+    HIP_CHECK(hipDeviceSynchronize());
+}
