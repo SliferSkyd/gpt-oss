@@ -4,6 +4,8 @@
 #include <cstdlib>
 #include <iomanip>
 #include <sstream>
+#include <vector>
+#include <mutex>
 // HIP error checking macro
 #define HIP_CHECK(call)                                                                                 \
     do                                                                                                  \
@@ -41,23 +43,34 @@ void debug(float *d_val, int size = 1)
 // Timer class for measuring execution time                                     //
 //------------------------------------------------------------------------------//
 
-struct Timer
-{
-    // hip events
-    hipEvent_t hip_start, hip_stop;
-    // CPU timing
-    std::chrono::high_resolution_clock::time_point cpu_start;
-
+// Global storage for profiling data
+struct ProfileEntry {
     std::string name;
-    std::ofstream log_file;
-    bool use_hip;
+    float time_ms;
+};
 
-    Timer(const std::string &timer_name, bool is_hip = false, const std::string &filename = "")
-        : name(timer_name), use_hip(is_hip)
-    {
-        std::string actual_filename = filename;
+class ProfileManager {
+private:
+    static std::vector<ProfileEntry> entries;
+    static std::mutex entries_mutex;
+    static std::string output_filename;
+
+public:
+    static void add_entry(const std::string& name, float time_ms) {
+        std::lock_guard<std::mutex> lock(entries_mutex);
+        entries.push_back({name, time_ms});
+    }
+
+    static void set_output_file(const std::string& filename) {
+        output_filename = filename;
+    }
+
+    static void write_profile_info() {
+        std::lock_guard<std::mutex> lock(entries_mutex);
         
-        // Auto-generate filename if not provided
+        if (entries.empty()) return;
+        
+        std::string actual_filename = output_filename;
         if (actual_filename.empty()) {
             // Try to get SLURM_JOB_ID first
             const char* job_id = std::getenv("SLURM_JOB_ID");
@@ -80,16 +93,57 @@ struct Timer
             actual_filename = "logs/" + actual_filename;
         }
 
+        std::ofstream log_file(actual_filename, std::ios::app);
+        if (log_file.tellp() == 0) {
+            log_file << "name,time_ms\n";
+        }
+        
+        for (const auto& entry : entries) {
+            log_file << entry.name << "," << entry.time_ms << "\n";
+        }
+        
+        log_file.close();
+        entries.clear();
+    }
+
+    static void clear() {
+        std::lock_guard<std::mutex> lock(entries_mutex);
+        entries.clear();
+    }
+};
+
+// Static member definitions
+std::vector<ProfileEntry> ProfileManager::entries;
+std::mutex ProfileManager::entries_mutex;
+std::string ProfileManager::output_filename;
+
+// Wrapper function for easy access
+void write_profile_info() {
+    ProfileManager::write_profile_info();
+}
+
+struct Timer
+{
+    // hip events
+    hipEvent_t hip_start, hip_stop;
+    // CPU timing
+    std::chrono::high_resolution_clock::time_point cpu_start;
+
+    std::string name;
+    bool use_hip;
+    bool write_immediately;
+
+    Timer(const std::string &timer_name, bool is_hip = false, const std::string &filename = "", bool immediate_write = false)
+        : name(timer_name), use_hip(is_hip), write_immediately(immediate_write)
+    {
+        if (!filename.empty()) {
+            ProfileManager::set_output_file(filename);
+        }
+
         if (use_hip)
         {
             hipEventCreate(&hip_start);
             hipEventCreate(&hip_stop);
-        }
-
-        log_file.open(actual_filename, std::ios::app);
-        if (log_file.tellp() == 0)
-        {
-            log_file << "name,time_ms\n";
         }
     }
 
@@ -100,7 +154,6 @@ struct Timer
             hipEventDestroy(hip_start);
             hipEventDestroy(hip_stop);
         }
-        log_file.close();
     }
 
     void start()
@@ -132,8 +185,35 @@ struct Timer
             ms = duration.count() / 1000.0f;
         }
 
-        log_file << name << "," << ms << "\n";
-        log_file.flush();
+        if (write_immediately) {
+            // Old behavior - write immediately (slower)
+            std::string actual_filename;
+            const char* job_id = std::getenv("SLURM_JOB_ID");
+            if (job_id) {
+                actual_filename = "logs/times_job_" + std::string(job_id) + ".csv";
+            } else {
+                auto now = std::chrono::system_clock::now();
+                auto time_t = std::chrono::system_clock::to_time_t(now);
+                auto ms_ts = std::chrono::duration_cast<std::chrono::milliseconds>(
+                    now.time_since_epoch()) % 1000;
+                
+                std::stringstream ss;
+                ss << "logs/times_" << std::put_time(std::localtime(&time_t), "%Y%m%d_%H%M%S");
+                ss << "_" << std::setfill('0') << std::setw(3) << ms_ts.count() << ".csv";
+                actual_filename = ss.str();
+            }
+            
+            std::ofstream log_file(actual_filename, std::ios::app);
+            if (log_file.tellp() == 0) {
+                log_file << "name,time_ms\n";
+            }
+            log_file << name << "," << ms << "\n";
+            log_file.flush();
+            log_file.close();
+        } else {
+            // New behavior - store in memory for batch writing (faster)
+            ProfileManager::add_entry(name, ms);
+        }
     }
 };
 
@@ -145,7 +225,20 @@ struct ScopedTimer
     ~ScopedTimer() { timer.stop(); }
 };
 
+// Block timer for HIP kernel calls and code blocks
+struct BlockTimer
+{
+    Timer timer;
+    BlockTimer(const std::string &name, bool is_hip = true) : timer(name, is_hip) { 
+        timer.start(); 
+    }
+    ~BlockTimer() { 
+        timer.stop(); 
+    }
+};
+
 #define TIME_SCOPE(timer) ScopedTimer _t(timer)
+#define TIMER_BLOCK(name) BlockTimer _block_timer(name, true)
 
 // CPU warmup functions (same as before)
 void compute_concentration_and_inv_freq_getp(float base, int head_dim,

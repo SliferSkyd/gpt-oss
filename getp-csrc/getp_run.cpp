@@ -1008,8 +1008,11 @@ void moe_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size)
    {
 
     dim3 norm_grid(batch_size), norm_block(THREADS_PER_BLOCK);
-    rmsnorm_kernel<<<norm_grid, norm_block, 0, s0>>>(
+    {
+        TIMER_BLOCK("rmsnorm_kernel");
+        rmsnorm_kernel<<<norm_grid, norm_block, 0, s0>>>(
        s->t, s->x, w->rms_ffn_w + (size_t)layer_idx * H, batch_size, H);
+    }
      HIP_CHECK(hipGetLastError());
 
 
@@ -1019,18 +1022,27 @@ void moe_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size)
 
      const int elems = batch_size * E;
 
-    add_bias_kernel<<<(elems + THREADS_PER_BLOCK - 1)/THREADS_PER_BLOCK,
+    {
+        TIMER_BLOCK("add_bias_kernel");
+        add_bias_kernel<<<(elems + THREADS_PER_BLOCK - 1)/THREADS_PER_BLOCK,
                       THREADS_PER_BLOCK, 0, s0>>>(
        s->router_score, w->b_router + (size_t)layer_idx * E, batch_size, E);
+    }
      HIP_CHECK(hipGetLastError());
 
 
-    topk_kernel<<<batch_size, 1, 0, s0>>>(
+    {
+        TIMER_BLOCK("topk_kernel");
+        topk_kernel<<<batch_size, 1, 0, s0>>>(
        s->topk_v, s->topk_i, s->router_score, batch_size, E, Ktok);
+    }
 
 
-    softmax_kernel<<<batch_size, THREADS_PER_BLOCK, 0, s0>>>(
+    {
+        TIMER_BLOCK("softmax_kernel");
+        softmax_kernel<<<batch_size, THREADS_PER_BLOCK, 0, s0>>>(
        s->topk_v, batch_size, Ktok);
+    }
 
     // HIP_CHECK(hipStreamSynchronize(s0));
    }
@@ -1042,8 +1054,11 @@ void moe_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size)
 
     HIP_CHECK(hipMemset(s->d_expert_counts, 0, E * sizeof(int)));
      const dim3 count_grid((batch_size + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK);
-    count_tokens_per_expert_kernel<<<count_grid, THREADS_PER_BLOCK, 0, s0>>>(
+    {
+        TIMER_BLOCK("count_tokens_per_expert_kernel");
+        count_tokens_per_expert_kernel<<<count_grid, THREADS_PER_BLOCK, 0, s0>>>(
        s->topk_i, s->d_expert_counts, batch_size, Ktok);
+    }
      HIP_CHECK(hipGetLastError());
 
 
@@ -1064,10 +1079,13 @@ void moe_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size)
 
      const dim3 permute_grid(batch_size), permute_block(256);
      const int  shared_mem_size = Ktok * sizeof(int);
-    permute_expert_inputs_kernel<<<permute_grid, permute_block, shared_mem_size, s0>>>(
+    {
+        TIMER_BLOCK("permute_expert_inputs_kernel");
+        permute_expert_inputs_kernel<<<permute_grid, permute_block, shared_mem_size, s0>>>(
        s->t, s->topk_i, s->topk_v, s->d_expert_offsets, s->d_expert_write_idx,
        batch_size, H, Ktok,
        s->expert_input_buffer, s->expert_indices, s->expert_weights);
+    }
      HIP_CHECK(hipGetLastError());
     // HIP_CHECK(hipStreamSynchronize(s0));
    }
@@ -1118,16 +1136,20 @@ HIP_CHECK(hipMemcpy(d_tile2local,  h_tile2local.data(),
      dim3 block(LANE_PER_WAVE, WAVES_PER_BLOCK_MLP);
      size_t shmem = (size_t)(2*BLOCK_M_MLP*BLOCK_K + 2*BLOCK_K*BLOCK_N_MLP) * sizeof(uint16_t);
 
-    hipLaunchKernelGGL(grouped_mlp1_bf16_kernel, grid, block, shmem, s0,
+    {
+        TIMER_BLOCK("grouped_mlp1_bf16_kernel");
+        hipLaunchKernelGGL(grouped_mlp1_bf16_kernel, grid, block, shmem, s0,
     s->mlp1_out, s->expert_input_buffer, W1_layer,
     s->d_expert_offsets, s->d_expert_counts,
     d_tile2expert, d_tile2local,            // NEW
     E, H, 2*D);
+}
      HIP_CHECK(hipGetLastError());
    }
 
    // fused bias + SwiGLU
    {
+    TIMER_BLOCK("bias_swiglu_epilogue_kernel");
      const __hip_bfloat16* b1_layer = w->b_mlp1 + (size_t)layer_idx * E * (2*D);
      const size_t work = (size_t)total_tokens * D;
      const int T = 256;
@@ -1141,6 +1163,7 @@ HIP_CHECK(hipMemcpy(d_tile2local,  h_tile2local.data(),
 
    // Grouped MLP2 + bias
    {
+    TIMER_BLOCK("grouped_mlp2_bf16_bias_kernel");
      const size_t seg2_elems = (size_t)H * D;
      const size_t layer2_elem_off = (size_t)layer_idx * E * seg2_elems;
      const __hip_bfloat16* W2_layer = w->w_mlp2 + layer2_elem_off;
@@ -1160,6 +1183,7 @@ HIP_CHECK(hipMemcpy(d_tile2local,  h_tile2local.data(),
 
    // scatter + residual
    {
+    TIMER_BLOCK("scatter + residual");
      const int elems = total_tokens * H;
      const dim3 grid((elems + THREADS_PER_BLOCK - 1)/THREADS_PER_BLOCK);
    scatter_expert_outputs_kernel<<<grid, THREADS_PER_BLOCK, 0, s0>>>(
@@ -1168,6 +1192,7 @@ HIP_CHECK(hipMemcpy(d_tile2local,  h_tile2local.data(),
      HIP_CHECK(hipGetLastError());
    }
    {
+    TIMER_BLOCK("residual add");
      const int elems = batch_size * H;
      accumulate_kernel<<<(elems + THREADS_PER_BLOCK - 1)/THREADS_PER_BLOCK,
                          THREADS_PER_BLOCK, 0, s0>>>(
@@ -1193,6 +1218,7 @@ int *forward_batch_gpu(GPUTransformer *gpu_t, int *tokens, int batch_size)
     // Copy token embeddings
     dim3 embed_grid((batch_size * hidden_dim + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK);
     {
+        TIMER_BLOCK("copy_embeddings_kernel");
         copy_embeddings_kernel<<<embed_grid, THREADS_PER_BLOCK>>>(
             s->x, w->token_embedding_table, s->current_tokens, batch_size, hidden_dim);
         HIP_CHECK(hipGetLastError());
@@ -1207,6 +1233,7 @@ int *forward_batch_gpu(GPUTransformer *gpu_t, int *tokens, int batch_size)
     dim3 final_norm_grid(batch_size);
     dim3 final_norm_block(THREADS_PER_BLOCK);
     {
+        TIMER_BLOCK("rmsnorm_kernel");
         rmsnorm_kernel<<<final_norm_grid, final_norm_block>>>(
             s->x, s->x, w->rms_out_w, batch_size, hidden_dim);
         HIP_CHECK(hipGetLastError());
@@ -1222,7 +1249,11 @@ int *forward_batch_gpu(GPUTransformer *gpu_t, int *tokens, int batch_size)
         matmul_mc(
             s->logits, s->x, w->out, batch_size, hidden_dim, p->vocab_size);
     }
-    sample_argmax(s->logits, s->current_tokens, batch_size, p->vocab_size);
+
+    {
+        TIMER_BLOCK("sample_argmax");
+        sample_argmax(s->logits, s->current_tokens, batch_size, p->vocab_size);
+    }
     // Copy logits back to CPU (you might want to keep this on GPU for sampling)
     HIP_CHECK(hipMemcpy(cpu_buf->current_tokens, s->current_tokens, batch_size * sizeof(int), hipMemcpyDeviceToHost));
     ++tokenId;
@@ -1445,6 +1476,9 @@ long long continuous_batching_inference(Tokenizer *tokenizer,
         printf("\n");
     }
     fflush(stdout);
+
+
+    write_profile_info();
 
     return total_tokens_generated;
 }

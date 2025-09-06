@@ -8,6 +8,7 @@
 #include <hip/hip_fp16.h>
 #include <hip/hip_bfloat16.h>
 #include <stdint.h>
+#include "../utils.hpp"
 
 // ===== Tunables (same defaults you had) =====
 #ifndef WM
@@ -325,6 +326,10 @@ void matmul_mc(
     int batch_size, int input_dim, int output_dim,
     hipStream_t stream = nullptr)
 {
+    std::stringstream timer_name;
+    timer_name << "matmul_mc_" << batch_size << "x" << input_dim << "x" << output_dim;
+    TIMER_BLOCK(timer_name.str());
+    
     const int M = batch_size, K = input_dim, N = output_dim;
     dim3 grid((N + BLOCK_N - 1) / BLOCK_N, (M + BLOCK_M - 1) / BLOCK_M);
     dim3 block(LANE_PER_WAVE, WAVES_PER_BLOCK);
@@ -522,6 +527,9 @@ void matmul(
     int batch_size, int input_dim, int output_dim,
     hipStream_t stream = nullptr)
 {
+    std::stringstream timer_name;
+    timer_name << "matmul_kernel_" << batch_size << "x" << input_dim << "x" << output_dim;
+    TIMER_BLOCK(timer_name.str());
     const int M = batch_size, K = input_dim, N = output_dim;
     dim3 grid((N + BN - 1) / BN, (M + BM - 1) / BM);
     dim3 block(TB_X, TB_Y);
@@ -667,6 +675,10 @@ void matmul(
     int batch_size, int input_dim, int output_dim,
     hipStream_t stream = nullptr)
 {
+    std::stringstream timer_name;
+    timer_name << "matmul_fma_" << batch_size << "x" << input_dim << "x" << output_dim;
+    TIMER_BLOCK(timer_name.str());
+    
     const int M = batch_size, K = input_dim, N = output_dim;
     dim3 grid((N + BN - 1) / BN, (M + BM - 1) / BM);
     dim3 block(TB_X, TB_Y);
