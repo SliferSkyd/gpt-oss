@@ -326,104 +326,179 @@ void malloc_gpu_weights(GPUTransformerWeights *w, Config *p)
     HIP_CHECK(hipMalloc((void **)&w->attn_sinks, p->n_layers * p->n_attn_heads * sizeof(__hip_bfloat16)));
 }
 
+#ifndef KEEP_ORIGINAL_QKV
+// If set to 0, we free gpu_weights->w_qkv after transposing to save memory.
+#define KEEP_ORIGINAL_QKV 0
+#endif
+
 void copy_weights_to_gpu(Transformer *transformer, GPUTransformerWeights *gpu_weights)
 {
     Config *p = &transformer->config;
     TransformerWeights *w = &transformer->weights;
 
-    // Convert and copy embedding weights
-    size_t embedding_size = p->vocab_size * p->hidden_dim;
-    HIP_CHECK(hipMemcpy(gpu_weights->token_embedding_table, w->token_embedding_table, embedding_size * sizeof(float), hipMemcpyHostToDevice));
-
-    // Convert and copy normalization weights
-    size_t rms_attn_size = p->n_layers * p->hidden_dim;
-    HIP_CHECK(hipMemcpy(gpu_weights->rms_attn_w, w->rms_attn_w, rms_attn_size * sizeof(float), hipMemcpyHostToDevice));
-
-    size_t rms_ffn_size = p->n_layers * p->hidden_dim;
-    HIP_CHECK(hipMemcpy(gpu_weights->rms_ffn_w, w->rms_ffn_w, rms_ffn_size * sizeof(float), hipMemcpyHostToDevice));
-
-    size_t rms_out_size = p->hidden_dim;
-    HIP_CHECK(hipMemcpy(gpu_weights->rms_out_w, w->rms_out_w, rms_out_size * sizeof(float), hipMemcpyHostToDevice));
-
-    // Convert and copy attention weights
-    size_t qkv_size = p->n_layers * p->hidden_dim * (p->n_attn_heads + 2 * p->n_kv_heads) * p->head_dim;
-    HIP_CHECK(hipMemcpy(gpu_weights->w_qkv, w->w_qkv, qkv_size * sizeof(float), hipMemcpyHostToDevice));
-
-    for (int i = 0; i < p->n_layers; i++) {
-        transpose_inplace_gpu(gpu_weights->w_qkv + i * p->hidden_dim * (p->n_attn_heads + 2 * p->n_kv_heads) * p->head_dim,
-                              (p->n_attn_heads + 2 * p->n_kv_heads) * p->head_dim, p->hidden_dim);
+    // Embeddings
+    {
+        size_t embedding_size = (size_t)p->vocab_size * p->hidden_dim;
+        HIP_CHECK(hipMemcpy(gpu_weights->token_embedding_table, w->token_embedding_table,
+                            embedding_size * sizeof(float), hipMemcpyHostToDevice));
     }
 
-    size_t b_qkv_size = p->n_layers * (p->n_attn_heads + 2 * p->n_kv_heads) * p->head_dim;
-    HIP_CHECK(hipMemcpy(gpu_weights->b_qkv, w->b_qkv, b_qkv_size * sizeof(float), hipMemcpyHostToDevice));
+    // Norms
+    {
+        size_t rms_attn_size = (size_t)p->n_layers * p->hidden_dim;
+        HIP_CHECK(hipMemcpy(gpu_weights->rms_attn_w, w->rms_attn_w,
+                            rms_attn_size * sizeof(float), hipMemcpyHostToDevice));
 
-    size_t attn_out_size = p->n_layers * (p->n_attn_heads * p->head_dim) * p->hidden_dim;
-    HIP_CHECK(hipMemcpy(gpu_weights->w_o, w->w_o, attn_out_size * sizeof(float), hipMemcpyHostToDevice));
+        size_t rms_ffn_size = (size_t)p->n_layers * p->hidden_dim;
+        HIP_CHECK(hipMemcpy(gpu_weights->rms_ffn_w, w->rms_ffn_w,
+                            rms_ffn_size * sizeof(float), hipMemcpyHostToDevice));
 
-    size_t b_o_size = p->n_layers * p->hidden_dim;
-    HIP_CHECK(hipMemcpy(gpu_weights->b_o, w->b_o, b_o_size * sizeof(float), hipMemcpyHostToDevice));
+        size_t rms_out_size = (size_t)p->hidden_dim;
+        HIP_CHECK(hipMemcpy(gpu_weights->rms_out_w, w->rms_out_w,
+                            rms_out_size * sizeof(float), hipMemcpyHostToDevice));
+    }
 
-    // Convert and copy attention sinks
-    size_t attn_sinks_size = p->n_layers * p->n_attn_heads;
-    __hip_bfloat16 *h_attn_sinks_bf16 = (__hip_bfloat16 *)malloc(attn_sinks_size * sizeof(__hip_bfloat16));
-    convert_float_array_to_bfloat16(w->attn_sinks, h_attn_sinks_bf16, attn_sinks_size);
-    HIP_CHECK(hipMemcpy(gpu_weights->attn_sinks, h_attn_sinks_bf16, attn_sinks_size * sizeof(__hip_bfloat16), hipMemcpyHostToDevice));
-    free(h_attn_sinks_bf16);
+    // ---------------- QKV: copy then transpose IN-PLACE to [K, N] ----------------
+    {
+        const int K = p->hidden_dim;
+        const int N = (p->n_attn_heads + 2 * p->n_kv_heads) * p->head_dim;
 
-    // Convert and copy MoE weights
-    size_t w_router_size = p->n_layers * p->hidden_dim * p->n_experts;
-    __hip_bfloat16 *h_w_router_bf16 = (__hip_bfloat16 *)malloc(w_router_size * sizeof(__hip_bfloat16));
-    convert_float_array_to_bfloat16(w->w_router, h_w_router_bf16, w_router_size);
-    HIP_CHECK(hipMemcpy(gpu_weights->w_router, h_w_router_bf16, w_router_size * sizeof(__hip_bfloat16), hipMemcpyHostToDevice));
-    free(h_w_router_bf16);
+        const size_t per_layer_elems = (size_t)K * N;
+        const size_t per_layer_bytes = per_layer_elems * sizeof(float);
+        const size_t total_elems     = (size_t)p->n_layers * per_layer_elems;
 
-    size_t b_router_size = p->n_layers * p->n_experts;
-    __hip_bfloat16 *h_b_router_bf16 = (__hip_bfloat16 *)malloc(b_router_size * sizeof(__hip_bfloat16));
-    convert_float_array_to_bfloat16(w->b_router, h_b_router_bf16, b_router_size);
-    HIP_CHECK(hipMemcpy(gpu_weights->b_router, h_b_router_bf16, b_router_size * sizeof(__hip_bfloat16), hipMemcpyHostToDevice));
-    free(h_b_router_bf16);
-    // --- remove the whole MXFP4 quantize/copy section ---
+        // Copy host → device (as [N,K] per layer)
+        HIP_CHECK(hipMemcpy(gpu_weights->w_qkv, w->w_qkv,
+                            total_elems * sizeof(float), hipMemcpyHostToDevice));
 
-    // BF16 MLP1
+        // Temp buffer for a single layer transpose
+        float *d_tmp = nullptr;
+        HIP_CHECK(hipMalloc(&d_tmp, per_layer_bytes));
+
+        dim3 block(TILE_DIM, BLOCK_ROWS);
+        dim3 grid((K + TILE_DIM - 1) / TILE_DIM, (N + TILE_DIM - 1) / TILE_DIM);
+
+        for (int layer = 0; layer < p->n_layers; ++layer) {
+            float *src_layer = gpu_weights->w_qkv + (size_t)layer * per_layer_elems; // [N,K]
+            transpose_tiled_kernel<<<grid, block>>>(src_layer, d_tmp, /*rows=*/N, /*cols=*/K);
+            HIP_CHECK(hipGetLastError());
+            // Copy back: now [K,N]
+            HIP_CHECK(hipMemcpy(src_layer, d_tmp, per_layer_bytes, hipMemcpyDeviceToDevice));
+        }
+        HIP_CHECK(hipFree(d_tmp));
+        HIP_CHECK(hipDeviceSynchronize());
+        // NOTE: gpu_weights->w_qkv now stores each layer as [K, N] row-major.
+    }
+
+    // QKV bias
+    {
+        size_t b_qkv_size = (size_t)p->n_layers * (p->n_attn_heads + 2 * p->n_kv_heads) * p->head_dim;
+        HIP_CHECK(hipMemcpy(gpu_weights->b_qkv, w->b_qkv,
+                            b_qkv_size * sizeof(float), hipMemcpyHostToDevice));
+    }
+
+    // Attention output projection (unchanged)
+    {
+        size_t attn_out_size = (size_t)p->n_layers * (p->n_attn_heads * p->head_dim) * p->hidden_dim;
+        HIP_CHECK(hipMemcpy(gpu_weights->w_o, w->w_o,
+                            attn_out_size * sizeof(float), hipMemcpyHostToDevice));
+
+        size_t b_o_size = (size_t)p->n_layers * p->hidden_dim;
+        HIP_CHECK(hipMemcpy(gpu_weights->b_o, w->b_o,
+                            b_o_size * sizeof(float), hipMemcpyHostToDevice));
+    }
+
+    // Attention sinks → BF16
+    {
+        size_t attn_sinks_size = (size_t)p->n_layers * p->n_attn_heads;
+        __hip_bfloat16 *h_attn_sinks_bf16 = (__hip_bfloat16 *)malloc(attn_sinks_size * sizeof(__hip_bfloat16));
+        convert_float_array_to_bfloat16(w->attn_sinks, h_attn_sinks_bf16, attn_sinks_size);
+        HIP_CHECK(hipMemcpy(gpu_weights->attn_sinks, h_attn_sinks_bf16,
+                            attn_sinks_size * sizeof(__hip_bfloat16), hipMemcpyHostToDevice));
+        free(h_attn_sinks_bf16);
+    }
+
+    // MoE router → BF16
+    {
+        size_t w_router_size = (size_t)p->n_layers * p->hidden_dim * p->n_experts;
+        __hip_bfloat16 *h_w_router_bf16 = (__hip_bfloat16 *)malloc(w_router_size * sizeof(__hip_bfloat16));
+        convert_float_array_to_bfloat16(w->w_router, h_w_router_bf16, w_router_size);
+        HIP_CHECK(hipMemcpy(gpu_weights->w_router, h_w_router_bf16,
+                            w_router_size * sizeof(__hip_bfloat16), hipMemcpyHostToDevice));
+        free(h_w_router_bf16);
+
+        size_t b_router_size = (size_t)p->n_layers * p->n_experts;
+        __hip_bfloat16 *h_b_router_bf16 = (__hip_bfloat16 *)malloc(b_router_size * sizeof(__hip_bfloat16));
+        convert_float_array_to_bfloat16(w->b_router, h_b_router_bf16, b_router_size);
+        HIP_CHECK(hipMemcpy(gpu_weights->b_router, h_b_router_bf16,
+                            b_router_size * sizeof(__hip_bfloat16), hipMemcpyHostToDevice));
+        free(h_b_router_bf16);
+    }
+
+    // MoE MLPs → BF16
     {
         size_t mlp1_size = (size_t)p->n_layers * p->n_experts * (2 * p->intermediate_dim) * p->hidden_dim;
         __hip_bfloat16 *h_mlp1_bf16 = (__hip_bfloat16 *)malloc(mlp1_size * sizeof(__hip_bfloat16));
         convert_float_array_to_bfloat16(w->w_mlp1, h_mlp1_bf16, mlp1_size);
-        HIP_CHECK(hipMemcpy(gpu_weights->w_mlp1, h_mlp1_bf16, mlp1_size * sizeof(__hip_bfloat16), hipMemcpyHostToDevice));
+        HIP_CHECK(hipMemcpy(gpu_weights->w_mlp1, h_mlp1_bf16,
+                            mlp1_size * sizeof(__hip_bfloat16), hipMemcpyHostToDevice));
         free(h_mlp1_bf16);
-    }
-    {
+
         size_t b_mlp1_size = (size_t)p->n_layers * p->n_experts * (2 * p->intermediate_dim);
         __hip_bfloat16 *h_b_mlp1_bf16 = (__hip_bfloat16 *)malloc(b_mlp1_size * sizeof(__hip_bfloat16));
         convert_float_array_to_bfloat16(w->b_mlp1, h_b_mlp1_bf16, b_mlp1_size);
-        HIP_CHECK(hipMemcpy(gpu_weights->b_mlp1, h_b_mlp1_bf16, b_mlp1_size * sizeof(__hip_bfloat16), hipMemcpyHostToDevice));
+        HIP_CHECK(hipMemcpy(gpu_weights->b_mlp1, h_b_mlp1_bf16,
+                            b_mlp1_size * sizeof(__hip_bfloat16), hipMemcpyHostToDevice));
         free(h_b_mlp1_bf16);
     }
-
-    // BF16 MLP2
     {
         size_t mlp2_size = (size_t)p->n_layers * p->n_experts * p->hidden_dim * p->intermediate_dim;
         __hip_bfloat16 *h_mlp2_bf16 = (__hip_bfloat16 *)malloc(mlp2_size * sizeof(__hip_bfloat16));
         convert_float_array_to_bfloat16(w->w_mlp2, h_mlp2_bf16, mlp2_size);
-        HIP_CHECK(hipMemcpy(gpu_weights->w_mlp2, h_mlp2_bf16, mlp2_size * sizeof(__hip_bfloat16), hipMemcpyHostToDevice));
+        HIP_CHECK(hipMemcpy(gpu_weights->w_mlp2, h_mlp2_bf16,
+                            mlp2_size * sizeof(__hip_bfloat16), hipMemcpyHostToDevice));
         free(h_mlp2_bf16);
-    }
-    {
+
         size_t b_mlp2_size = (size_t)p->n_layers * p->n_experts * p->hidden_dim;
         __hip_bfloat16 *h_b_mlp2_bf16 = (__hip_bfloat16 *)malloc(b_mlp2_size * sizeof(__hip_bfloat16));
         convert_float_array_to_bfloat16(w->b_mlp2, h_b_mlp2_bf16, b_mlp2_size);
-        HIP_CHECK(hipMemcpy(gpu_weights->b_mlp2, h_b_mlp2_bf16, b_mlp2_size * sizeof(__hip_bfloat16), hipMemcpyHostToDevice));
+        HIP_CHECK(hipMemcpy(gpu_weights->b_mlp2, h_b_mlp2_bf16,
+                            b_mlp2_size * sizeof(__hip_bfloat16), hipMemcpyHostToDevice));
         free(h_b_mlp2_bf16);
     }
 
-    // Convert and copy output weights
-    size_t out_size = p->hidden_dim * p->vocab_size;
-    HIP_CHECK(hipMemcpy(gpu_weights->out, w->out, out_size * sizeof(float), hipMemcpyHostToDevice));
+    // ---------------- Output (lm head): copy then transpose IN-PLACE to [hidden_dim, vocab_size] ----------------
+    {
+        const int K = p->hidden_dim;     // input dim to lm head
+        const int N = p->vocab_size;     // output classes
 
-    transpose_inplace_gpu(gpu_weights->out, p->vocab_size, p->hidden_dim);
+        const size_t elems = (size_t)K * N;
+        const size_t bytes = elems * sizeof(float);
 
-    printf("Weight conversion and copying completed successfully\n");
+        // Copy host → device as-is ([N, K] row-major)
+        HIP_CHECK(hipMemcpy(gpu_weights->out, w->out,
+                            bytes, hipMemcpyHostToDevice));
+
+        // Transpose to [K, N] row-major IN-PLACE via temp
+        float *d_tmp_out = nullptr;
+        HIP_CHECK(hipMalloc(&d_tmp_out, bytes));
+
+        dim3 block(TILE_DIM, BLOCK_ROWS);
+        dim3 grid((K + TILE_DIM - 1) / TILE_DIM, (N + TILE_DIM - 1) / TILE_DIM);
+
+        transpose_tiled_kernel<<<grid, block>>>(gpu_weights->out, d_tmp_out, /*rows=*/N, /*cols=*/K);
+        HIP_CHECK(hipGetLastError());
+
+        HIP_CHECK(hipMemcpy(gpu_weights->out, d_tmp_out, bytes, hipMemcpyDeviceToDevice));
+        HIP_CHECK(hipFree(d_tmp_out));
+        HIP_CHECK(hipDeviceSynchronize());
+        // NOTE: gpu_weights->out is now [hidden_dim, vocab_size] row-major.
+    }
+
+    printf("Weights copied. w_qkv and out are transposed in-place on GPU ([K,N] layout).\n");
 }
+
+
 
 void malloc_cpu_buffers(CPUBuffers *cpu_buf, Config *p)
 {
@@ -1005,14 +1080,30 @@ void moe_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size)
    // 3) Build m-tile prefix -> D2D
    std::vector<int> h_mtiles(E+1, 0);
    for (int e = 0; e < E; ++e) {
-     int mtiles = (cpu_buf->expert_counts[e] + BLOCK_M - 1) / BLOCK_M;
+     int mtiles = (cpu_buf->expert_counts[e] + BLOCK_M_MLP - 1) / BLOCK_M_MLP;
      h_mtiles[e+1] = h_mtiles[e] + mtiles;
    }
    const int total_mtiles = h_mtiles[E];
 
-   int *d_mtile_prefix = nullptr;
-   HIP_CHECK(hipMalloc((void**)&d_mtile_prefix, (E+1) * sizeof(int)));
-   HIP_CHECK(hipMemcpy(d_mtile_prefix, h_mtiles.data(), (E+1)*sizeof(int), hipMemcpyHostToDevice));
+   // Build dense maps: for each global m-tile id -> (expert id, local tile id in that expert)
+std::vector<int> h_tile2expert(total_mtiles);
+std::vector<int> h_tile2local(total_mtiles);
+for (int e = 0; e < E; ++e) {
+    const int first = h_mtiles[e];
+    const int last  = h_mtiles[e+1];
+    for (int m = first; m < last; ++m) {
+        h_tile2expert[m] = e;
+        h_tile2local[m]  = m - first; // local tile index within expert e
+    }
+}
+
+int *d_tile2expert = nullptr, *d_tile2local = nullptr;
+HIP_CHECK(hipMalloc((void**)&d_tile2expert, total_mtiles * sizeof(int)));
+HIP_CHECK(hipMalloc((void**)&d_tile2local,  total_mtiles * sizeof(int)));
+HIP_CHECK(hipMemcpy(d_tile2expert, h_tile2expert.data(),
+                    total_mtiles * sizeof(int), hipMemcpyHostToDevice));
+HIP_CHECK(hipMemcpy(d_tile2local,  h_tile2local.data(),
+                    total_mtiles * sizeof(int), hipMemcpyHostToDevice));
 
 
   HIP_CHECK(hipMemset(s->e_agg, 0, (size_t)batch_size * H * sizeof(float)));
@@ -1023,14 +1114,15 @@ void moe_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size)
      const size_t layer1_elem_off = (size_t)layer_idx * E * seg1_elems;
      const __hip_bfloat16* W1_layer = w->w_mlp1 + layer1_elem_off;
 
-     dim3 grid((2*D + BLOCK_N - 1) / BLOCK_N, total_mtiles);
-     dim3 block(LANE_PER_WAVE, WAVES_PER_BLOCK);
-     size_t shmem = (size_t)(2*BLOCK_M*BLOCK_K + 2*BLOCK_K*BLOCK_N) * sizeof(uint16_t);
+     dim3 grid((2*D + BLOCK_N_MLP - 1) / BLOCK_N_MLP, total_mtiles);
+     dim3 block(LANE_PER_WAVE, WAVES_PER_BLOCK_MLP);
+     size_t shmem = (size_t)(2*BLOCK_M_MLP*BLOCK_K + 2*BLOCK_K*BLOCK_N_MLP) * sizeof(uint16_t);
 
     hipLaunchKernelGGL(grouped_mlp1_bf16_kernel, grid, block, shmem, s0,
-       s->mlp1_out, s->expert_input_buffer, W1_layer,
-       s->d_expert_offsets, s->d_expert_counts, d_mtile_prefix, E,
-       H, 2*D);
+    s->mlp1_out, s->expert_input_buffer, W1_layer,
+    s->d_expert_offsets, s->d_expert_counts,
+    d_tile2expert, d_tile2local,            // NEW
+    E, H, 2*D);
      HIP_CHECK(hipGetLastError());
    }
 
@@ -1054,14 +1146,15 @@ void moe_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size)
      const __hip_bfloat16* W2_layer = w->w_mlp2 + layer2_elem_off;
      const __hip_bfloat16* b2_layer = w->b_mlp2 + (size_t)layer_idx * E * H;
 
-     dim3 grid((H + BLOCK_N - 1) / BLOCK_N, total_mtiles);
-     dim3 block(LANE_PER_WAVE, WAVES_PER_BLOCK);
-     size_t shmem = (size_t)(2*BLOCK_M*BLOCK_K + 2*BLOCK_K*BLOCK_N) * sizeof(uint16_t);
+     dim3 grid((H + BLOCK_N_MLP - 1) / BLOCK_N_MLP, total_mtiles);
+     dim3 block(LANE_PER_WAVE, WAVES_PER_BLOCK_MLP);
+     size_t shmem = (size_t)(2*BLOCK_M_MLP*BLOCK_K + 2*BLOCK_K*BLOCK_N_MLP) * sizeof(uint16_t);
 
     hipLaunchKernelGGL(grouped_mlp2_bf16_bias_kernel, grid, block, shmem, s0,
-       s->expert_output_buffer, s->gate_up, W2_layer, b2_layer,
-       s->d_expert_offsets, s->d_expert_counts, d_mtile_prefix, E,
-       D, H);
+    s->expert_output_buffer, s->gate_up, W2_layer, b2_layer,
+    s->d_expert_offsets, s->d_expert_counts,
+    d_tile2expert, d_tile2local,            // NEW
+    E, D, H);
      HIP_CHECK(hipGetLastError());
    }
 
@@ -1081,9 +1174,6 @@ void moe_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size)
        s->x, s->e_agg, 1.0f, batch_size, H);
      HIP_CHECK(hipGetLastError());
    }
-
-  // HIP_CHECK(hipStreamSynchronize(s0));
-   HIP_CHECK(hipFree(d_mtile_prefix));
 
 }
 

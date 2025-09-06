@@ -129,7 +129,7 @@ void test_basic_correctness() {
     
     // Compute reference on CPU (with B_transposed=true since weights are stored transposed)
     printf("Computing reference on CPU...\n");
-    reference_matmul_cpu(h_C_cpu, h_A, h_B, M, K, N, true);
+    reference_matmul_cpu(h_C_cpu, h_A, h_B, M, K, N, false);
     
     // Compare results
     float max_error = compute_relative_error(h_C_gpu, h_C_cpu, M * N);
@@ -215,7 +215,7 @@ void test_qkv_projection() {
     // CPU reference (only validate subset for speed)
     printf("Validating subset of results...\n");
     const int validate_rows = std::min(4, batch_size);
-    reference_matmul_cpu(h_output_cpu, h_input, h_weight, validate_rows, hidden_dim, output_dim, true);  // B_transposed=true
+    reference_matmul_cpu(h_output_cpu, h_input, h_weight, validate_rows, hidden_dim, output_dim, false);  // B_transposed=true
     
     float max_error = compute_relative_error(h_output_gpu, h_output_cpu, validate_rows * output_dim);
     
@@ -384,7 +384,7 @@ int main(int argc, char** argv) {
     printf("Compute capability: %d.%d\n", prop.major, prop.minor);
     
     // Run all tests
-    // test_basic_correctness();
+    test_basic_correctness();
     test_qkv_projection();
     // test_edge_cases();
     // test_numerical_stability();
