@@ -114,3 +114,33 @@ __global__ void copy_embeddings_kernel_with_active(float *output, const float *e
     float embedding_fp32 = (embeddings[token * hidden_dim + dim_idx]);
     output[idx] = embedding_fp32;
 }
+
+
+// Zero-out the KV cache region for a single logical slot across all layers/positions.
+// Layout matches update_kv_cache_kernel's likely addressing:
+// (((layer * batch_size + slot) * max_seq_len) + pos) * kv_dim + d
+__global__ void clear_kv_cache_for_slot_kernel(
+    float* __restrict__ key_cache,
+    float* __restrict__ value_cache,
+    int batch_size,
+    int n_layers,
+    int max_seq_len,
+    int kv_dim,
+    int slot)
+{
+    int layer = blockIdx.x;     // [0, n_layers)
+    int pos   = blockIdx.y;     // [0, max_seq_len)
+    int tid   = threadIdx.x;
+
+    // Sanity guards (cheap, avoids accidental OOB if launched oddly)
+    if (layer >= n_layers || pos >= max_seq_len || slot >= batch_size) return;
+
+    const size_t base = ( ( (size_t)layer * batch_size + (size_t)slot ) * max_seq_len + (size_t)pos ) * (size_t)kv_dim;
+
+    // Stride over kv_dim
+    for (int d = tid; d < kv_dim; d += blockDim.x) {
+        key_cache  [base + d] = 0.0f;
+        value_cache[base + d] = 0.0f;
+    }
+}
+

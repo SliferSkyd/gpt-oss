@@ -323,11 +323,6 @@ void malloc_gpu_weights(GPUTransformerWeights *w, Config *p)
     HIP_CHECK(hipMalloc((void **)&w->attn_sinks, p->n_layers * p->n_attn_heads * sizeof(__hip_bfloat16)));
 }
 
-#ifndef KEEP_ORIGINAL_QKV
-// If set to 0, we free gpu_weights->w_qkv after transposing to save memory.
-#define KEEP_ORIGINAL_QKV 0
-#endif
-
 void copy_weights_to_gpu(Transformer *transformer, GPUTransformerWeights *gpu_weights)
 {
     Config *p = &transformer->config;
@@ -1076,6 +1071,43 @@ HIP_CHECK(hipMemcpy(d_tile2local,  h_tile2local.data(),
 
 }
 
+
+
+// Replace previous clear_kv_cache_for_slot_kernel + wrapper with this version.
+// It uses hipMemset per layer to zero the entire [max_seq_len x kv_dim] slice
+// for the specified physical slot. No device kernels, no grid limits.
+
+static inline void clear_kv_cache_for_slot(GPURunState* s, const Config* p, int slot)
+{
+    // Guard: invalid slot -> nothing to do
+    if (slot < 0 || slot >= BATCH_SIZE) return;
+
+    const int kv_dim = p->head_dim * p->n_kv_heads;
+
+    // We assume key/value cache elements are 4-byte floats. If your KV cache
+    // is stored as bf16/half in this build, change elem_bytes to 2.
+    const size_t elem_bytes = sizeof(float);
+
+    const size_t bytes_per_pos        = (size_t)kv_dim * elem_bytes;
+    const size_t bytes_per_layer_slot = (size_t)MAX_SEQ_LEN * bytes_per_pos;
+
+    for (int layer = 0; layer < p->n_layers; ++layer) {
+        // Base element index for (layer, slot, pos=0, d=0)
+        const size_t base_elem =
+            (((size_t)layer * (size_t)BATCH_SIZE + (size_t)slot) *
+              (size_t)MAX_SEQ_LEN) * (size_t)kv_dim;
+
+        // Compute byte pointers
+        void* k_ptr = (void*)((char*)s->key_cache   + base_elem * elem_bytes);
+        void* v_ptr = (void*)((char*)s->value_cache + base_elem * elem_bytes);
+
+        // Zero the contiguous [MAX_SEQ_LEN * kv_dim] region for this (layer,slot)
+        HIP_CHECK(hipMemset(k_ptr, 0, bytes_per_layer_slot));
+        HIP_CHECK(hipMemset(v_ptr, 0, bytes_per_layer_slot));
+    }
+}
+
+
 int *forward_batch_gpu(GPUTransformer *gpu_t, int *tokens, int batch_size)
 {
     Config *p = &gpu_t->config;
@@ -1083,67 +1115,77 @@ int *forward_batch_gpu(GPUTransformer *gpu_t, int *tokens, int batch_size)
     GPUTransformerWeights *w = &gpu_t->weights;
     CPUBuffers *cpu_buf = &gpu_t->cpu_buffers;
 
-    int hidden_dim = p->hidden_dim;
+    const int hidden_dim = p->hidden_dim;
 
-    // Copy tokens to GPU
+    // Defensive: if batch_size is 0, nothing to do.
+    if (batch_size <= 0) return cpu_buf->current_tokens;
+
+    // Copy tokens & positions for exactly 'batch_size' rows.
     HIP_CHECK(hipMemcpy(s->current_tokens, tokens, batch_size * sizeof(int), hipMemcpyHostToDevice));
-    HIP_CHECK(hipMemcpy(s->positions, cpu_buf->positions, batch_size * sizeof(int), hipMemcpyHostToDevice));
+    HIP_CHECK(hipMemcpy(s->positions,     cpu_buf->positions, batch_size * sizeof(int), hipMemcpyHostToDevice));
 
-    // Copy token embeddings
-    dim3 embed_grid((batch_size * hidden_dim + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK);
+    // Embedding lookup into s->x
     {
-        // TIMER_BLOCK("copy_embeddings_kernel");
+        dim3 embed_grid((batch_size * hidden_dim + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK);
         copy_embeddings_kernel<<<embed_grid, THREADS_PER_BLOCK>>>(
-            s->x, w->token_embedding_table, s->current_tokens, batch_size, hidden_dim);
-        HIP_CHECK(hipGetLastError());
+            s->x, w->token_embedding_table, s->current_tokens, batch_size, hidden_dim
+        );
+     HIP_CHECK(hipGetLastError());
     }
-    // Forward through all layers - UNCOMMENTED: All layers now enabled
-    for (int l = 0; l < p->n_layers; l++)
-    {
+
+    // All transformer layers
+    for (int l = 0; l < p->n_layers; l++) {
         attention_gpu(gpu_t, l, batch_size);
         moe_gpu(gpu_t, l, batch_size);
     }
-    // Final RMSNorm - UNCOMMENTED: Now enabled with GPU weight pointer
-    dim3 final_norm_grid(batch_size);
-    dim3 final_norm_block(THREADS_PER_BLOCK);
+
+    // Final RMSNorm
     {
-        // TIMER_BLOCK("rmsnorm_kernel");
+        dim3 final_norm_grid(batch_size);
+        dim3 final_norm_block(THREADS_PER_BLOCK);
         rmsnorm_kernel<<<final_norm_grid, final_norm_block>>>(
-            s->x, s->x, w->rms_out_w, batch_size, hidden_dim);
+            s->x, s->x, w->rms_out_w, batch_size, hidden_dim
+        );
         HIP_CHECK(hipGetLastError());
     }
 
-    dim3 block_dim(32, 32); // A 2D block, e.g., 32x32 = 1024 threads.
-    dim3 grid_dim;
-    grid_dim.x = batch_size;
-    grid_dim.y = (p->vocab_size + block_dim.y - 1) / block_dim.y; // Ceiling division
-
+    // Output projection -> logits
     {
-        // Launch the simple kernel
-        matmul_mc(
-            s->logits, s->x, w->out, batch_size, hidden_dim, p->vocab_size);
+        // matmul_mc computes [batch, hidden] x [hidden, vocab] -> [batch, vocab]
+        matmul_mc(s->logits, s->x, w->out, batch_size, hidden_dim, p->vocab_size);
+        HIP_CHECK(hipGetLastError());
     }
 
+    // Greedy argmax sampling into s->current_tokens
     {
-        // TIMER_BLOCK("sample_argmax");
         sample_argmax(s->logits, s->current_tokens, batch_size, p->vocab_size);
+        HIP_CHECK(hipGetLastError());
     }
-    // Copy logits back to CPU (you might want to keep this on GPU for sampling)
+
+    // Copy the next tokens back to host (only the active 'batch_size' rows)
     HIP_CHECK(hipMemcpy(cpu_buf->current_tokens, s->current_tokens, batch_size * sizeof(int), hipMemcpyDeviceToHost));
-    ++tokenId;
-    return cpu_buf->current_tokens; 
+
+    ++tokenId; // harmless counter; not used for sampling
+
+    return cpu_buf->current_tokens;
 }
+
 
 long long continuous_batching_inference(Tokenizer *tokenizer,
                                         Sampler *sampler, Requests *requests)
 {
     long long total_tokens_generated = 0;
+
+    // We'll treat token 1 as a safe BOS; consistent with encode() usage above.
+    const int BOS_TOKEN_ID = 1;
+
     int total_requests = requests->num_reqs;
+
     #pragma omp parallel num_threads(num_gpus) reduction(+:total_tokens_generated)
     {
         int gpu_id = omp_get_thread_num();
         HIP_CHECK(hipSetDevice(gpu_id));
-        
+
         GPUTransformer *gpu_t = gpu_transformers[gpu_id];
 
         int requests_per_gpu = requests->num_reqs / num_gpus;
@@ -1151,198 +1193,189 @@ long long continuous_batching_inference(Tokenizer *tokenizer,
 
         int local_request = requests_per_gpu + (gpu_id < extra ? 1 : 0);
         int start_request = gpu_id * requests_per_gpu + (gpu_id < extra ? gpu_id : extra);
-        int end_request = start_request + local_request;
+        int end_request   = start_request + local_request;
 
-        Config *p = &gpu_t->config;
+        Config     *p       = &gpu_t->config;
         CPUBuffers *cpu_buf = &gpu_t->cpu_buffers;
-        GPURunState *state = &gpu_t->state;
+        GPURunState *state  = &gpu_t->state;
 
-        // Initialize
+        // Initialize host slot bookkeeping
         cpu_buf->next_request_idx = start_request;
 
-        // Initialize all slots to inactive
-        for (int slot = 0; slot < BATCH_SIZE; slot++)
-        {
-            cpu_buf->slot_active_cpu[slot] = false;
-            cpu_buf->request_mapping_cpu[slot] = -1;
-            cpu_buf->seq_lengths_cpu[slot] = 0;
-            cpu_buf->positions[slot] = 0;
-            cpu_buf->finished[slot] = true;
+        for (int slot = 0; slot < BATCH_SIZE; slot++) {
+            cpu_buf->slot_active_cpu[slot]   = false;
+            cpu_buf->request_mapping_cpu[slot]= -1;
+            cpu_buf->seq_lengths_cpu[slot]   = 0;
+            cpu_buf->positions[slot]         = 0;
+            cpu_buf->finished[slot]          = true;
+            cpu_buf->current_tokens[slot]    = BOS_TOKEN_ID; // <- safe init (fixes bug #1)
         }
 
-        // Fill initial batch with first requests
-        for (int slot = 0; slot < BATCH_SIZE && cpu_buf->next_request_idx < end_request; slot++)
-        {
+        // Fill initial batch
+        for (int slot = 0; slot < BATCH_SIZE && cpu_buf->next_request_idx < end_request; slot++) {
             int req_idx = cpu_buf->next_request_idx++;
             const char *input_seq = get_str_req_ptr(requests, req_idx);
 
-            // Encode prompt
-            encode(tokenizer, input_seq, -1, -1, cpu_buf->prompt_tokens[slot],
-                &cpu_buf->prompt_lens[slot], p->initial_context_length);
+            // Encode the prompt
+            encode(tokenizer, input_seq, -1, -1,
+                   cpu_buf->prompt_tokens[slot],
+                   &cpu_buf->prompt_lens[slot],
+                   p->initial_context_length);
 
-            if (cpu_buf->prompt_lens[slot] < 1)
-            {
+            if (cpu_buf->prompt_lens[slot] < 1) {
                 fprintf(stderr, "Error: prompt too short for request %d\n", req_idx);
-                cpu_buf->prompt_lens[slot] = 1;
-                cpu_buf->prompt_tokens[slot][0] = 1; // BOS token
+                cpu_buf->prompt_lens[slot]   = 1;
+                cpu_buf->prompt_tokens[slot][0] = BOS_TOKEN_ID;
             }
 
-            // Initialize slot
             cpu_buf->request_mapping_cpu[slot] = req_idx;
-            cpu_buf->slot_active_cpu[slot] = true;
-            cpu_buf->seq_lengths_cpu[slot] = 0;
-            cpu_buf->positions[slot] = 0;
-            cpu_buf->finished[slot] = false;
-            cpu_buf->current_tokens[slot] = cpu_buf->prompt_tokens[slot][0];
+            cpu_buf->slot_active_cpu[slot]     = true;
+            cpu_buf->seq_lengths_cpu[slot]     = 0;
+            cpu_buf->positions[slot]           = 0;
+            cpu_buf->finished[slot]            = false;
+            cpu_buf->current_tokens[slot]      = cpu_buf->prompt_tokens[slot][0];
         }
 
-        // Copy initial state to GPU
-        HIP_CHECK(hipMemcpy(state->slot_active, cpu_buf->slot_active_cpu,
-                            BATCH_SIZE * sizeof(bool), hipMemcpyHostToDevice));
-        HIP_CHECK(hipMemcpy(state->request_mapping, cpu_buf->request_mapping_cpu,
-                            BATCH_SIZE * sizeof(int), hipMemcpyHostToDevice));
-        HIP_CHECK(hipMemcpy(state->seq_lengths, cpu_buf->seq_lengths_cpu,
-                            BATCH_SIZE * sizeof(int), hipMemcpyHostToDevice));
+        // Push initial slot metadata to device
+        HIP_CHECK(hipMemcpy(state->slot_active,     cpu_buf->slot_active_cpu,  BATCH_SIZE * sizeof(bool), hipMemcpyHostToDevice));
+        HIP_CHECK(hipMemcpy(state->request_mapping, cpu_buf->request_mapping_cpu, BATCH_SIZE * sizeof(int),  hipMemcpyHostToDevice));
+        HIP_CHECK(hipMemcpy(state->seq_lengths,     cpu_buf->seq_lengths_cpu,  BATCH_SIZE * sizeof(int),  hipMemcpyHostToDevice));
+        HIP_CHECK(hipMemcpy(state->positions,       cpu_buf->positions,        BATCH_SIZE * sizeof(int),  hipMemcpyHostToDevice));
 
         // Main generation loop
-        int max_steps = requests->max_seq_len;
-        bool has_active_slots = true;
+        const int max_steps = requests->max_seq_len;
 
-        while (has_active_slots)
+        while (true)
         {
-            // Forward pass on all slots (inactive ones will be skipped internally)
+            // Quick scan: any active slots left?
+            bool any_active = false;
+            for (int slot = 0; slot < BATCH_SIZE; ++slot) {
+                if (cpu_buf->slot_active_cpu[slot]) { any_active = true; break; }
+            }
+            if (!any_active) break; // <- avoids calling kernels with 0 active (fixes bug #1)
+
+            // Ensure inactive rows contain safe values so device reads are always valid
+            for (int slot = 0; slot < BATCH_SIZE; ++slot) {
+                if (!cpu_buf->slot_active_cpu[slot]) {
+                    cpu_buf->positions[slot]      = 0;
+                    cpu_buf->current_tokens[slot] = BOS_TOKEN_ID;
+                }
+            }
+
+            // One forward step for the fixed physical batch [0..BATCH_SIZE)
             int *next_tokens = forward_batch_gpu(gpu_t, cpu_buf->current_tokens, BATCH_SIZE);
 
-            // Process each slot
-            has_active_slots = false;
-            for (int slot = 0; slot < BATCH_SIZE; slot++)
-            {
-                if (!cpu_buf->slot_active_cpu[slot])
-                    continue;
+            // Process results, advance positions, and handle completions/assignments
+            for (int slot = 0; slot < BATCH_SIZE; slot++) {
+                if (!cpu_buf->slot_active_cpu[slot]) continue;
 
-                has_active_slots = true;
                 int req_idx = cpu_buf->request_mapping_cpu[slot];
-                int pos = cpu_buf->positions[slot];
+                int pos     = cpu_buf->positions[slot];
 
-                int next_token;
-                // Advance position first
+                // Advance physical position
                 pos++;
 
-                if (pos < cpu_buf->prompt_lens[slot])
-                {
-                    // Still processing prompt - force next prompt token
+                int next_token;
+                if (pos < cpu_buf->prompt_lens[slot]) {
+                    // Still consuming prompt -> teacher forcing
                     next_token = cpu_buf->prompt_tokens[slot][pos];
-                }
-                else
-                {
-                    // Generate new token
+                } else {
+                    // Use model prediction
                     next_token = next_tokens[slot];
-
-                    // Save generated token
-                    int *output_tokens = get_tok_gen_ptr(requests, req_idx);
-                    int gen_pos = pos - cpu_buf->prompt_lens[slot];
-                    if (gen_pos >= 0 && gen_pos < requests->max_seq_len)
-                    {
-                        output_tokens[gen_pos] = next_token;
+                    // Record generated token
+                    int *out = get_tok_gen_ptr(requests, req_idx);
+                    const int gen_pos = pos - cpu_buf->prompt_lens[slot];
+                    if (gen_pos >= 0 && gen_pos < requests->max_seq_len) {
+                        out[gen_pos] = next_token;
                         total_tokens_generated++;
                     }
                 }
 
-                // Check for completion
-                bool completed = (next_token == 199999 || next_token == 200002 ||
-                                pos >= max_steps - 1 || pos >= MAX_SEQ_LEN - 2);
+                // Completion conditions (EOS or length/seq cap)
+                const bool completed =
+                    (next_token == 199999 || next_token == 200002 ||
+                     pos >= max_steps - 1 || pos >= MAX_SEQ_LEN - 2);
 
-                if (completed)
-                {
-                    // fprintf(stderr, "Request %d completed at position %d with token %d\n", req_idx, pos, next_token);
-                    // Mark end of generation
-                    int *output_tokens = get_tok_gen_ptr(requests, req_idx);
-                    int gen_pos = pos - cpu_buf->prompt_lens[slot] + 1;
-                    if (gen_pos >= 0 && gen_pos < requests->max_seq_len)
-                    {
-                        output_tokens[gen_pos] = -1; // End marker
+                if (completed) {
+                    // mark end for this request
+                    int *out = get_tok_gen_ptr(requests, req_idx);
+                    const int gen_pos = pos - cpu_buf->prompt_lens[slot] + 1;
+                    if (gen_pos >= 0 && gen_pos < requests->max_seq_len) {
+                        out[gen_pos] = -1;
                     }
 
-                    // Try to assign a new request to this slot
-                    if (cpu_buf->next_request_idx < end_request)
-                    {
-                        // Get next request
+                    // Try to reuse this physical slot for a new request
+                    if (cpu_buf->next_request_idx < end_request) {
+                        // *** Deterministic reset of KV for this slot (fixes bug #2) ***
+                        clear_kv_cache_for_slot(&gpu_t->state, &gpu_t->config, slot);
+
+                        // Prepare next request
                         req_idx = cpu_buf->next_request_idx++;
                         const char *input_seq = get_str_req_ptr(requests, req_idx);
 
-                        // Encode prompt
-                        encode(tokenizer, input_seq, -1, -1, cpu_buf->prompt_tokens[slot],
-                            &cpu_buf->prompt_lens[slot], p->initial_context_length);
+                        encode(tokenizer, input_seq, -1, -1,
+                               cpu_buf->prompt_tokens[slot],
+                               &cpu_buf->prompt_lens[slot],
+                               p->initial_context_length);
 
-                        if (cpu_buf->prompt_lens[slot] < 1)
-                        {
+                        if (cpu_buf->prompt_lens[slot] < 1) {
                             fprintf(stderr, "Error: prompt too short for request %d\n", req_idx);
-                            cpu_buf->prompt_lens[slot] = 1;
-                            cpu_buf->prompt_tokens[slot][0] = 1; // BOS token
+                            cpu_buf->prompt_lens[slot]   = 1;
+                            cpu_buf->prompt_tokens[slot][0] = BOS_TOKEN_ID;
                         }
 
-                        // Reinitialize slot with new request
+                        // Reset per-slot CPU state
                         cpu_buf->request_mapping_cpu[slot] = req_idx;
-                        cpu_buf->positions[slot] = 0;
-                        cpu_buf->seq_lengths_cpu[slot] = 0;
-                        cpu_buf->current_tokens[slot] = cpu_buf->prompt_tokens[slot][0];
-                        // Slot remains active
+                        cpu_buf->positions[slot]           = 0;
+                        cpu_buf->seq_lengths_cpu[slot]     = 0;
+                        cpu_buf->finished[slot]            = false;
+                        cpu_buf->current_tokens[slot]      = cpu_buf->prompt_tokens[slot][0];
+                        // slot remains active
+                    } else {
+                        // No more work -> deactivate the slot and make it inert
+                        cpu_buf->slot_active_cpu[slot]   = false;
+                        cpu_buf->request_mapping_cpu[slot]= -1;
+                        cpu_buf->positions[slot]         = 0;
+                        cpu_buf->seq_lengths_cpu[slot]   = 0;
+                        cpu_buf->current_tokens[slot]    = BOS_TOKEN_ID; // safe filler
                     }
-                    else
-                    {
-                        // No more requests, deactivate slot
-                        cpu_buf->slot_active_cpu[slot] = false;
-                        cpu_buf->request_mapping_cpu[slot] = -1;
-                    }
-                }
-                else
-                {
-                    // Continue generation
-                    cpu_buf->positions[slot] = pos;
+                } else {
+                    // Continue generation for this slot
+                    cpu_buf->positions[slot]       = pos;
                     cpu_buf->seq_lengths_cpu[slot]++;
-                    cpu_buf->current_tokens[slot] = next_token;
+                    cpu_buf->current_tokens[slot]  = next_token;
                 }
             }
 
-            // Update GPU state for next iteration
-            HIP_CHECK(hipMemcpy(state->slot_active, cpu_buf->slot_active_cpu,
-                                BATCH_SIZE * sizeof(bool), hipMemcpyHostToDevice));
-            HIP_CHECK(hipMemcpy(state->seq_lengths, cpu_buf->seq_lengths_cpu,
-                                BATCH_SIZE * sizeof(int), hipMemcpyHostToDevice));
-            HIP_CHECK(hipMemcpy(state->positions, cpu_buf->positions,
-                                BATCH_SIZE * sizeof(int), hipMemcpyHostToDevice));
-        }
-    }
+            // Push updated per-slot state back to device for the next iteration
+            HIP_CHECK(hipMemcpy(state->slot_active, cpu_buf->slot_active_cpu,   BATCH_SIZE * sizeof(bool), hipMemcpyHostToDevice));
+            HIP_CHECK(hipMemcpy(state->seq_lengths, cpu_buf->seq_lengths_cpu,   BATCH_SIZE * sizeof(int),  hipMemcpyHostToDevice));
+            HIP_CHECK(hipMemcpy(state->positions,   cpu_buf->positions,         BATCH_SIZE * sizeof(int),  hipMemcpyHostToDevice));
+        } // while(true)
+    } // omp parallel
 
     int max_steps = gpu_transformers[0]->config.seq_len;
     Config *p = gpu_transformers[0] ? &gpu_transformers[0]->config : nullptr;
 
-    // Print results for all requests
-    for (int req_idx = 0; req_idx < requests->num_reqs; req_idx++)
-    {
+    // Print all results
+    for (int req_idx = 0; req_idx < requests->num_reqs; req_idx++) {
         const char *input_seq = get_str_req_ptr(requests, req_idx);
-        int *output_tokens = get_tok_gen_ptr(requests, req_idx);
+        int *output_tokens    = get_tok_gen_ptr(requests, req_idx);
 
-        // Print the original prompt string
         safe_printf(input_seq);
         printf("!");
 
-        // Find last token of prompt for context
+        // Decode pieces with prev-token context starting from last prompt token
         int prompt_len = strlen(input_seq);
         int *temp_tokens = (int *)malloc((MAX_SEQ_LEN + 3) * sizeof(int));
         int temp_len;
         encode(tokenizer, input_seq, -1, -1, temp_tokens, &temp_len, p->initial_context_length);
-        int last_prompt_token = temp_tokens[temp_len - 1];
+        int prev_token = temp_tokens[temp_len - 1];
         free(temp_tokens);
 
-        // Decode and print generated tokens
-        int prev_token = last_prompt_token;
-        for (int i = 0; i < max_steps; ++i)
-        {
+        for (int i = 0; i < max_steps; ++i) {
             int token = output_tokens[i];
-            if (token == -1)
-                break;
-
+            if (token == -1) break;
             const char *piece = decode_piece(tokenizer, prev_token, token);
             safe_printf(piece);
             prev_token = token;
@@ -1351,11 +1384,10 @@ long long continuous_batching_inference(Tokenizer *tokenizer,
     }
     fflush(stdout);
 
-
     write_profile_info();
-
     return total_tokens_generated;
 }
+
 
 long long inference(Transformer *transformer, Tokenizer *tokenizer,
                     Sampler *sampler, Requests *requests)
