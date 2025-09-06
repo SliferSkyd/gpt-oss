@@ -7,8 +7,6 @@
 #include "../memory/mxfp4.hpp"
 #include <hip/hip_fp16.h>
 #include <hip/hip_bfloat16.h>
-#include <stdint.h>
-#include "../utils.hpp"
 
 // ===== Tunables (same defaults you had) =====
 #ifndef WM
@@ -36,12 +34,6 @@ constexpr int BLOCK_K = WK;                  // 16
 constexpr int LANE_PER_WAVE = 64;
 constexpr int WAVES_PER_BLOCK = WAVES_M * WAVES_N;
 
-// ===== Optional fast-path toggles =====
-// If B is already BF16 in HBM, define this to avoid FP32->BF16 converts:
-// #define B_IN_HBM_IS_BF16 1
-// If B pointer is 16B-aligned and N % 8 == 0, enable vectorized BF16 loads:
-// #define VECTORIZED_B_LOAD 1
-
 // ===== Small vector helpers (types that match MFMA signatures) =====
 using f32x4  = float __attribute__((ext_vector_type(4)));
 using bf16x4 = unsigned short __attribute__((ext_vector_type(4))); // 4×i16 carrying BF16 bit patterns
@@ -52,11 +44,16 @@ __device__ inline uint16_t f32_to_bf16_bits(float x) {
     return *reinterpret_cast<uint16_t*>(&t);
 }
 
+__device__ inline uint16_t hipbf16_to_bits(__hip_bfloat16 x) {
+    return *reinterpret_cast<uint16_t*>(&x);
+}
+
 // ===== MFMA wrapper (gfx90a supports BF16->F32 accumulate) =====
 // d = a*b + c, one 16x16x16 bf16 MMA per wave (returns 4 accumulators / lane)
 __device__ inline f32x4 mfma_16x16x16_bf16(bf16x4 a_vec, bf16x4 b_vec, f32x4 c_vec) {
     // cbsz, abid, blgp must be immediates
     return __builtin_amdgcn_mfma_f32_16x16x16bf16_1k(a_vec, b_vec, c_vec, 0, 0, 0);
+    // Syntax & wavefront-wide semantics: AMD Lab Notes on Matrix Cores.  :contentReference[oaicite:4]{index=4}
 }
 
 // ===== Lane → (row/col-group) mapping helpers =====
@@ -79,28 +76,15 @@ __device__ inline bf16x4 make_a_vec(const uint16_t* __restrict__ sA,
     return v;
 }
 
-// B is stored in LDS column-major [BLOCK_K x BLOCK_N], BUT we swizzle rows at store-time
-// to avoid LDS bank conflicts; we undo it here during the read.
-__device__ inline bf16x4 make_b_vec_swizzled(const uint16_t* __restrict__ sB,
-                                             int ldB, int bColBase, int lane)
+// B is in LDS column-major [BLOCK_K x BLOCK_N] with ldB = BLOCK_K
+// Take column = (wave_n*WN) + lane_row (0..15), rows (grp*4 + i)
+__device__ inline bf16x4 make_b_vec(const uint16_t* __restrict__ sB,
+                                    int ldB, int bColBase, int lane)
 {
-    const int col = bColBase + lane_row(lane); // 0..15 within the 16x16 sub-tile handled by this wave
+    const int col = bColBase + lane_row(lane); // 0..15 within the 16x16 tile
     const int grp = lane_group(lane);          // 0..3
     bf16x4 v;
 #pragma unroll
-    for (int i = 0; i < 4; ++i) {
-        const int r     = grp * 4 + i;        // 0..15
-        const int r_sw  = r ^ (col & 0xF);    // undo the column-dependent XOR used on store
-        v[i] = sB[col * ldB + r_sw];
-    }
-    return v;
-}
-
-__device__ inline bf16x4 make_b_vec(const uint16_t* __restrict__ sB, int ldB, int bColBase, int lane) { 
-    const int col = bColBase + lane_row(lane); // 0..15 within the 16x16 tile
-    const int grp = lane_group(lane); // 0..3
-    bf16x4 v;
-    #pragma unroll
     for (int i = 0; i < 4; ++i) {
         // column-major addressing: index = col*ldB + row
         v[i] = sB[col * ldB + (grp * 4 + i)];
@@ -111,7 +95,7 @@ __device__ inline bf16x4 make_b_vec(const uint16_t* __restrict__ sB, int ldB, in
 // ===== Store 16x16 accum tile from per-lane f32x4 =====
 template<bool InteriorStore>
 __device__ inline void store_c_tile_mfma(
-    float* __restrict__ C, const f32x4& acc,
+float* __restrict__ C, const f32x4& acc,
     int M, int N, int m0, int n0, int wave_m, int wave_n, int lane)
 {
     const int rowBase = m0 + wave_m * WM + lane_group(lane) * 4; // 4 rows per group
@@ -128,11 +112,265 @@ __device__ inline void store_c_tile_mfma(
     }
 }
 
+
+// ===== Helpers (same style as your MLP path) =================================
+
+// Packs two fp32 into one u32 holding 2×bf16 (lo=bf16(a0), hi=bf16(a1))
+__device__ inline uint32_t pack2_bf16_bits_f32(float a0, float a1) {
+    const __hip_bfloat16 b0 = __float2bfloat16(a0);
+    const __hip_bfloat16 b1 = __float2bfloat16(a1);
+    return (uint32_t(hipbf16_to_bits(b1)) << 16) | uint32_t(hipbf16_to_bits(b0));
+}
+
+// Vectorized A load: read float2 (64b), convert to 2×bf16 in a single u32
+template<bool Aligned, int LD_A>
+__device__ inline void copy_A_tile_vec(uint32_t* __restrict__ dst_u32,
+                                       const float* __restrict__ A,
+                                       int m_start, int M_bound, int K, int kBase,
+                                       int linearT, int threadsPerBlock)
+{
+    constexpr int BM_ = BLOCK_M;
+    constexpr int BK_ = BLOCK_K;
+    const int pairsPerRow = BK_ >> 1;
+    const int totalPairs  = BM_ * pairsPerRow;
+
+    for (int t = linearT; t < totalPairs; t += threadsPerBlock) {
+        const int r  = t / pairsPerRow;
+        const int p  = t % pairsPerRow;
+        const int gm = m_start + r;
+        const int gk = kBase + (p << 1);
+
+        uint32_t val = 0u;
+        if (gm < M_bound && gk < K) {
+            const size_t base = (size_t)gm * K + gk;
+            if constexpr (Aligned) {
+                const float2 v = *reinterpret_cast<const float2*>(&A[base]);
+                val = pack2_bf16_bits_f32(v.x, v.y);
+            } else {
+                const float a0 = A[base];
+                const float a1 = (gk + 1 < K) ? A[base + 1] : 0.0f;
+                val = pack2_bf16_bits_f32(a0, a1);
+            }
+        }
+        // LD_A is in "bf16 elements"; >>1 because we write u32 (2×bf16)
+        reinterpret_cast<uint32_t*>(dst_u32 + ((size_t)r * LD_A >> 1))[p] = val;
+    }
+}
+
+// Vectorized B load: read uint4 (128b = 8×bf16) when aligned & K%8==0, else u32 pairs
+template<bool Use128b, int LD_B>
+__device__ inline void copy_B_tile_vec(uint32_t* __restrict__ dst_u32,
+                                       const __hip_bfloat16* __restrict__ W_e, // [N,K] row-major
+                                       int n0, int N, int K, int kBase,
+                                       int linearT, int threadsPerBlock)
+{
+    constexpr int BN_ = BLOCK_N;
+    constexpr int BK_ = BLOCK_K;
+
+    if constexpr (Use128b) {
+        const int quadPerCol = BK_ / 8;              // 8 bf16 per 128b
+        const int totalQuads = BN_ * quadPerCol;
+        for (int t = linearT; t < totalQuads; t += threadsPerBlock) {
+            const int c   = t / quadPerCol;          // column in this BN tile
+            const int q   = t % quadPerCol;          // which 8-elem chunk along K
+            const int gn  = n0 + c;
+            const int gk8 = kBase + (q << 3);
+
+            uint4 v = {0,0,0,0};
+            if (gn < N && (gk8 + 7) < K) {
+                const uint4* src = reinterpret_cast<const uint4*>(&W_e[(size_t)gn * K + gk8]);
+                v = *src; // 128b global load
+            } else {
+                __hip_bfloat16 tmp[8] = {};
+                for (int i=0;i<8 && (gk8+i)<K && gn<N;i++) tmp[i] = W_e[(size_t)gn*K + gk8 + i];
+                const uint32_t* p = reinterpret_cast<const uint32_t*>(tmp);
+                v = make_uint4(p[0],p[1],p[2],p[3]);
+            }
+            uint32_t* col = reinterpret_cast<uint32_t*>(dst_u32 + ((size_t)c * LD_B >> 1));
+            const int off = q << 2;                   // 4×u32 per 128b
+            col[off + 0] = v.x;
+            col[off + 1] = v.y;
+            col[off + 2] = v.z;
+            col[off + 3] = v.w;
+        }
+    } else {
+        const int pairsPerCol = BK_ >> 1;
+        const int totalPairs  = BN_ * pairsPerCol;
+        for (int t = linearT; t < totalPairs; t += threadsPerBlock) {
+            const int c  = t / pairsPerCol;
+            const int p  = t % pairsPerCol;
+            const int gn = n0 + c;
+            const int gk = kBase + (p << 1);
+            uint32_t val = 0u;
+            if (gn < N && gk < K) {
+                const size_t base = (size_t)gn * K + gk;
+                if (gk + 1 < K) val = *reinterpret_cast<const uint32_t*>(&W_e[base]);
+                else            val = uint32_t(hipbf16_to_bits(W_e[base]));
+            }
+            reinterpret_cast<uint32_t*>(dst_u32 + ((size_t)c * LD_B >> 1))[p] = val;
+        }
+    }
+}
+
+// ===== Optional tiny LDS padding to cut bank conflicts =====
+#ifndef PAD_K_MC
+#define PAD_K_MC 0   // try 2 or 8 if you observe LDS conflicts; must be even
+#endif
+static_assert((BLOCK_K % 2) == 0, "BLOCK_K must be even (packs 2×bf16).");
+static_assert((PAD_K_MC % 2) == 0, "PAD_K_MC must be even (u32 pair addressing).");
+
+// ===== FP32 × BF16 GEMM using MFMA (gfx90a) ==================================
+// A: float [M,K] (row-major)  → converted to bf16 in LDS
+// B: bf16  [N,K] (row-major)  → copied to LDS as column-major [K, BN]
+// C: float [M,N]
+__global__ __launch_bounds__(LANE_PER_WAVE * WAVES_PER_BLOCK, 2)
+void gemm_mfma_f32xbf16_kernel_opt(
+    float* __restrict__ C,
+    const float* __restrict__ A,
+    const __hip_bfloat16* __restrict__ Wbf16,
+    int M, int K, int N)
+{
+    const int m0 = blockIdx.y * BLOCK_M;
+    const int n0 = blockIdx.x * BLOCK_N;
+
+    const int lane   = threadIdx.x;               // 0..63
+    const int wave   = threadIdx.y;               // 0..(WAVES_PER_BLOCK-1)
+    const int wave_m = wave / WAVES_N;
+    const int wave_n = wave % WAVES_N;
+
+    // LDS ping–pong:
+    // sA0,sA1: [BLOCK_M x (BLOCK_K+pad)] row-major (bf16 bits)
+    // sB0,sB1: [(BLOCK_K+pad) x BLOCK_N] col-major (bf16 bits)
+    extern __shared__ uint8_t smemRaw[];
+    const int ldA = BLOCK_K + PAD_K_MC;          // leading dim in bf16 elems
+    const int ldB = BLOCK_K + PAD_K_MC;
+
+    uint16_t* sA0_u16 = reinterpret_cast<uint16_t*>(smemRaw);
+    uint16_t* sA1_u16 = sA0_u16 + (BLOCK_M * ldA);
+    uint16_t* sB0_u16 = sA1_u16 + (BLOCK_M * ldA);
+    uint16_t* sB1_u16 = sB0_u16 + (ldB * BLOCK_N);
+
+    uint32_t* sA0_u32 = reinterpret_cast<uint32_t*>(sA0_u16);
+    uint32_t* sA1_u32 = reinterpret_cast<uint32_t*>(sA1_u16);
+    uint32_t* sB0_u32 = reinterpret_cast<uint32_t*>(sB0_u16);
+    uint32_t* sB1_u32 = reinterpret_cast<uint32_t*>(sB1_u16);
+
+    f32x4 acc = {0.f, 0.f, 0.f, 0.f};
+
+    const int threadsPerBlock = blockDim.x * blockDim.y;
+    const int linearT         = wave * blockDim.x + lane;
+
+    const int M_bound = m0 + BLOCK_M;
+
+    // Alignment guards (decide paths once per block)
+    const bool alignedA  = (((uintptr_t)A     & 0x7)==0) && ((K & 1)==0); // 8B & even
+    const bool use128bW  = (((uintptr_t)Wbf16 & 0xF)==0) && ((K & 7)==0); // 16B & K%8==0
+
+    // Preload kBase = 0
+    if (alignedA) copy_A_tile_vec</*Aligned*/true,  /*LD_A=*/ldA>(sA0_u32, A, m0, M_bound, K, 0, linearT, threadsPerBlock);
+    else          copy_A_tile_vec</*Aligned*/false, /*LD_A=*/ldA>(sA0_u32, A, m0, M_bound, K, 0, linearT, threadsPerBlock);
+
+    if (use128bW) copy_B_tile_vec</*Use128b*/true,  /*LD_B=*/ldB>(sB0_u32, Wbf16, n0, N, K, 0, linearT, threadsPerBlock);
+    else          copy_B_tile_vec</*Use128b*/false, /*LD_B=*/ldB>(sB0_u32, Wbf16, n0, N, K, 0, linearT, threadsPerBlock);
+
+    __syncthreads();
+
+    // Ping–pong pointers
+    uint16_t* currA = sA0_u16; uint16_t* nextA = sA1_u16;
+    uint16_t* currB = sB0_u16; uint16_t* nextB = sB1_u16;
+    uint32_t* nextA32 = sA1_u32;
+    uint32_t* nextB32 = sB1_u32;
+
+    // Per-wave MFMA bases
+    const int aRowBase = wave_m * WM;
+    const int bColBase = wave_n * WN;
+
+    // Split K into main slabs of BLOCK_K and one possible tail
+    const int Kmain = (K / BLOCK_K) * BLOCK_K;
+    const bool has_tail = (Kmain < K);
+
+#pragma unroll 1
+    for (int k0 = 0; k0 < Kmain; k0 += BLOCK_K) {
+        const int kNext = k0 + BLOCK_K;
+
+        // Prefetch next main slab
+        if (kNext < Kmain) {
+            if (alignedA) copy_A_tile_vec</*Aligned*/true,  /*LD_A=*/ldA>(nextA32, A, m0, M_bound, K, kNext, linearT, threadsPerBlock);
+            else          copy_A_tile_vec</*Aligned*/false, /*LD_A=*/ldA>(nextA32, A, m0, M_bound, K, kNext, linearT, threadsPerBlock);
+
+            if (use128bW) copy_B_tile_vec</*Use128b*/true,  /*LD_B=*/ldB>(nextB32, Wbf16, n0, N, K, kNext, linearT, threadsPerBlock);
+            else          copy_B_tile_vec</*Use128b*/false, /*LD_B=*/ldB>(nextB32, Wbf16, n0, N, K, kNext, linearT, threadsPerBlock);
+        }
+
+        // Consume current tiles
+        {
+            bf16x4 avec = make_a_vec(currA, ldA, aRowBase, lane);
+            bf16x4 bvec = make_b_vec(currB, ldB, bColBase, lane);
+            acc = mfma_16x16x16_bf16(avec, bvec, acc);
+        }
+
+        __syncthreads();
+        if (kNext < Kmain) {
+            // swap
+            uint16_t* tA = currA; currA = nextA; nextA = tA;
+            uint16_t* tB = currB; currB = nextB; nextB = tB;
+            nextA32 = reinterpret_cast<uint32_t*>(nextA);
+            nextB32 = reinterpret_cast<uint32_t*>(nextB);
+        }
+    }
+
+    // Tail slab (0 < K - Kmain < BLOCK_K)
+    if (has_tail) {
+        if (alignedA) copy_A_tile_vec</*Aligned*/true,  /*LD_A=*/ldA>(nextA32, A, m0, M_bound, K, Kmain, linearT, threadsPerBlock);
+        else          copy_A_tile_vec</*Aligned*/false, /*LD_A=*/ldA>(nextA32, A, m0, M_bound, K, Kmain, linearT, threadsPerBlock);
+
+        if (use128bW) copy_B_tile_vec</*Use128b*/true,  /*LD_B=*/ldB>(nextB32, Wbf16, n0, N, K, Kmain, linearT, threadsPerBlock);
+        else          copy_B_tile_vec</*Use128b*/false, /*LD_B=*/ldB>(nextB32, Wbf16, n0, N, K, Kmain, linearT, threadsPerBlock);
+
+        __syncthreads();
+
+        bf16x4 avec = make_a_vec(nextA, ldA, aRowBase, lane);
+        bf16x4 bvec = make_b_vec(nextB, ldB, bColBase, lane);
+        acc = mfma_16x16x16_bf16(avec, bvec, acc);
+        __syncthreads();
+    }
+
+    // Stores
+    const bool interior = (m0 + BLOCK_M) <= M && (n0 + BLOCK_N) <= N;
+    if (interior) store_c_tile_mfma<true >(C, acc, M, N, m0, n0, wave_m, wave_n, lane);
+    else          store_c_tile_mfma<false>(C, acc, M, N, m0, n0, wave_m, wave_n, lane);
+}
+
+// ===== Host wrapper: FP32 × BF16 ==================================================
+inline void matmul_mc(
+    float* __restrict__ output,                    // [B, O]
+    const float* __restrict__ input,               // [B, I] (fp32)
+    const __hip_bfloat16* __restrict__ weight,     // [O, I] (bf16 row-major)
+    int batch_size, int input_dim, int output_dim,
+    hipStream_t stream = nullptr)
+{
+    const int M = batch_size, K = input_dim, N = output_dim;
+
+    dim3 grid((N + BLOCK_N - 1) / BLOCK_N,
+              (M + BLOCK_M - 1) / BLOCK_M);
+    dim3 block(LANE_PER_WAVE, WAVES_PER_BLOCK);
+
+    const int ldA = BLOCK_K + PAD_K_MC;
+    const int ldB = BLOCK_K + PAD_K_MC;
+    const size_t shmem_bytes =
+        sizeof(uint16_t) * (size_t)(2 * BLOCK_M * ldA + 2 * ldB * BLOCK_N);
+
+    hipLaunchKernelGGL(
+        gemm_mfma_f32xbf16_kernel_opt,
+        grid, block, shmem_bytes, stream,
+        output, input, weight, M, K, N);
+}
+
 // ===== BF16 kernel (A: FP32, B: BF16) =====
 __global__ void gemm_mfma_bf16_kernel_opt(
     float* __restrict__ C,                     // [M, N]
     const float* __restrict__ A,               // [M, K] FP32
-    const float* __restrict__ Wbf16,  // [N, K] row-major (weights)
+    const __hip_bfloat16* __restrict__ Wbf16,  // [N, K] row-major (weights)
     int M, int K, int N)
 {
     const int m0 = blockIdx.y * BLOCK_M;
@@ -174,8 +412,8 @@ __global__ void gemm_mfma_bf16_kernel_opt(
             const int r = idx % BLOCK_K;  // k inside this slice
             const int gn = n0 + c;
             const int gk = r;
-            float wb = (gk < K && gn < N) ? Wbf16[(size_t)gn * K + gk] : 0.0f;
-            sB0[c * BLOCK_K + r] = f32_to_bf16_bits(wb);
+            __hip_bfloat16 wb = (gk < K && gn < N) ? Wbf16[(size_t)gn * K + gk] : __float2bfloat16(0.0f);
+            sB0[c * BLOCK_K + r] = hipbf16_to_bits(wb);
         }
     }
     __syncthreads();
@@ -204,8 +442,8 @@ __global__ void gemm_mfma_bf16_kernel_opt(
                 const int r = idx % BLOCK_K;
                 const int gn = n0 + c;
                 const int gk = kBase + r;
-                float wb = (gk < K && gn < N) ? Wbf16[(size_t)gn * K + gk] : 0.0f;
-                nextB[c * BLOCK_K + r] = f32_to_bf16_bits(wb);
+                __hip_bfloat16 wb = (gk < K && gn < N) ? Wbf16[(size_t)gn * K + gk] : __float2bfloat16(0.0f);
+                nextB[c * BLOCK_K + r] = hipbf16_to_bits(wb);
             }
         }
 
@@ -233,12 +471,11 @@ __global__ void gemm_mfma_bf16_kernel_opt(
     }
 }
 
-
 // ===== Host wrappers (unchanged API) =====
-void matmul_mc(
+void matmul(
     float* __restrict__ output,                 // [B, O]
     const float* __restrict__ input,            // [B, I]
-    const float* __restrict__ weight,  // [O, I] bf16 row-major
+    const __hip_bfloat16* __restrict__ weight,  // [O, I] bf16 row-major
     int batch_size, int input_dim, int output_dim,
     hipStream_t stream = nullptr)
 {
@@ -255,386 +492,3 @@ void matmul_mc(
         grid, block, shmem_bytes, stream,
         output, input, weight, M, K, N);
 }
-
-// ===== Tile Tunables (FMA path) =====
-// Workgroup computes BM x BN tile of C
-#ifndef BM
-#define BM 32
-#endif
-#ifndef BN
-#define BN 64
-#endif
-#ifndef BK
-#define BK 64
-#endif
-// Per-thread micro-tile (TM x TN) -> BM/BN must be multiples of TM/TN * block dims
-#ifndef TM
-#define TM 2
-#endif
-#ifndef TN
-#define TN 4
-#endif
-
-// Threadblock shape (TX x TY) so that TX*TM = BN and TY*TM = BM when mapping below
-#ifndef TB_X
-#define TB_X 16  // along N
-#endif
-#ifndef TB_Y
-#define TB_Y 16  // along M
-#endif
-
-static_assert(BM % (TB_Y * TM) == 0 || (TB_Y * TM) == BM, "BM must be compatible with TB_Y and TM");
-static_assert(BN % (TB_X * TN) == 0 || (TB_X * TN) == BN, "BN must be compatible with TB_X and TN");
-
-__device__ __forceinline__ float bfloat16_to_float(__hip_bfloat16 x) {
-    return __bfloat162float(x);
-}
-
-// ====== FMA GEMM (A: FP32 row-major [M,K], B: BF16 row-major [N,K]) ======
-// Keep your BM/BN/BK/TB_X/TB_Y/TM/TN as-is
-
-#ifndef LDS_PAD_A
-#define LDS_PAD_A 1   // pad A's leading dimension by +1 column
-#endif
-#ifndef PAD_SB
-#define PAD_SB 1      // add one padded row to B tile
-#endif
-
-// Derived LDS strides with padding
-constexpr int LD_SA = BK + LDS_PAD_A;  // sA: [BM x (BK+pad)] row-major
-constexpr int LD_SB = BN;              // sB: [(BK+pad_row) x BN] row-major
-
-
-__device__ __forceinline__ float bf16_bits_to_f32_fix(uint16_t bits) {
-    const __hip_bfloat16 bx = *reinterpret_cast<const __hip_bfloat16*>(&bits);
-    return __bfloat162float(bx);
-}
-__launch_bounds__(TB_X * TB_Y, 2)
-__global__ void gemm_fma_bf16_kernel_opt(
-    float* __restrict__ C,                          // [M, N] row-major
-    const float* __restrict__ A,                    // [M, K] row-major (fp32)
-    const __hip_bfloat16* __restrict__ Wbf16,       // [N, K] row-major (bf16)
-    int M, int K, int N)
-{
-    // --- Tile origin in C ---
-    const int m0 = blockIdx.y * BM;
-    const int n0 = blockIdx.x * BN;
-
-    // --- Thread coords ---
-    const int tx = threadIdx.x;               // 0..TB_X-1
-    const int ty = threadIdx.y;               // 0..TB_Y-1
-    const int linearT = ty * TB_X + tx;
-    const int threadsPerBlock = TB_X * TB_Y;
-
-    // --- Microtile per thread ---
-    const int rowBase = m0 + ty * TM;
-    const int colBase = n0 + tx * TN;
-
-    // --- Padded shared strides to avoid bank conflicts ---
-    const int LD_SA = BK + 1;                 // sA: [BM x (BK+1)] row-major (float)
-    const int LD_SB = BN + 1;                 // sB: [BK x (BN+1)] row-major (float)
-
-    // --- Double-buffered shared memory ---
-    extern __shared__ float smem[];
-    float* sA0 = smem;                                   // size BM*LD_SA
-    float* sA1 = sA0 + (BM * LD_SA);
-    float* sB0 = sA1 + (BM * LD_SA);                     // size BK*LD_SB
-    float* sB1 = sB0 + (BK * LD_SB);
-
-    // --- Accumulators ---
-    float acc[TM][TN];
-#pragma unroll
-    for (int i = 0; i < TM; ++i)
-#pragma unroll
-        for (int j = 0; j < TN; ++j)
-            acc[i][j] = 0.0f;
-
-    // --- Cooperative loaders (vectorized & padded) ---
-
-    // A: load as float4 along K (contiguous in memory), store to sA row-major with LD_SA
-    auto loadA_vec = [&](float* __restrict__ dst, int kBase) {
-        const int vecs_per_row = BK / 4; // 4 floats (16B) per vector
-        for (int idx = linearT; idx < BM * vecs_per_row; idx += threadsPerBlock) {
-            const int r  = idx / vecs_per_row;          // 0..BM-1
-            const int c4 = idx - r * vecs_per_row;      // 0..(BK/4)-1
-            const int gm = m0 + r;
-            const int gk = kBase + c4 * 4;
-
-            float4 v4 = {0.f, 0.f, 0.f, 0.f};
-            if (gm < M) {
-                const float* gptr = A + (size_t)gm * K + gk;
-                v4 = *reinterpret_cast<const float4*>(gptr);
-            }
-            float* srow = dst + r * LD_SA + c4 * 4;
-            srow[0] = v4.x; srow[1] = v4.y; srow[2] = v4.z; srow[3] = v4.w;
-        }
-        // zero pad column
-        if (linearT < BM) dst[linearT * LD_SA + BK] = 0.0f;
-    };
-
-    // B: load 8×bf16 (16B) along K for each column n, convert to f32, store row-major [BK x LD_SB]
-    auto loadB_vec = [&](float* __restrict__ dst, int kBase) {
-        const int vecs_per_col = BK / 8;          // each vector covers 8 contiguous k's
-        const int total_vecs   = vecs_per_col * BN;
-
-        for (int idx = linearT; idx < total_vecs; idx += threadsPerBlock) {
-            const int c    = idx / vecs_per_col;  // 0..BN-1 (column in the tile)
-            const int r8v  = idx - c * vecs_per_col; // 0..(BK/8)-1
-            const int gn   = n0 + c;
-            const int gk   = kBase + r8v * 8;     // global K index of this 16B vector
-            const int rloc = r8v * 8;             // *** local row offset inside BK slice ***
-
-            uint16_t b16[8];
-            if (gn < N) {
-                const uint4* gptr = reinterpret_cast<const uint4*>(
-                    reinterpret_cast<const char*>(Wbf16) + ((size_t)gn * K + gk) * sizeof(__hip_bfloat16));
-                const uint4 v = *gptr;           // 16B load (8×bf16)
-                memcpy(b16, &v, 16);
-            } else {
-#pragma unroll
-                for (int t = 0; t < 8; ++t) b16[t] = uint16_t(0);
-            }
-
-            // *** FIXED: use LOCAL row index (rloc), not absolute gk ***
-            float* base = dst + (size_t)rloc * LD_SB + c;
-#pragma unroll
-            for (int t = 0; t < 8; ++t) {
-                base[t * LD_SB] = bf16_bits_to_f32_fix(b16[t]);
-            }
-        }
-        // zero pad column
-        if (linearT < BK) dst[linearT * LD_SB + BN] = 0.0f;
-    };
-
-    // --- Preload first BK-slice ---
-    loadA_vec(sA0, 0);
-    loadB_vec(sB0, 0);
-    __syncthreads();
-
-    float* currA = sA0;  float* nextA = sA1;
-    float* currB = sB0;  float* nextB = sB1;
-
-#pragma unroll 1
-    for (int k0 = 0; k0 < K; k0 += BK) {
-        if (k0 + BK < K) {
-            loadA_vec(nextA, k0 + BK);
-            loadB_vec(nextB, k0 + BK);
-        }
-
-#pragma unroll
-        for (int kk = 0; kk < BK; ++kk) {
-            // A fragment: TM rows from column kk
-            float aFrag[TM];
-#pragma unroll
-            for (int i = 0; i < TM; ++i) {
-                const int rr = ty * TM + i;
-                aFrag[i] = currA[rr * LD_SA + kk];
-            }
-            // B fragment: TN cols from row kk
-            float bFrag[TN];
-#pragma unroll
-            for (int j = 0; j < TN; ++j) {
-                const int cc = tx * TN + j;
-                bFrag[j] = currB[kk * LD_SB + cc];
-            }
-            // FMA outer product
-#pragma unroll
-            for (int i = 0; i < TM; ++i)
-#pragma unroll
-                for (int j = 0; j < TN; ++j)
-                    acc[i][j] = fmaf(aFrag[i], bFrag[j], acc[i][j]);
-        }
-
-        __syncthreads();
-        float* tA = currA; currA = nextA; nextA = tA;
-        float* tB = currB; currB = nextB; nextB = tB;
-    }
-
-    // --- Store C ---
-    float* __restrict__ Cout = C + (size_t)rowBase * N + colBase;
-#pragma unroll
-    for (int i = 0; i < TM; ++i) {
-        const int gm = rowBase + i;
-        if (gm >= M) break;
-#pragma unroll
-        for (int j = 0; j < TN; ++j) {
-            const int gn = colBase + j;
-            if (gn < N) Cout[j] = acc[i][j];
-        }
-        Cout += N;
-    }
-}
-// ===== Host wrappers (API unchanged) =====
-void matmul(
-    float* __restrict__ output,                 // [B, O]
-    const float* __restrict__ input,            // [B, I]
-    const __hip_bfloat16* __restrict__ weight,  // [O, I] bf16 row-major
-    int batch_size, int input_dim, int output_dim,
-    hipStream_t stream = nullptr)
-{
-    std::stringstream timer_name;
-    timer_name << "matmul_kernel_" << batch_size << "x" << input_dim << "x" << output_dim;
-    TIMER_BLOCK(timer_name.str());
-    const int M = batch_size, K = input_dim, N = output_dim;
-    dim3 grid((N + BN - 1) / BN, (M + BM - 1) / BM);
-    dim3 block(TB_X, TB_Y);
-
-    size_t shmem_bytes = sizeof(float) * (2*(BM*LD_SA) + 2*((BK + PAD_SB)*LD_SB));
-
-    hipLaunchKernelGGL(
-        gemm_fma_bf16_kernel_opt,
-        grid, block, shmem_bytes, stream,
-        output, input, weight, M, K, N);
-}
-
-
-// ====== FMA GEMM (A: FP32 row-major [M,K], B: BF16 row-major [N,K]) ======
-__global__ void gemm_fma_bf16_kernel_opt(
-    float* __restrict__ C,                     // [M, N]
-    const float* __restrict__ A,               // [M, K]
-    const float* __restrict__ Wbf16,  // [N, K] row-major
-    int M, int K, int N)
-{
-    // Tile origins
-    const int m0 = blockIdx.y * BM;
-    const int n0 = blockIdx.x * BN;
-
-    // Per-thread coordinates within the block
-    const int tx = threadIdx.x; // 0..TB_X-1 maps across N
-    const int ty = threadIdx.y; // 0..TB_Y-1 maps across M
-
-    // Each thread computes a TM x TN microtile
-    const int rowBase = m0 + ty * TM;
-    const int colBase = n0 + tx * TN;
-
-    // Double-buffered shared memory: sA: [BM x BK], sB: [BK x BN], both float32
-    extern __shared__ float smem[];
-    float* sA0 = smem;
-    float* sA1 = sA0 + (BM * BK);
-    float* sB0 = sA1 + (BM * BK);
-    float* sB1 = sB0 + (BK * BN);
-
-    double acc[TM][TN];
-#pragma unroll
-    for (int i = 0; i < TM; ++i)
-#pragma unroll
-        for (int j = 0; j < TN; ++j)
-            acc[i][j] = 0.0;
-
-    const int threadsPerBlock = TB_X * TB_Y;
-    const int linearT = ty * TB_X + tx;
-
-    // Helper lambdas to cooperatively load tiles from global -> shared
-    auto loadA = [&](float* dst, int kBase) {
-        // row-major [BM x BK]
-        for (int idx = linearT; idx < BM * BK; idx += threadsPerBlock) {
-            int r = idx / BK;
-            int c = idx % BK;
-            int gm = m0 + r;
-            int gk = kBase + c;
-            float a = (gm < M && gk < K) ? A[(size_t)gm * K + gk] : 0.0f;
-            dst[r * BK + c] = a;
-        }
-    };
-    auto loadB = [&](float* dst, int kBase) {
-        // We store sB as row-major [BK x BN] for unit-stride kk access
-        for (int idx = linearT; idx < BK * BN; idx += threadsPerBlock) {
-            int r = idx / BN; // 0..BK-1  (k within this slice)
-            int c = idx % BN; // 0..BN-1  (n within this block)
-            int gk = kBase + r;
-            int gn = n0 + c;
-            float b = (gk < K && gn < N) ? (Wbf16[(size_t)gn * K + gk]) : 0.0f;
-            dst[r * BN + c] = b;
-        }
-    };
-
-    // Preload k-slice 0
-    loadA(sA0, /*kBase=*/0);
-    loadB(sB0, /*kBase=*/0);
-    __syncthreads();
-
-    float* currA = sA0; float* nextA = sA1;
-    float* currB = sB0; float* nextB = sB1;
-
-    // Compute across K in BK chunks
-    for (int k0 = 0; k0 < K; k0 += BK) {
-        // Preload next if any
-        if (k0 + BK < K) {
-            loadA(nextA, k0 + BK);
-            loadB(nextB, k0 + BK);
-        }
-
-        // Compute: for kk in [0..BK)
-#pragma unroll
-        for (int kk = 0; kk < BK; ++kk) {
-            float aFrag[TM];
-#pragma unroll
-            for (int i = 0; i < TM; ++i) {
-                int r = ty * TM + i;
-                int rr = r; // within [0..BM)
-                aFrag[i] = currA[rr * BK + kk];
-            }
-
-            float bFrag[TN];
-#pragma unroll
-            for (int j = 0; j < TN; ++j) {
-                int c = tx * TN + j; // within [0..BN)
-                bFrag[j] = currB[kk * BN + c];
-            }
-
-#pragma unroll
-            for (int i = 0; i < TM; ++i) {
-#pragma unroll
-                for (int j = 0; j < TN; ++j) {
-                    acc[i][j] += (double)aFrag[i] * bFrag[j];
-                }
-            }
-        }
-
-        __syncthreads();
-        // Swap buffers
-        float* tA = currA; currA = nextA; nextA = tA;
-        float* tB = currB; currB = nextB; nextB = tB;
-    }
-
-    // Store back to C with bounds checks
-#pragma unroll
-    for (int i = 0; i < TM; ++i) {
-        int gm = rowBase + i;
-        if (gm >= M) break;
-#pragma unroll
-        for (int j = 0; j < TN; ++j) {
-            int gn = colBase + j;
-            if (gn < N) {
-                C[(size_t)gm * N + gn] = acc[i][j];
-            }
-        }
-    }
-}
-
-// ===== Host wrappers (API unchanged) =====
-void matmul(
-    float* __restrict__ output,                 // [B, O]
-    const float* __restrict__ input,            // [B, I]
-    const float* __restrict__ weight,  // [O, I] bf16 row-major
-    int batch_size, int input_dim, int output_dim,
-    hipStream_t stream = nullptr)
-{
-    std::stringstream timer_name;
-    timer_name << "matmul_fma_" << batch_size << "x" << input_dim << "x" << output_dim;
-    TIMER_BLOCK(timer_name.str());
-    
-    const int M = batch_size, K = input_dim, N = output_dim;
-    dim3 grid((N + BN - 1) / BN, (M + BM - 1) / BM);
-    dim3 block(TB_X, TB_Y);
-
-    // Double-buffered sA,sB
-    size_t shmem_bytes = (size_t)(2 * (BM * BK + BK * BN)) * sizeof(float);
-
-    hipLaunchKernelGGL(
-        gemm_fma_bf16_kernel_opt,
-        grid, block, shmem_bytes, stream,
-        output, input, weight, M, K, N);
-}
-
-__device__ inline uint16_t hipbf16_to_bits(__hip_bfloat16 x) { return *reinterpret_cast<uint16_t*>(&x); }

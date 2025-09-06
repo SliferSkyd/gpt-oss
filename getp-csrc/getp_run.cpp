@@ -42,15 +42,15 @@ typedef struct
     float *token_embedding_table; // (vocab_size, hidden_dim)
 
     // RMSNorm weights
-    float *rms_attn_w; // (n_layers, hidden_dim)
-    float *rms_ffn_w;  // (n_layers, hidden_dim)
-    float *rms_out_w;  // (hidden_dim,)
+    __hip_bfloat16 *rms_attn_w; // (n_layers, hidden_dim)
+    __hip_bfloat16 *rms_ffn_w;  // (n_layers, hidden_dim)
+    __hip_bfloat16 *rms_out_w;  // (hidden_dim,)
 
     // Attention weights
-    float *w_qkv;      // (n_layers, head_dim * (n_attn_heads + 2 * n_kv_heads), hidden_dim)
-    float *b_qkv;      // (n_layers, head_dim * (n_attn_heads + 2 * n_kv_heads))
-    float *w_o;        // (n_layers, hidden_dim, head_dim * n_attn_heads)
-    float *b_o;        // (n_layers, hidden_dim)
+     __hip_bfloat16 *w_qkv;      // (n_layers, head_dim * (n_attn_heads + 2 * n_kv_heads), hidden_dim)
+    __hip_bfloat16 *b_qkv;      // (n_layers, head_dim * (n_attn_heads + 2 * n_kv_heads))
+    __hip_bfloat16 *w_o;        // (n_layers, hidden_dim, head_dim * n_attn_heads)
+    __hip_bfloat16 *b_o;        // (n_layers, hidden_dim)
     __hip_bfloat16 *attn_sinks; // (n_layers, n_attn_heads)
 
     // MoE router weights
@@ -63,7 +63,7 @@ typedef struct
     __hip_bfloat16 *w_mlp2;  // (n_layers, n_experts, H,   D) row-major [O=H,  I=D]
     __hip_bfloat16 *b_mlp1, *b_mlp2;
     // Output weights
-    float *out; // (vocab_size, hidden_dim)
+    __hip_bfloat16 *out; // (vocab_size, hidden_dim)
 } GPUTransformerWeights;
 
 // GPU Run State struct - stores all activation buffers on GPU
@@ -140,9 +140,6 @@ typedef struct
     bool *finished;      // finished flags for each sequence
     int *positions;      // current positions (CPU copy)
     int *prompt_lens;    // prompt lengths
-    hipStream_t sGather;
-    hipStream_t sScatter;
-    hipStream_t sMLP[N_MLP_STREAMS];
     int *expert_counts;
     int *expert_offsets;
     float *logits;
@@ -294,17 +291,17 @@ void malloc_gpu_weights(GPUTransformerWeights *w, Config *p)
 {
     // Allocate GPU memory for all weights in bfloat16 format
     HIP_CHECK(hipMalloc((void **)&w->token_embedding_table, p->vocab_size * p->hidden_dim * sizeof(float)));
-    HIP_CHECK(hipMalloc((void **)&w->rms_attn_w, p->n_layers * p->hidden_dim * sizeof(float)));
-    HIP_CHECK(hipMalloc((void **)&w->rms_ffn_w, p->n_layers * p->hidden_dim * sizeof(float)));
-    HIP_CHECK(hipMalloc((void **)&w->rms_out_w, p->hidden_dim * sizeof(float)));
+    HIP_CHECK(hipMalloc((void **)&w->rms_attn_w, p->n_layers * p->hidden_dim * sizeof(__hip_bfloat16)));
+    HIP_CHECK(hipMalloc((void **)&w->rms_ffn_w, p->n_layers * p->hidden_dim * sizeof(__hip_bfloat16)));
+    HIP_CHECK(hipMalloc((void **)&w->rms_out_w, p->hidden_dim * sizeof(__hip_bfloat16)));
 
     int qkv_size = p->n_layers * p->hidden_dim * (p->n_attn_heads + 2 * p->n_kv_heads) * p->head_dim;
-    HIP_CHECK(hipMalloc((void **)&w->w_qkv, qkv_size * sizeof(float)));
-    HIP_CHECK(hipMalloc((void **)&w->b_qkv, p->n_layers * (p->n_attn_heads + 2 * p->n_kv_heads) * p->head_dim * sizeof(float)));
+    HIP_CHECK(hipMalloc((void **)&w->w_qkv, qkv_size * sizeof(__hip_bfloat16)));
+    HIP_CHECK(hipMalloc((void **)&w->b_qkv, p->n_layers * (p->n_attn_heads + 2 * p->n_kv_heads) * p->head_dim * sizeof(__hip_bfloat16)));
 
     int attn_out_size = p->n_layers * (p->n_attn_heads * p->head_dim) * p->hidden_dim;
-    HIP_CHECK(hipMalloc((void **)&w->w_o, attn_out_size * sizeof(float)));
-    HIP_CHECK(hipMalloc((void **)&w->b_o, p->n_layers * p->hidden_dim * sizeof(float)));
+    HIP_CHECK(hipMalloc((void **)&w->w_o, attn_out_size * sizeof(__hip_bfloat16)));
+    HIP_CHECK(hipMalloc((void **)&w->b_o, p->n_layers * p->hidden_dim * sizeof(__hip_bfloat16)));
 
     HIP_CHECK(hipMalloc((void **)&w->w_router, p->n_layers * p->hidden_dim * p->n_experts * sizeof(__hip_bfloat16)));
     HIP_CHECK(hipMalloc((void **)&w->b_router, p->n_layers * p->n_experts * sizeof(__hip_bfloat16)));
@@ -322,7 +319,7 @@ void malloc_gpu_weights(GPUTransformerWeights *w, Config *p)
     HIP_CHECK(hipMalloc((void **)&w->b_mlp2,
                         (size_t)p->n_layers * p->n_experts * p->hidden_dim * sizeof(__hip_bfloat16)));
 
-    HIP_CHECK(hipMalloc((void **)&w->out, p->hidden_dim * p->vocab_size * sizeof(float)));
+    HIP_CHECK(hipMalloc((void **)&w->out, p->hidden_dim * p->vocab_size * sizeof(__hip_bfloat16)));
     HIP_CHECK(hipMalloc((void **)&w->attn_sinks, p->n_layers * p->n_attn_heads * sizeof(__hip_bfloat16)));
 }
 
@@ -345,64 +342,62 @@ void copy_weights_to_gpu(Transformer *transformer, GPUTransformerWeights *gpu_we
 
     // Norms
     {
-        size_t rms_attn_size = (size_t)p->n_layers * p->hidden_dim;
-        HIP_CHECK(hipMemcpy(gpu_weights->rms_attn_w, w->rms_attn_w,
-                            rms_attn_size * sizeof(float), hipMemcpyHostToDevice));
+        // Convert and copy normalization weights
+        size_t rms_attn_size = p->n_layers * p->hidden_dim;
+        __hip_bfloat16 *h_rms_attn_bf16 = (__hip_bfloat16 *)malloc(rms_attn_size * sizeof(__hip_bfloat16));
+        convert_float_array_to_bfloat16(w->rms_attn_w, h_rms_attn_bf16, rms_attn_size);
+        HIP_CHECK(hipMemcpy(gpu_weights->rms_attn_w, h_rms_attn_bf16, rms_attn_size * sizeof(__hip_bfloat16), hipMemcpyHostToDevice));
+        free(h_rms_attn_bf16);
 
-        size_t rms_ffn_size = (size_t)p->n_layers * p->hidden_dim;
-        HIP_CHECK(hipMemcpy(gpu_weights->rms_ffn_w, w->rms_ffn_w,
-                            rms_ffn_size * sizeof(float), hipMemcpyHostToDevice));
+        size_t rms_ffn_size = p->n_layers * p->hidden_dim;
+        __hip_bfloat16 *h_rms_ffn_bf16 = (__hip_bfloat16 *)malloc(rms_ffn_size * sizeof(__hip_bfloat16));
+        convert_float_array_to_bfloat16(w->rms_ffn_w, h_rms_ffn_bf16, rms_ffn_size);
+        HIP_CHECK(hipMemcpy(gpu_weights->rms_ffn_w, h_rms_ffn_bf16, rms_ffn_size * sizeof(__hip_bfloat16), hipMemcpyHostToDevice));
+        free(h_rms_ffn_bf16);
 
-        size_t rms_out_size = (size_t)p->hidden_dim;
-        HIP_CHECK(hipMemcpy(gpu_weights->rms_out_w, w->rms_out_w,
-                            rms_out_size * sizeof(float), hipMemcpyHostToDevice));
+        size_t rms_out_size = p->hidden_dim;
+        __hip_bfloat16 *h_rms_out_bf16 = (__hip_bfloat16 *)malloc(rms_out_size * sizeof(__hip_bfloat16));
+        convert_float_array_to_bfloat16(w->rms_out_w, h_rms_out_bf16, rms_out_size);
+        HIP_CHECK(hipMemcpy(gpu_weights->rms_out_w, h_rms_out_bf16, rms_out_size * sizeof(__hip_bfloat16), hipMemcpyHostToDevice));
+        free(h_rms_out_bf16);
     }
 
-    // ---------------- QKV: copy then transpose IN-PLACE to [K, N] ----------------
+    // Convert and copy attention weights
     {
-        const int K = p->hidden_dim;
-        const int N = (p->n_attn_heads + 2 * p->n_kv_heads) * p->head_dim;
+        size_t qkv_size = p->n_layers * p->hidden_dim * (p->n_attn_heads + 2 * p->n_kv_heads) * p->head_dim;
+        __hip_bfloat16 *h_w_qkv_bf16 = (__hip_bfloat16 *)malloc(qkv_size * sizeof(__hip_bfloat16));
+        convert_float_array_to_bfloat16(w->w_qkv, h_w_qkv_bf16, qkv_size);
+        HIP_CHECK(hipMemcpy(gpu_weights->w_qkv, h_w_qkv_bf16, qkv_size * sizeof(__hip_bfloat16), hipMemcpyHostToDevice));
+        free(h_w_qkv_bf16);
 
-        const size_t per_layer_elems = (size_t)K * N;
-        const size_t per_layer_bytes = per_layer_elems * sizeof(float);
-        const size_t total_elems     = (size_t)p->n_layers * per_layer_elems;
+        size_t b_qkv_size = p->n_layers * (p->n_attn_heads + 2 * p->n_kv_heads) * p->head_dim;
+        __hip_bfloat16 *h_b_qkv_bf16 = (__hip_bfloat16 *)malloc(b_qkv_size * sizeof(__hip_bfloat16));
+        convert_float_array_to_bfloat16(w->b_qkv, h_b_qkv_bf16, b_qkv_size);
+        HIP_CHECK(hipMemcpy(gpu_weights->b_qkv, h_b_qkv_bf16, b_qkv_size * sizeof(__hip_bfloat16), hipMemcpyHostToDevice));
+        free(h_b_qkv_bf16);
 
-        // Copy host → device (as [N,K] per layer)
-        HIP_CHECK(hipMemcpy(gpu_weights->w_qkv, w->w_qkv,
-                            total_elems * sizeof(float), hipMemcpyHostToDevice));
+        size_t attn_out_size = p->n_layers * (p->n_attn_heads * p->head_dim) * p->hidden_dim;
+        __hip_bfloat16 *h_w_o_bf16 = (__hip_bfloat16 *)malloc(attn_out_size * sizeof(__hip_bfloat16));
+        convert_float_array_to_bfloat16(w->w_o, h_w_o_bf16, attn_out_size);
+        HIP_CHECK(hipMemcpy(gpu_weights->w_o, h_w_o_bf16, attn_out_size * sizeof(__hip_bfloat16), hipMemcpyHostToDevice));
+        free(h_w_o_bf16);
 
-        ;
-        HIP_CHECK(hipDeviceSynchronize());
-        // NOTE: gpu_weights->w_qkv now stores each layer as [K, N] row-major.
+        size_t b_o_size = p->n_layers * p->hidden_dim;
+        __hip_bfloat16 *h_b_o_bf16 = (__hip_bfloat16 *)malloc(b_o_size * sizeof(__hip_bfloat16));
+        convert_float_array_to_bfloat16(w->b_o, h_b_o_bf16, b_o_size);
+        HIP_CHECK(hipMemcpy(gpu_weights->b_o, h_b_o_bf16, b_o_size * sizeof(__hip_bfloat16), hipMemcpyHostToDevice));
+        free(h_b_o_bf16);
     }
 
-    // QKV bias
+    // Attention sinks
     {
-        size_t b_qkv_size = (size_t)p->n_layers * (p->n_attn_heads + 2 * p->n_kv_heads) * p->head_dim;
-        HIP_CHECK(hipMemcpy(gpu_weights->b_qkv, w->b_qkv,
-                            b_qkv_size * sizeof(float), hipMemcpyHostToDevice));
-    }
-
-    // Attention output projection (unchanged)
-    {
-        size_t attn_out_size = (size_t)p->n_layers * (p->n_attn_heads * p->head_dim) * p->hidden_dim;
-        HIP_CHECK(hipMemcpy(gpu_weights->w_o, w->w_o,
-                            attn_out_size * sizeof(float), hipMemcpyHostToDevice));
-
-        size_t b_o_size = (size_t)p->n_layers * p->hidden_dim;
-        HIP_CHECK(hipMemcpy(gpu_weights->b_o, w->b_o,
-                            b_o_size * sizeof(float), hipMemcpyHostToDevice));
-    }
-
-    // Attention sinks → BF16
-    {
-        size_t attn_sinks_size = (size_t)p->n_layers * p->n_attn_heads;
+        size_t attn_sinks_size = p->n_layers * p->n_attn_heads;
         __hip_bfloat16 *h_attn_sinks_bf16 = (__hip_bfloat16 *)malloc(attn_sinks_size * sizeof(__hip_bfloat16));
         convert_float_array_to_bfloat16(w->attn_sinks, h_attn_sinks_bf16, attn_sinks_size);
-        HIP_CHECK(hipMemcpy(gpu_weights->attn_sinks, h_attn_sinks_bf16,
-                            attn_sinks_size * sizeof(__hip_bfloat16), hipMemcpyHostToDevice));
+        HIP_CHECK(hipMemcpy(gpu_weights->attn_sinks, h_attn_sinks_bf16, attn_sinks_size * sizeof(__hip_bfloat16), hipMemcpyHostToDevice));
         free(h_attn_sinks_bf16);
     }
+
 
     // MoE router → BF16
     {
@@ -453,26 +448,15 @@ void copy_weights_to_gpu(Transformer *transformer, GPUTransformerWeights *gpu_we
         free(h_b_mlp2_bf16);
     }
 
-    // ---------------- Output (lm head): copy then transpose IN-PLACE to [hidden_dim, vocab_size] ----------------
-    {
-        const int K = p->hidden_dim;     // input dim to lm head
-        const int N = p->vocab_size;     // output classes
-
-        const size_t elems = (size_t)K * N;
-        const size_t bytes = elems * sizeof(float);
-
-        // Copy host → device as-is ([N, K] row-major)
-        HIP_CHECK(hipMemcpy(gpu_weights->out, w->out,
-                            bytes, hipMemcpyHostToDevice));
-
-        HIP_CHECK(hipDeviceSynchronize());
-        // NOTE: gpu_weights->out is now [hidden_dim, vocab_size] row-major.
-    }
+    // Convert and copy output weights
+    size_t out_size = p->hidden_dim * p->vocab_size;
+    __hip_bfloat16 *h_out_bf16 = (__hip_bfloat16 *)malloc(out_size * sizeof(__hip_bfloat16));
+    convert_float_array_to_bfloat16(w->out, h_out_bf16, out_size);
+    HIP_CHECK(hipMemcpy(gpu_weights->out, h_out_bf16, out_size * sizeof(__hip_bfloat16), hipMemcpyHostToDevice));
+    free(h_out_bf16);
 
     printf("Weights copied. w_qkv and out are transposed in-place on GPU ([K,N] layout).\n");
 }
-
-
 
 void malloc_cpu_buffers(CPUBuffers *cpu_buf, Config *p)
 {
@@ -503,10 +487,6 @@ void malloc_cpu_buffers(CPUBuffers *cpu_buf, Config *p)
 
     cpu_buf->expert_counts = (int*) malloc(p->n_experts * sizeof(int));
     cpu_buf->expert_offsets = (int*) malloc(p->n_experts * sizeof(int));
-    HIP_CHECK(hipStreamCreateWithFlags(&cpu_buf->sGather, hipStreamNonBlocking));
-    HIP_CHECK(hipStreamCreateWithFlags(&cpu_buf->sScatter, hipStreamNonBlocking));
-    for (int i = 0; i < N_MLP_STREAMS; ++i)
-        HIP_CHECK(hipStreamCreateWithFlags(&cpu_buf->sMLP[i], hipStreamNonBlocking));
     cpu_buf->logits = (float*) malloc(BATCH_SIZE * p->vocab_size * sizeof(float));
 }
 
@@ -746,7 +726,7 @@ void attention_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size)
     dim3 norm_grid(batch_size);
     dim3 norm_block(THREADS_PER_BLOCK);
     {
-        TIMER_BLOCK("rmsnorm_kernel");
+        // TIMER_BLOCK("rmsnorm_kernel");
         rmsnorm_kernel<<<norm_grid, norm_block>>>(
             s->t, s->x, w->rms_attn_w + layer_idx * hidden_dim, batch_size, hidden_dim);
         HIP_CHECK(hipGetLastError());
@@ -780,14 +760,14 @@ void attention_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size)
     dim3 bias_grid((1LL * batch_size * (p->n_attn_heads + 2 * p->n_kv_heads) * head_dim + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK);
 
     {
-        TIMER_BLOCK("add_bias_kernel");
+        // TIMER_BLOCK("add_bias_kernel");
         add_bias_kernel<<<bias_grid, THREADS_PER_BLOCK>>>(
             s->qkv, w->b_qkv + qkv_bias_offset, batch_size, (p->n_attn_heads + 2 * p->n_kv_heads) * head_dim);
         HIP_CHECK(hipGetLastError());
     }
     
    {
-    TIMER_BLOCK("launch_split_qkv_apply_rotary");
+    // TIMER_BLOCK("launch_split_qkv_apply_rotary");
      launch_split_qkv_apply_rotary(
         /*qkv=*/s->qkv,
         /*q=*/s->q, /*k=*/s->k, /*v=*/s->v,
@@ -803,7 +783,7 @@ void attention_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size)
     dim3 kv_grid(batch_size, (kv_dim + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK);
     dim3 kv_block(1, THREADS_PER_BLOCK);
     {
-        TIMER_BLOCK("update_kv_cache_kernel");
+        // TIMER_BLOCK("update_kv_cache_kernel");
         update_kv_cache_kernel<<<kv_grid, kv_block>>>(
             s->key_cache, s->value_cache, s->k, s->v, s->positions, batch_size,
             p->n_layers, layer_idx, MAX_SEQ_LEN, kv_dim);
@@ -815,7 +795,7 @@ void attention_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size)
     
     
     {
-        TIMER_BLOCK("fused_attention_kernel");
+        // TIMER_BLOCK("fused_attention_kernel");
         dim3 grid(batch_size, p->n_attn_heads);
         dim3 block(256);  // 4 warps; good for sweeping tokens
 
@@ -856,7 +836,7 @@ void attention_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size)
     int attn_bias_offset = layer_idx * hidden_dim;
 
     {
-        TIMER_BLOCK("fused_output_projection_kernel_optimized");
+        // TIMER_BLOCK("fused_output_projection_kernel_optimized");
         
         int M = batch_size;
         int N = hidden_dim;
@@ -881,95 +861,6 @@ void attention_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size)
         HIP_CHECK(hipGetLastError());
     }
 }
-struct GPUWorker {
-  int device_index;
-
-  int expert_start;
-  int expert_end;
-
-  int request_start;
-  int request_end;
-};
-void moe_gpu_old(GPUTransformer *gpu_t, int l, int batch_size)
-{
-Config *p = &gpu_t->config;
-GPURunState *dev_s = &gpu_t->state;
-GPUTransformerWeights *dev_w = &gpu_t->weights;
-CPUBuffers *cpu_buf = &gpu_t->cpu_buffers;
-// ExpertiseExt *ext = &cpu_buf->expertise_ext;
-GPUWorker *worker = nullptr;
-worker = (GPUWorker *)malloc(sizeof(GPUWorker));
-worker->device_index = 0;
-worker->expert_start = 0;
-worker->expert_end = p->n_experts;
-worker->request_start = 0;
-worker->request_end = batch_size;
-float *dev_x = dev_s->x;
-
-int hidden_dim = p->hidden_dim;
-int n_experts = p->n_experts;
-
-    {
-      getp_rmsnorm(dev_s->t, dev_x, dev_w->rms_ffn_w + 1ll * l * hidden_dim,
-                BATCH_SIZE, hidden_dim);
-
-  __hip_bfloat16 *dev_w_router =
-      dev_w->w_router + 1ll * l * hidden_dim * n_experts;
-  __hip_bfloat16 *dev_b_router = dev_w->b_router + 1ll * l * n_experts;
-  getp_matmul<__hip_bfloat16>(dev_s->router_score, dev_s->t, dev_w_router,
-                              dev_b_router, hidden_dim, n_experts,
-                              BATCH_SIZE);
-
-  getp_router_topk_softmax_batch(dev_s->router_score, n_experts,
-                                  p->experts_per_token, dev_s->topk_v,
-                                  dev_s->topk_i, BATCH_SIZE);
-
-  getp_map_global_to_local_batch(dev_s->topk_i, dev_s->topk_v, dev_s->local_ids,
-                                  dev_s->local_wts, dev_s->n_local,
-                                  p->experts_per_token, worker->expert_start,
-                                  worker->expert_end, BATCH_SIZE);
-
-  HIP_CHECK(hipMemset(dev_s->e_agg, 0,
-                      (size_t)BATCH_SIZE * hidden_dim * sizeof(float)));
-                  }
-
-  int experts_per_device = worker->expert_end - worker->expert_start;
-
-  __hip_bfloat16 *w1_base = dev_w->w_mlp1 + 1ll * l * experts_per_device * 2 *
-                                                p->intermediate_dim *
-                                                hidden_dim;
-  __hip_bfloat16 *b1_base =
-      dev_w->b_mlp1 + 1ll * l * experts_per_device * 2 * p->intermediate_dim;
-
-  {
-    // PROFILE_BLOCK("mlp1");
-    getp_mlp1_swiglu_bf16_batch_gridy(
-      dev_s->gate_up, dev_s->t, w1_base, b1_base, hidden_dim,
-      p->intermediate_dim, experts_per_device, dev_s->local_ids, dev_s->n_local,
-      p->experts_per_token, BATCH_SIZE, p->swiglu_limit);
-    }
-
-  __hip_bfloat16 *w2_base = dev_w->w_mlp2 + 1ll * l * experts_per_device *
-                                                hidden_dim *
-                                                p->intermediate_dim;
-  __hip_bfloat16 *b2_base =
-      dev_w->b_mlp2 + 1ll * l * experts_per_device * hidden_dim;
-
-  {
-    // PROFILE_BLOCK("mlp2");
-    getp_mlp2_accum_bf16_batch_gridy(
-      dev_s->e_agg, dev_s->gate_up, w2_base, b2_base, dev_s->local_ids,
-      dev_s->local_wts, dev_s->n_local, p->experts_per_token, BATCH_SIZE,
-      p->intermediate_dim, hidden_dim);
-    }
-
-  {
-    // PROFILE_BLOCK("add");
-    // add to residual
-  getp_vecadd(dev_x, dev_s->e_agg, hidden_dim, BATCH_SIZE);
-  }
-}
-
 
 void moe_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size)
 {
@@ -992,21 +883,21 @@ void moe_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size)
 
     dim3 norm_grid(batch_size), norm_block(THREADS_PER_BLOCK);
     {
-        TIMER_BLOCK("rmsnorm_kernel");
+        // TIMER_BLOCK("rmsnorm_kernel");
         rmsnorm_kernel<<<norm_grid, norm_block, 0, s0>>>(
        s->t, s->x, w->rms_ffn_w + (size_t)layer_idx * H, batch_size, H);
     }
      HIP_CHECK(hipGetLastError());
 
 
-    matmul(s->router_score, s->t,
+    matmul_mc(s->router_score, s->t,
            w->w_router + (size_t)layer_idx * H * E,
            batch_size, H, E, s0);
 
      const int elems = batch_size * E;
 
     {
-        TIMER_BLOCK("add_bias_kernel");
+        // TIMER_BLOCK("add_bias_kernel");
         add_bias_kernel<<<(elems + THREADS_PER_BLOCK - 1)/THREADS_PER_BLOCK,
                       THREADS_PER_BLOCK, 0, s0>>>(
        s->router_score, w->b_router + (size_t)layer_idx * E, batch_size, E);
@@ -1015,14 +906,14 @@ void moe_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size)
 
 
     {
-        TIMER_BLOCK("topk_kernel");
+        // TIMER_BLOCK("topk_kernel");
         topk_kernel<<<batch_size, 1, 0, s0>>>(
        s->topk_v, s->topk_i, s->router_score, batch_size, E, Ktok);
     }
 
 
     {
-        TIMER_BLOCK("softmax_kernel");
+        // TIMER_BLOCK("softmax_kernel");
         softmax_kernel<<<batch_size, THREADS_PER_BLOCK, 0, s0>>>(
        s->topk_v, batch_size, Ktok);
     }
@@ -1038,7 +929,7 @@ void moe_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size)
     HIP_CHECK(hipMemset(s->d_expert_counts, 0, E * sizeof(int)));
      const dim3 count_grid((batch_size + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK);
     {
-        TIMER_BLOCK("count_tokens_per_expert_kernel");
+        // TIMER_BLOCK("count_tokens_per_expert_kernel");
         count_tokens_per_expert_kernel<<<count_grid, THREADS_PER_BLOCK, 0, s0>>>(
        s->topk_i, s->d_expert_counts, batch_size, Ktok);
     }
@@ -1063,7 +954,7 @@ void moe_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size)
      const dim3 permute_grid(batch_size), permute_block(256);
      const int  shared_mem_size = Ktok * sizeof(int);
     {
-        TIMER_BLOCK("permute_expert_inputs_kernel");
+        // TIMER_BLOCK("permute_expert_inputs_kernel");
         permute_expert_inputs_kernel<<<permute_grid, permute_block, shared_mem_size, s0>>>(
        s->t, s->topk_i, s->topk_v, s->d_expert_offsets, s->d_expert_write_idx,
        batch_size, H, Ktok,
@@ -1120,7 +1011,7 @@ HIP_CHECK(hipMemcpy(d_tile2local,  h_tile2local.data(),
      size_t shmem = (size_t)(2*BLOCK_M_MLP*BLOCK_K + 2*BLOCK_K*BLOCK_N_MLP) * sizeof(uint16_t);
 
     {
-        TIMER_BLOCK("grouped_mlp1_bf16_kernel");
+        // TIMER_BLOCK("grouped_mlp1_bf16_kernel");
         hipLaunchKernelGGL(grouped_mlp1_bf16_kernel, grid, block, shmem, s0,
     s->mlp1_out, s->expert_input_buffer, W1_layer,
     s->d_expert_offsets, s->d_expert_counts,
@@ -1132,7 +1023,7 @@ HIP_CHECK(hipMemcpy(d_tile2local,  h_tile2local.data(),
 
    // fused bias + SwiGLU
    {
-    TIMER_BLOCK("bias_swiglu_epilogue_kernel");
+    // TIMER_BLOCK("bias_swiglu_epilogue_kernel");
      const __hip_bfloat16* b1_layer = w->b_mlp1 + (size_t)layer_idx * E * (2*D);
      const size_t work = (size_t)total_tokens * D;
      const int T = 256;
@@ -1146,7 +1037,7 @@ HIP_CHECK(hipMemcpy(d_tile2local,  h_tile2local.data(),
 
    // Grouped MLP2 + bias
    {
-    TIMER_BLOCK("grouped_mlp2_bf16_bias_kernel");
+    // TIMER_BLOCK("grouped_mlp2_bf16_bias_kernel");
      const size_t seg2_elems = (size_t)H * D;
      const size_t layer2_elem_off = (size_t)layer_idx * E * seg2_elems;
      const __hip_bfloat16* W2_layer = w->w_mlp2 + layer2_elem_off;
@@ -1166,7 +1057,7 @@ HIP_CHECK(hipMemcpy(d_tile2local,  h_tile2local.data(),
 
    // scatter + residual
    {
-    TIMER_BLOCK("scatter + residual");
+    // TIMER_BLOCK("scatter + residual");
      const int elems = total_tokens * H;
      const dim3 grid((elems + THREADS_PER_BLOCK - 1)/THREADS_PER_BLOCK);
    scatter_expert_outputs_kernel<<<grid, THREADS_PER_BLOCK, 0, s0>>>(
@@ -1175,7 +1066,7 @@ HIP_CHECK(hipMemcpy(d_tile2local,  h_tile2local.data(),
      HIP_CHECK(hipGetLastError());
    }
    {
-    TIMER_BLOCK("residual add");
+    // TIMER_BLOCK("residual add");
      const int elems = batch_size * H;
      accumulate_kernel<<<(elems + THREADS_PER_BLOCK - 1)/THREADS_PER_BLOCK,
                          THREADS_PER_BLOCK, 0, s0>>>(
@@ -1201,7 +1092,7 @@ int *forward_batch_gpu(GPUTransformer *gpu_t, int *tokens, int batch_size)
     // Copy token embeddings
     dim3 embed_grid((batch_size * hidden_dim + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK);
     {
-        TIMER_BLOCK("copy_embeddings_kernel");
+        // TIMER_BLOCK("copy_embeddings_kernel");
         copy_embeddings_kernel<<<embed_grid, THREADS_PER_BLOCK>>>(
             s->x, w->token_embedding_table, s->current_tokens, batch_size, hidden_dim);
         HIP_CHECK(hipGetLastError());
@@ -1216,7 +1107,7 @@ int *forward_batch_gpu(GPUTransformer *gpu_t, int *tokens, int batch_size)
     dim3 final_norm_grid(batch_size);
     dim3 final_norm_block(THREADS_PER_BLOCK);
     {
-        TIMER_BLOCK("rmsnorm_kernel");
+        // TIMER_BLOCK("rmsnorm_kernel");
         rmsnorm_kernel<<<final_norm_grid, final_norm_block>>>(
             s->x, s->x, w->rms_out_w, batch_size, hidden_dim);
         HIP_CHECK(hipGetLastError());
@@ -1234,7 +1125,7 @@ int *forward_batch_gpu(GPUTransformer *gpu_t, int *tokens, int batch_size)
     }
 
     {
-        TIMER_BLOCK("sample_argmax");
+        // TIMER_BLOCK("sample_argmax");
         sample_argmax(s->logits, s->current_tokens, batch_size, p->vocab_size);
     }
     // Copy logits back to CPU (you might want to keep this on GPU for sampling)

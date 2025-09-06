@@ -420,16 +420,9 @@ __global__ void bias_swiglu_epilogue_kernel(
     gate_up[(size_t)t * (size_t)D + d] = fmaf(gx, uy, gx);
 }
 
-// --- helpers (shared by MLP1 & MLP2) ---
-__device__ inline uint32_t pack2_bf16_bits_f32(float a0, float a1) {
-    const __hip_bfloat16 b0 = __float2bfloat16(a0);
-    const __hip_bfloat16 b1 = __float2bfloat16(a1);
-    return (uint32_t(hipbf16_to_bits(b1)) << 16) | uint32_t(hipbf16_to_bits(b0));
-}
-
 // Vectorized A load: read float2 (64b), convert to 2×bf16 in a single u32
 template<bool Aligned, int LD_A>
-__device__ inline void copy_A_tile_vec(uint32_t* __restrict__ dst_u32,
+__device__ inline void copy_A_tile_vec_MLP(uint32_t* __restrict__ dst_u32,
                                        const float* __restrict__ A,
                                        int m_start, int M_bound, int K, int kBase,
                                        int linearT, int threadsPerBlock) {
@@ -463,7 +456,7 @@ __device__ inline void copy_A_tile_vec(uint32_t* __restrict__ dst_u32,
 
 // Vectorized W load: read uint4 (128b = 8×bf16) when aligned & K%8==0
 template<bool Use128b, int LD_B>
-__device__ inline void copy_B_tile_vec(uint32_t* __restrict__ dst_u32,
+__device__ inline void copy_B_tile_vec_MLP(uint32_t* __restrict__ dst_u32,
                                        const __hip_bfloat16* __restrict__ W_e,
                                        int n0, int N, int K, int kBase,
                                        int linearT, int threadsPerBlock) {
@@ -573,11 +566,11 @@ __global__ void grouped_mlp1_bf16_kernel(
     const bool use128bW = (((uintptr_t)W_e & 0xF)==0) && ((K & 7)==0);    // 16B & K%8==0
 
     // Preload kBase=0
-    if (alignedA) copy_A_tile_vec<true,  /*LD_A=*/ldA>(sA0_u32, A, m_start, M_bound, K, 0, linearT, threadsPerBlock);
-    else          copy_A_tile_vec<false, /*LD_A=*/ldA>(sA0_u32, A, m_start, M_bound, K, 0, linearT, threadsPerBlock);
+    if (alignedA) copy_A_tile_vec_MLP<true,  /*LD_A=*/ldA>(sA0_u32, A, m_start, M_bound, K, 0, linearT, threadsPerBlock);
+    else          copy_A_tile_vec_MLP<false, /*LD_A=*/ldA>(sA0_u32, A, m_start, M_bound, K, 0, linearT, threadsPerBlock);
 
-    if (use128bW) copy_B_tile_vec<true,  /*LD_B=*/ldB>(sB0_u32, W_e, n0, N, K, 0, linearT, threadsPerBlock);
-    else          copy_B_tile_vec<false, /*LD_B=*/ldB>(sB0_u32, W_e, n0, N, K, 0, linearT, threadsPerBlock);
+    if (use128bW) copy_B_tile_vec_MLP<true,  /*LD_B=*/ldB>(sB0_u32, W_e, n0, N, K, 0, linearT, threadsPerBlock);
+    else          copy_B_tile_vec_MLP<false, /*LD_B=*/ldB>(sB0_u32, W_e, n0, N, K, 0, linearT, threadsPerBlock);
 
     __syncthreads();
 
@@ -597,11 +590,11 @@ __global__ void grouped_mlp1_bf16_kernel(
     for (int k0 = 0; k0 < Kmain; k0 += BK_) {
         const int kNext = k0 + BK_;
         if (kNext < Kmain) {
-            if (alignedA) copy_A_tile_vec<true,  ldA>(nextA32, A, m_start, M_bound, K, kNext, linearT, threadsPerBlock);
-            else          copy_A_tile_vec<false, ldA>(nextA32, A, m_start, M_bound, K, kNext, linearT, threadsPerBlock);
+            if (alignedA) copy_A_tile_vec_MLP<true,  ldA>(nextA32, A, m_start, M_bound, K, kNext, linearT, threadsPerBlock);
+            else          copy_A_tile_vec_MLP<false, ldA>(nextA32, A, m_start, M_bound, K, kNext, linearT, threadsPerBlock);
 
-            if (use128bW) copy_B_tile_vec<true,  ldB>(nextB32, W_e, n0, N, K, kNext, linearT, threadsPerBlock);
-            else          copy_B_tile_vec<false, ldB>(nextB32, W_e, n0, N, K, kNext, linearT, threadsPerBlock);
+            if (use128bW) copy_B_tile_vec_MLP<true,  ldB>(nextB32, W_e, n0, N, K, kNext, linearT, threadsPerBlock);
+            else          copy_B_tile_vec_MLP<false, ldB>(nextB32, W_e, n0, N, K, kNext, linearT, threadsPerBlock);
         }
 
         bf16x4 avec = make_a_vec(currA, ldA, aRowBase, lane);
@@ -619,11 +612,11 @@ __global__ void grouped_mlp1_bf16_kernel(
 
     if (has_tail) {
         // use Kmain here (not kNext!)
-        if (alignedA) copy_A_tile_vec<true,  ldA>(nextA32, A, m_start, M_bound, K, Kmain, linearT, threadsPerBlock);
-        else          copy_A_tile_vec<false, ldA>(nextA32, A, m_start, M_bound, K, Kmain, linearT, threadsPerBlock);
+        if (alignedA) copy_A_tile_vec_MLP<true,  ldA>(nextA32, A, m_start, M_bound, K, Kmain, linearT, threadsPerBlock);
+        else          copy_A_tile_vec_MLP<false, ldA>(nextA32, A, m_start, M_bound, K, Kmain, linearT, threadsPerBlock);
 
-        if (use128bW) copy_B_tile_vec<true,  ldB>(nextB32, W_e, n0, N, K, Kmain, linearT, threadsPerBlock);
-        else          copy_B_tile_vec<false, ldB>(nextB32, W_e, n0, N, K, Kmain, linearT, threadsPerBlock);
+        if (use128bW) copy_B_tile_vec_MLP<true,  ldB>(nextB32, W_e, n0, N, K, Kmain, linearT, threadsPerBlock);
+        else          copy_B_tile_vec_MLP<false, ldB>(nextB32, W_e, n0, N, K, Kmain, linearT, threadsPerBlock);
 
         __syncthreads();
         bf16x4 avec = make_a_vec(nextA, ldA, aRowBase, lane);
@@ -699,11 +692,11 @@ __global__ void grouped_mlp2_bf16_bias_kernel(
     const bool use128bW = (((uintptr_t)W_e & 0xF)==0) && ((K & 7)==0);
 
     // Preload kBase=0
-    if (alignedA) copy_A_tile_vec<true,  /*LD_A=*/ldA>(sA0_u32, A, m_start, M_bound, K, 0, linearT, threadsPerBlock);
-    else          copy_A_tile_vec<false, /*LD_A=*/ldA>(sA0_u32, A, m_start, M_bound, K, 0, linearT, threadsPerBlock);
+    if (alignedA) copy_A_tile_vec_MLP<true,  /*LD_A=*/ldA>(sA0_u32, A, m_start, M_bound, K, 0, linearT, threadsPerBlock);
+    else          copy_A_tile_vec_MLP<false, /*LD_A=*/ldA>(sA0_u32, A, m_start, M_bound, K, 0, linearT, threadsPerBlock);
 
-    if (use128bW) copy_B_tile_vec<true,  /*LD_B=*/ldB>(sB0_u32, W_e, n0, N, K, 0, linearT, threadsPerBlock);
-    else          copy_B_tile_vec<false, /*LD_B=*/ldB>(sB0_u32, W_e, n0, N, K, 0, linearT, threadsPerBlock);
+    if (use128bW) copy_B_tile_vec_MLP<true,  /*LD_B=*/ldB>(sB0_u32, W_e, n0, N, K, 0, linearT, threadsPerBlock);
+    else          copy_B_tile_vec_MLP<false, /*LD_B=*/ldB>(sB0_u32, W_e, n0, N, K, 0, linearT, threadsPerBlock);
 
     __syncthreads();
 
@@ -723,11 +716,11 @@ __global__ void grouped_mlp2_bf16_bias_kernel(
     for (int k0 = 0; k0 < Kmain; k0 += BK_) {
         const int kNext = k0 + BK_;
         if (kNext < Kmain) {
-            if (alignedA) copy_A_tile_vec<true,  ldA>(nextA32, A, m_start, M_bound, K, kNext, linearT, threadsPerBlock);
-            else          copy_A_tile_vec<false, ldA>(nextA32, A, m_start, M_bound, K, kNext, linearT, threadsPerBlock);
+            if (alignedA) copy_A_tile_vec_MLP<true,  ldA>(nextA32, A, m_start, M_bound, K, kNext, linearT, threadsPerBlock);
+            else          copy_A_tile_vec_MLP<false, ldA>(nextA32, A, m_start, M_bound, K, kNext, linearT, threadsPerBlock);
 
-            if (use128bW) copy_B_tile_vec<true,  ldB>(nextB32, W_e, n0, N, K, kNext, linearT, threadsPerBlock);
-            else          copy_B_tile_vec<false, ldB>(nextB32, W_e, n0, N, K, kNext, linearT, threadsPerBlock);
+            if (use128bW) copy_B_tile_vec_MLP<true,  ldB>(nextB32, W_e, n0, N, K, kNext, linearT, threadsPerBlock);
+            else          copy_B_tile_vec_MLP<false, ldB>(nextB32, W_e, n0, N, K, kNext, linearT, threadsPerBlock);
         }
 
         bf16x4 avec = make_a_vec(currA, ldA, aRowBase, lane);
@@ -744,11 +737,11 @@ __global__ void grouped_mlp2_bf16_bias_kernel(
     }
 
     if (has_tail) {
-        if (alignedA) copy_A_tile_vec<true,  ldA>(nextA32, A, m_start, M_bound, K, Kmain, linearT, threadsPerBlock);
-        else          copy_A_tile_vec<false, ldA>(nextA32, A, m_start, M_bound, K, Kmain, linearT, threadsPerBlock);
+        if (alignedA) copy_A_tile_vec_MLP<true,  ldA>(nextA32, A, m_start, M_bound, K, Kmain, linearT, threadsPerBlock);
+        else          copy_A_tile_vec_MLP<false, ldA>(nextA32, A, m_start, M_bound, K, Kmain, linearT, threadsPerBlock);
 
-        if (use128bW) copy_B_tile_vec<true,  ldB>(nextB32, W_e, n0, N, K, Kmain, linearT, threadsPerBlock);
-        else          copy_B_tile_vec<false, ldB>(nextB32, W_e, n0, N, K, Kmain, linearT, threadsPerBlock);
+        if (use128bW) copy_B_tile_vec_MLP<true,  ldB>(nextB32, W_e, n0, N, K, Kmain, linearT, threadsPerBlock);
+        else          copy_B_tile_vec_MLP<false, ldB>(nextB32, W_e, n0, N, K, Kmain, linearT, threadsPerBlock);
 
         __syncthreads();
         bf16x4 avec = make_a_vec(nextA, ldA, aRowBase, lane);

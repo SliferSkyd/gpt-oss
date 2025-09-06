@@ -691,107 +691,11 @@ __global__ void fused_rmsnorm_qkv_rope_kvcache_kernel(
     }
 }
 
-// ============================================================================
-// START: FUSED KERNEL FOR OUTPUT PROJECTION
-// This kernel replaces three separate operations: matmul, add_bias, and accumulate.
-// It performs a matrix multiplication, adds a bias vector, and adds the result
-// to the residual stream `x` in a single pass.
-// ============================================================================
-#define TILE_DIM 32 // Defines the size of the tiles processed by each thread block.
-__global__ void fused_output_projection_kernel(
-    float *__restrict__ x,                     // Residual input, and final output [M, N]
-    const float *__restrict__ input,           // Input from attention layers [M, K]
-    const __hip_bfloat16 *__restrict__ weight, // Projection weights [N, K]
-    const __hip_bfloat16 *__restrict__ bias,   // Projection bias [N]
-    int M,                                     // Batch size
-    int K,                                     // Attention output dimension
-    int N                                      // Hidden dimension
-)
-{
-    // Shared memory for tiles. No padding is needed with this new approach.
-    __shared__ float input_tile[TILE_DIM][TILE_DIM];
-    __shared__ float weight_tile[TILE_DIM][TILE_DIM];
-
-    int bx = blockIdx.x;
-    int by = blockIdx.y;
-    int tx = threadIdx.x;
-    int ty = threadIdx.y;
-
-    int row = by * TILE_DIM + ty;
-    int col = bx * TILE_DIM + tx;
-
-    float Cvalue = 0.0f;
-
-    for (int t = 0; t < (K + TILE_DIM - 1) / TILE_DIM; ++t)
-    {
-        // 1. Load a tile of the input matrix into shared memory (coalesced).
-        // This part remains unchanged and correct.
-        int input_col = t * TILE_DIM + tx;
-        if (row < M && input_col < K)
-        {
-            input_tile[ty][tx] = input[row * K + input_col];
-        }
-        else
-        {
-            input_tile[ty][tx] = 0.0f;
-        }
-
-        // 2. CORRECTED: Coalesced load of weight matrix WITH on-the-fly transpose.
-        int weight_load_row = bx * TILE_DIM + ty;
-        int weight_load_col = t * TILE_DIM + tx;
-        if (weight_load_row < N && weight_load_col < K)
-        {
-            // The source access `weight[...][...]` is coalesced.
-            // The destination `weight_tile[tx][ty]` stores the data in a transposed layout.
-            weight_tile[tx][ty] = __bfloat162float(weight[weight_load_row * K + weight_load_col]);
-        }
-        else
-        {
-            weight_tile[tx][ty] = 0.0f;
-        }
-
-        __syncthreads();
-
-        // 3. CORRECTED & EFFICIENT: Multiply tiles from shared memory.
-        for (int k = 0; k < TILE_DIM; ++k)
-        {
-            // This now performs the correct dot product: input[row] dot W[col].
-            // The access to `weight_tile[k][tx]` is a conflict-free row-wise read
-            // because of the on-the-fly transpose during loading.
-            Cvalue += input_tile[ty][k] * weight_tile[k][tx];
-        }
-
-        __syncthreads();
-    }
-
-    // Fusion step remains the same.
-    if (row < M && col < N)
-    {
-        Cvalue += __bfloat162float(bias[col]);
-        Cvalue += x[row * N + col];
-        x[row * N + col] = Cvalue;
-    }
-}
-
-
-
-#include <hip/hip_runtime.h>
-#include <hip/hip_bf16.h>
-
-// =================================================================================================
-// ## MFMA Configuration and Helpers
-//
-// This section defines the constants and helper functions necessary for the MFMA-based kernel.
-// The configuration is tuned for a block size of 64x64, processed by 16 wavefronts.
-// =================================================================================================
-
-// --- Store and Fuse Results ---
-
 // Stores the accumulator tile back to global memory and performs the fusion steps.
 template<bool Interior>
 __device__ inline void store_and_fuse_tile(
     float* __restrict__ x, // In/Out buffer
-    const float* __restrict__ bias,
+    const __hip_bfloat16* __restrict__ bias,
     const f32x4& acc,
     int M, int N,
     int m0, int n0,
@@ -810,157 +714,129 @@ __device__ inline void store_and_fuse_tile(
 
         // Fused operations: add bias and residual
         float Cvalue = acc[i];
-        Cvalue += (bias[col]);
+        Cvalue += __bfloat162float(bias[col]);
         Cvalue += x[(size_t)row * N + col];
         x[(size_t)row * N + col] = Cvalue;
     }
 }
 
-// =================================================================================================
-// ## Optimized Fused Kernel (MFMA)
-//
-// This kernel calculates: x = (input @ weight^T) + bias + x
-// - Uses MFMA instructions for the matmul.
-// - Employs double-buffering in shared memory to hide data-loading latency.
-// - Integrates bias and residual addition in the final store operation.
-// =================================================================================================
-__global__ void fused_output_projection_kernel_optimized(
-    float *__restrict__ x,                     // Residual input [M,N], and final output [M,N]
-    const float *__restrict__ input,           // Input from attention layers [M, K]
-    const float *__restrict__ weight, // Projection weights [N, K]
-    const float *__restrict__ bias,   // Projection bias [N]
-    int M,                                     // Batch size
-    int K,                                     // Attention output dimension
-    int N                                      // Hidden dimension
-) {
-    // --- Block and Thread Identification ---
+
+
+__global__ __launch_bounds__(64 * WAVES_PER_BLOCK, 2)
+void fused_output_projection_kernel_optimized(
+    float* __restrict__ C,                         // [M,N] in/out (residual + out)
+    const float* __restrict__ A,               // [M,K] fp32
+    const __hip_bfloat16* __restrict__ Wbf16,     // [N,K] bf16 row-major
+    const __hip_bfloat16* __restrict__ bias,                // [N]  fp32
+    int M, int K, int N)
+{
     const int m0 = blockIdx.y * BLOCK_M;
     const int n0 = blockIdx.x * BLOCK_N;
 
-    const int lane   = threadIdx.x; // 0..63
-    const int wave   = threadIdx.y; // 0..15
+    const int lane   = threadIdx.x;               // 0..63
+    const int wave   = threadIdx.y;               // 0..(WAVES_PER_BLOCK-1)
     const int wave_m = wave / WAVES_N;
     const int wave_n = wave % WAVES_N;
-    
+
+    // LDS ping–pong:
+    // sA0,sA1: [BLOCK_M x (BLOCK_K+pad)] row-major (bf16 bits)
+    // sB0,sB1: [(BLOCK_K+pad) x BLOCK_N] col-major (bf16 bits)
+    extern __shared__ uint8_t smemRaw[];
+    const int ldA = BLOCK_K + PAD_K_MC;          // leading dim in bf16 elems
+    const int ldB = BLOCK_K + PAD_K_MC;
+
+    uint16_t* sA0_u16 = reinterpret_cast<uint16_t*>(smemRaw);
+    uint16_t* sA1_u16 = sA0_u16 + (BLOCK_M * ldA);
+    uint16_t* sB0_u16 = sA1_u16 + (BLOCK_M * ldA);
+    uint16_t* sB1_u16 = sB0_u16 + (ldB * BLOCK_N);
+
+    uint32_t* sA0_u32 = reinterpret_cast<uint32_t*>(sA0_u16);
+    uint32_t* sA1_u32 = reinterpret_cast<uint32_t*>(sA1_u16);
+    uint32_t* sB0_u32 = reinterpret_cast<uint32_t*>(sB0_u16);
+    uint32_t* sB1_u32 = reinterpret_cast<uint32_t*>(sB1_u16);
+
+    f32x4 acc = {0.f, 0.f, 0.f, 0.f};
+
     const int threadsPerBlock = blockDim.x * blockDim.y;
     const int linearT         = wave * blockDim.x + lane;
 
-    // --- Shared Memory for Double-Buffered Tiles ---
-    extern __shared__ uint8_t smemRaw[];
-    auto* sA0 = reinterpret_cast<uint16_t*>(smemRaw);
-    auto* sA1 = sA0 + (BLOCK_M * BLOCK_K);
-    auto* sB0 = sA1 + (BLOCK_M * BLOCK_K);
-    auto* sB1 = sB0 + (BLOCK_K * BLOCK_N);
+    const int M_bound = m0 + BLOCK_M;
 
-    // --- Per-lane Accumulators ---
-    f32x4 acc = {0.0f, 0.0f, 0.0f, 0.0f};
+    // Alignment guards (decide paths once per block)
+    const bool alignedA  = (((uintptr_t)A     & 0x7)==0) && ((K & 1)==0); // 8B & even
+    const bool use128bW  = (((uintptr_t)Wbf16 & 0xF)==0) && ((K & 7)==0); // 16B & K%8==0
 
-    // --- Pre-load first k-slice into shared memory ---
-    {
-        // Load input (A) tile: FP32 -> BF16, store row-major
-        for (int idx = linearT; idx < BLOCK_M * BLOCK_K; idx += threadsPerBlock) {
-            const int r = idx / BLOCK_K;
-            const int c = idx % BLOCK_K;
-            const int gm = m0 + r;
-            const int gk = c;
-            float val = (gm < M && gk < K) ? input[(size_t)gm * K + gk] : 0.0f;
-            sA0[idx] = f32_to_bf16_bits(val);
-        }
-        // Load weight (B) tile: BF16, store transposed (column-major)
-        for (int idx = linearT; idx < BLOCK_K * BLOCK_N; idx += threadsPerBlock) {
-            const int c = idx / BLOCK_K; // Column in block (0..BLOCK_N-1)
-            const int r = idx % BLOCK_K; // Row in block (0..BLOCK_K-1)
-            const int gn = n0 + c;
-            const int gk = r;
-            float val = (gk < K && gn < N) ? weight[(size_t)gn * K + gk] : 0.0f;
-            sB0[c * BLOCK_K + r] = f32_to_bf16_bits(val);
-        }
-    }
+    // Preload kBase = 0
+    if (alignedA) copy_A_tile_vec</*Aligned*/true,  /*LD_A=*/ldA>(sA0_u32, A, m0, M_bound, K, 0, linearT, threadsPerBlock);
+    else          copy_A_tile_vec</*Aligned*/false, /*LD_A=*/ldA>(sA0_u32, A, m0, M_bound, K, 0, linearT, threadsPerBlock);
+
+    if (use128bW) copy_B_tile_vec</*Use128b*/true,  /*LD_B=*/ldB>(sB0_u32, Wbf16, n0, N, K, 0, linearT, threadsPerBlock);
+    else          copy_B_tile_vec</*Use128b*/false, /*LD_B=*/ldB>(sB0_u32, Wbf16, n0, N, K, 0, linearT, threadsPerBlock);
+
     __syncthreads();
 
-    // --- Main Loop: Pipe-lined computation and data loading ---
-    auto* currA = sA0; auto* nextA = sA1;
-    auto* currB = sB0; auto* nextB = sB1;
+    // Ping–pong pointers
+    uint16_t* currA = sA0_u16; uint16_t* nextA = sA1_u16;
+    uint16_t* currB = sB0_u16; uint16_t* nextB = sB1_u16;
+    uint32_t* nextA32 = sA1_u32;
+    uint32_t* nextB32 = sB1_u32;
 
-    for (int k0 = 0; k0 < K; k0 += BLOCK_K) {
-        // Pre-fetch next tiles while computing on current tiles
-        if (k0 + BLOCK_K < K) {
-            const int kBase = k0 + BLOCK_K;
-            // Load next input (A) tile
-            for (int idx = linearT; idx < BLOCK_M * BLOCK_K; idx += threadsPerBlock) {
-                const int r = idx / BLOCK_K;
-                const int c = idx % BLOCK_K;
-                const int gm = m0 + r;
-                const int gk = kBase + c;
-                float val = (gm < M && gk < K) ? input[(size_t)gm * K + gk] : 0.0f;
-                nextA[idx] = f32_to_bf16_bits(val);
-            }
-            // Load next weight (B) tile
-            for (int idx = linearT; idx < BLOCK_K * BLOCK_N; idx += threadsPerBlock) {
-                const int c = idx / BLOCK_K;
-                const int r = idx % BLOCK_K;
-                const int gn = n0 + c;
-                const int gk = kBase + r;
-                float val = (gk < K && gn < N) ? weight[(size_t)gn * K + gk] : 0.0f;
-                nextB[c * BLOCK_K + r] = f32_to_bf16_bits(val);
-            }
+    // Per-wave MFMA bases
+    const int aRowBase = wave_m * WM;
+    const int bColBase = wave_n * WN;
+
+    // Split K into main slabs of BLOCK_K and one possible tail
+    const int Kmain = (K / BLOCK_K) * BLOCK_K;
+    const bool has_tail = (Kmain < K);
+
+#pragma unroll 1
+    for (int k0 = 0; k0 < Kmain; k0 += BLOCK_K) {
+        const int kNext = k0 + BLOCK_K;
+
+        // Prefetch next main slab
+        if (kNext < Kmain) {
+            if (alignedA) copy_A_tile_vec</*Aligned*/true,  /*LD_A=*/ldA>(nextA32, A, m0, M_bound, K, kNext, linearT, threadsPerBlock);
+            else          copy_A_tile_vec</*Aligned*/false, /*LD_A=*/ldA>(nextA32, A, m0, M_bound, K, kNext, linearT, threadsPerBlock);
+
+            if (use128bW) copy_B_tile_vec</*Use128b*/true,  /*LD_B=*/ldB>(nextB32, Wbf16, n0, N, K, kNext, linearT, threadsPerBlock);
+            else          copy_B_tile_vec</*Use128b*/false, /*LD_B=*/ldB>(nextB32, Wbf16, n0, N, K, kNext, linearT, threadsPerBlock);
         }
 
-        // --- MFMA Computation ---
-        const int aRowBase = wave_m * WM;
-        const int bColBase = wave_n * WN;
-        bf16x4 avec = make_a_vec(currA, BLOCK_K, aRowBase, lane);
-        bf16x4 bvec = make_b_vec(currB, BLOCK_K, bColBase, lane);
-        acc = mfma_16x16x16_bf16(avec, bvec, acc);
+        // Consume current tiles
+        {
+            bf16x4 avec = make_a_vec(currA, ldA, aRowBase, lane);
+            bf16x4 bvec = make_b_vec(currB, ldB, bColBase, lane);
+            acc = mfma_16x16x16_bf16(avec, bvec, acc);
+        }
+
+        __syncthreads();
+        if (kNext < Kmain) {
+            // swap
+            uint16_t* tA = currA; currA = nextA; nextA = tA;
+            uint16_t* tB = currB; currB = nextB; nextB = tB;
+            nextA32 = reinterpret_cast<uint32_t*>(nextA);
+            nextB32 = reinterpret_cast<uint32_t*>(nextB);
+        }
+    }
+
+    // Tail slab (0 < K - Kmain < BLOCK_K)
+    if (has_tail) {
+        if (alignedA) copy_A_tile_vec</*Aligned*/true,  /*LD_A=*/ldA>(nextA32, A, m0, M_bound, K, Kmain, linearT, threadsPerBlock);
+        else          copy_A_tile_vec</*Aligned*/false, /*LD_A=*/ldA>(nextA32, A, m0, M_bound, K, Kmain, linearT, threadsPerBlock);
+
+        if (use128bW) copy_B_tile_vec</*Use128b*/true,  /*LD_B=*/ldB>(nextB32, Wbf16, n0, N, K, Kmain, linearT, threadsPerBlock);
+        else          copy_B_tile_vec</*Use128b*/false, /*LD_B=*/ldB>(nextB32, Wbf16, n0, N, K, Kmain, linearT, threadsPerBlock);
 
         __syncthreads();
 
-        // Swap shared memory buffers for next iteration
-        auto* tmpA = currA; currA = nextA; nextA = tmpA;
-        auto* tmpB = currB; currB = nextB; nextB = tmpB;
+        bf16x4 avec = make_a_vec(nextA, ldA, aRowBase, lane);
+        bf16x4 bvec = make_b_vec(nextB, ldB, bColBase, lane);
+        acc = mfma_16x16x16_bf16(avec, bvec, acc);
+        __syncthreads();
     }
 
-    // --- Store Results and Fuse Operations ---
-    const bool interior = (m0 + BLOCK_M <= M && n0 + BLOCK_N <= N);
-    if (interior) {
-        store_and_fuse_tile<true>(x, bias, acc, M, N, m0, n0, wave_m, wave_n, lane);
-    } else {
-        store_and_fuse_tile<false>(x, bias, acc, M, N, m0, n0, wave_m, wave_n, lane);
-    }
-}
-
-
-// =================================================================================================
-// ## Updated Kernel Launcher
-// =================================================================================================
-extern "C" void launch_output_projection_optimized_kernel(
-    const float* input1, const float* input2, float* output,
-    int size1, int size2, int size3, hipStream_t stream = 0)
-{
-    int M = size1;
-    int N = size2;
-    int K = size3;
-    
-    const float* weight = reinterpret_cast<const float*>(input2);
-    // Bias is located immediately after the weight matrix in memory
-    const float* bias = weight + (size_t)N * K;
-    
-    // --- MFMA Launch Configuration ---
-    dim3 gridDim((N + BLOCK_N - 1) / BLOCK_N, (M + BLOCK_M - 1) / BLOCK_M);
-    dim3 blockDim(LANE_PER_WAVE, WAVES_PER_BLOCK);
-    
-    // Shared memory: 2 buffers for A [M,K] tiles, 2 for B [K,N] tiles
-    size_t shared_mem_bytes = (2 * BLOCK_M * BLOCK_K + 2 * BLOCK_K * BLOCK_N) * sizeof(uint16_t);
-    
-    // The `output` buffer serves as both input (for residual) and output
-    hipLaunchKernelGGL(fused_output_projection_kernel_optimized, 
-                       gridDim, 
-                       blockDim, 
-                       shared_mem_bytes, 
-                       stream,
-                       output, // `x` in the kernel
-                       input1, // `input` in the kernel
-                       weight, 
-                       bias, 
-                       M, K, N);
+    // Stores
+    const bool interior = (m0 + BLOCK_M) <= M && (n0 + BLOCK_N) <= N;
+    if (interior) store_and_fuse_tile<true >(C, bias, acc, M, N, m0, n0, wave_m, wave_n, lane);
+    else          store_and_fuse_tile<false>(C, bias, acc, M, N, m0, n0, wave_m, wave_n, lane);
 }

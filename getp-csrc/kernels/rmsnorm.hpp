@@ -3,7 +3,7 @@
 #include "../config.hpp"
 
 // GPU kernels with bfloat16 weights support
-__global__ void rmsnorm_kernel(float *output, const float *input, const float *weight,
+__global__ void rmsnorm_kernel(float *output, const float *input, const __hip_bfloat16 *weight,
                                int batch_size, int size)
 {
     size_t batch_idx = blockIdx.x;
@@ -51,6 +51,6 @@ __global__ void rmsnorm_kernel(float *output, const float *input, const float *w
     // Normalize and scale - convert bfloat16 weight to fp32 on-the-fly
     for (int i = tid; i < size; i += blockDim.x)
     {
-        o[i] = (double)(weight[i]) * (ss * x[i]);
+        o[i] = (double)(__bfloat162float(weight[i])) * (ss * x[i]);
     }
 }
