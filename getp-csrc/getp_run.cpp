@@ -371,21 +371,7 @@ void copy_weights_to_gpu(Transformer *transformer, GPUTransformerWeights *gpu_we
         HIP_CHECK(hipMemcpy(gpu_weights->w_qkv, w->w_qkv,
                             total_elems * sizeof(float), hipMemcpyHostToDevice));
 
-        // Temp buffer for a single layer transpose
-        float *d_tmp = nullptr;
-        HIP_CHECK(hipMalloc(&d_tmp, per_layer_bytes));
-
-        dim3 block(TILE_DIM, BLOCK_ROWS);
-        dim3 grid((K + TILE_DIM - 1) / TILE_DIM, (N + TILE_DIM - 1) / TILE_DIM);
-
-        for (int layer = 0; layer < p->n_layers; ++layer) {
-            float *src_layer = gpu_weights->w_qkv + (size_t)layer * per_layer_elems; // [N,K]
-            transpose_tiled_kernel<<<grid, block>>>(src_layer, d_tmp, /*rows=*/N, /*cols=*/K);
-            HIP_CHECK(hipGetLastError());
-            // Copy back: now [K,N]
-            HIP_CHECK(hipMemcpy(src_layer, d_tmp, per_layer_bytes, hipMemcpyDeviceToDevice));
-        }
-        HIP_CHECK(hipFree(d_tmp));
+        ;
         HIP_CHECK(hipDeviceSynchronize());
         // NOTE: gpu_weights->w_qkv now stores each layer as [K, N] row-major.
     }
@@ -479,18 +465,6 @@ void copy_weights_to_gpu(Transformer *transformer, GPUTransformerWeights *gpu_we
         HIP_CHECK(hipMemcpy(gpu_weights->out, w->out,
                             bytes, hipMemcpyHostToDevice));
 
-        // Transpose to [K, N] row-major IN-PLACE via temp
-        float *d_tmp_out = nullptr;
-        HIP_CHECK(hipMalloc(&d_tmp_out, bytes));
-
-        dim3 block(TILE_DIM, BLOCK_ROWS);
-        dim3 grid((K + TILE_DIM - 1) / TILE_DIM, (N + TILE_DIM - 1) / TILE_DIM);
-
-        transpose_tiled_kernel<<<grid, block>>>(gpu_weights->out, d_tmp_out, /*rows=*/N, /*cols=*/K);
-        HIP_CHECK(hipGetLastError());
-
-        HIP_CHECK(hipMemcpy(gpu_weights->out, d_tmp_out, bytes, hipMemcpyDeviceToDevice));
-        HIP_CHECK(hipFree(d_tmp_out));
         HIP_CHECK(hipDeviceSynchronize());
         // NOTE: gpu_weights->out is now [hidden_dim, vocab_size] row-major.
     }
@@ -772,6 +746,7 @@ void attention_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size)
     dim3 norm_grid(batch_size);
     dim3 norm_block(THREADS_PER_BLOCK);
     {
+        TIMER_BLOCK("rmsnorm_kernel");
         rmsnorm_kernel<<<norm_grid, norm_block>>>(
             s->t, s->x, w->rms_attn_w + layer_idx * hidden_dim, batch_size, hidden_dim);
         HIP_CHECK(hipGetLastError());
@@ -805,18 +780,22 @@ void attention_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size)
     dim3 bias_grid((1LL * batch_size * (p->n_attn_heads + 2 * p->n_kv_heads) * head_dim + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK);
 
     {
+        TIMER_BLOCK("add_bias_kernel");
         add_bias_kernel<<<bias_grid, THREADS_PER_BLOCK>>>(
             s->qkv, w->b_qkv + qkv_bias_offset, batch_size, (p->n_attn_heads + 2 * p->n_kv_heads) * head_dim);
         HIP_CHECK(hipGetLastError());
     }
     
-    launch_split_qkv_apply_rotary(
+   {
+    TIMER_BLOCK("launch_split_qkv_apply_rotary");
+     launch_split_qkv_apply_rotary(
         /*qkv=*/s->qkv,
         /*q=*/s->q, /*k=*/s->k, /*v=*/s->v,
         /*cos/sin=*/s->cos_vals, s->sin_vals,
         /*pos=*/s->positions,
         /*sizes=*/batch_size, p->n_attn_heads, p->n_kv_heads, p->head_dim,
         /*stream=*/0);
+    }
     HIP_CHECK(hipGetLastError());
 
 
@@ -824,6 +803,7 @@ void attention_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size)
     dim3 kv_grid(batch_size, (kv_dim + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK);
     dim3 kv_block(1, THREADS_PER_BLOCK);
     {
+        TIMER_BLOCK("update_kv_cache_kernel");
         update_kv_cache_kernel<<<kv_grid, kv_block>>>(
             s->key_cache, s->value_cache, s->k, s->v, s->positions, batch_size,
             p->n_layers, layer_idx, MAX_SEQ_LEN, kv_dim);
@@ -835,6 +815,7 @@ void attention_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size)
     
     
     {
+        TIMER_BLOCK("fused_attention_kernel");
         dim3 grid(batch_size, p->n_attn_heads);
         dim3 block(256);  // 4 warps; good for sweeping tokens
 
@@ -875,6 +856,8 @@ void attention_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size)
     int attn_bias_offset = layer_idx * hidden_dim;
 
     {
+        TIMER_BLOCK("fused_output_projection_kernel_optimized");
+        
         int M = batch_size;
         int N = hidden_dim;
         int K = head_dim * p->n_attn_heads;
