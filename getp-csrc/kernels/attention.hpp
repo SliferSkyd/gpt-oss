@@ -803,9 +803,10 @@ void fused_output_projection_kernel_optimized(
         }
 
         // Consume current tiles
-        {
-            bf16x4 avec = make_a_vec(currA, ldA, aRowBase, lane);
-            bf16x4 bvec = make_b_vec(currB, ldB, bColBase, lane);
+        #pragma unroll
+        for (int kk = 0; kk < BLOCK_K; kk += WK) {
+            bf16x4 avec = make_a_vec_k(currA, ldA, aRowBase, kk, lane);
+            bf16x4 bvec = make_b_vec_k(currB, ldB, bColBase, kk, lane);
             acc = mfma_16x16x16_bf16(avec, bvec, acc);
         }
 
@@ -829,9 +830,12 @@ void fused_output_projection_kernel_optimized(
 
         __syncthreads();
 
-        bf16x4 avec = make_a_vec(nextA, ldA, aRowBase, lane);
-        bf16x4 bvec = make_b_vec(nextB, ldB, bColBase, lane);
-        acc = mfma_16x16x16_bf16(avec, bvec, acc);
+        #pragma unroll
+        for (int kk = 0; kk < BLOCK_K; kk += WK) {
+            bf16x4 avec = make_a_vec_k(currA, ldA, aRowBase, kk, lane);
+            bf16x4 bvec = make_b_vec_k(currB, ldB, bColBase, kk, lane);
+            acc = mfma_16x16x16_bf16(avec, bvec, acc);
+        }
         __syncthreads();
     }
 

@@ -23,14 +23,18 @@
 #define WAVES_M 2
 #endif
 #ifndef WAVES_N
-#define WAVES_N 8
+#define WAVES_N 4
+#endif
+
+#ifndef WAVES_K
+#define WAVES_K 2
 #endif
 
 static_assert(WM == 16 && WN == 16 && WK == 16, "This MFMA microkernel assumes 16x16x16 bf16 tiles.");
 
 constexpr int BLOCK_M = WM * WAVES_M;        // e.g. 64 if WAVES_M=4
 constexpr int BLOCK_N = WN * WAVES_N;        // e.g. 64 if WAVES_N=4
-constexpr int BLOCK_K = WK;                  // 16
+constexpr int BLOCK_K = WK * WAVES_K;                  // 16
 constexpr int LANE_PER_WAVE = 64;
 constexpr int WAVES_PER_BLOCK = WAVES_M * WAVES_N;
 
@@ -59,6 +63,31 @@ __device__ inline f32x4 mfma_16x16x16_bf16(bf16x4 a_vec, bf16x4 b_vec, f32x4 c_v
 // ===== Lane → (row/col-group) mapping helpers =====
 __device__ inline int lane_row(int lane)   { return lane & 15; }   // 0..15
 __device__ inline int lane_group(int lane) { return lane >> 4; }   // 0..3
+
+__device__ inline bf16x4 make_a_vec_k(const uint16_t* __restrict__ sA,
+                                       int ldA, int aRowBase, int kOff, int lane) {
+    const int r   = aRowBase + lane_row(lane);
+    const int grp = lane_group(lane);
+    bf16x4 v;
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        v[i] = sA[r * ldA + (kOff + grp * 4 + i)];
+    }
+    return v;
+}
+
+__device__ inline bf16x4 make_b_vec_k(const uint16_t* __restrict__ sB,
+                                       int ldB, int bColBase, int kOff, int lane) {
+    const int col = bColBase + lane_row(lane);
+    const int grp = lane_group(lane);
+    bf16x4 v;
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        v[i] = sB[col * ldB + (kOff + grp * 4 + i)];
+    }
+    return v;
+}
+
 
 // ===== Build the per-lane bf16x4 operands from LDS tiles =====
 // A is in LDS row-major [BLOCK_M x BLOCK_K] with ldA = BLOCK_K
@@ -303,9 +332,10 @@ void gemm_mfma_f32xbf16_kernel_opt(
         }
 
         // Consume current tiles
-        {
-            bf16x4 avec = make_a_vec(currA, ldA, aRowBase, lane);
-            bf16x4 bvec = make_b_vec(currB, ldB, bColBase, lane);
+        #pragma unroll
+        for (int kk = 0; kk < BLOCK_K; kk += WK) {
+            bf16x4 avec = make_a_vec_k(currA, ldA, aRowBase, kk, lane);
+            bf16x4 bvec = make_b_vec_k(currB, ldB, bColBase, kk, lane);
             acc = mfma_16x16x16_bf16(avec, bvec, acc);
         }
 
@@ -329,9 +359,12 @@ void gemm_mfma_f32xbf16_kernel_opt(
 
         __syncthreads();
 
-        bf16x4 avec = make_a_vec(nextA, ldA, aRowBase, lane);
-        bf16x4 bvec = make_b_vec(nextB, ldB, bColBase, lane);
-        acc = mfma_16x16x16_bf16(avec, bvec, acc);
+        #pragma unroll
+        for (int kk = 0; kk < BLOCK_K; kk += WK) {
+            bf16x4 avec = make_a_vec_k(currA, ldA, aRowBase, kk, lane);
+            bf16x4 bvec = make_b_vec_k(currB, ldB, bColBase, kk, lane);
+            acc = mfma_16x16x16_bf16(avec, bvec, acc);
+        }
         __syncthreads();
     }
 

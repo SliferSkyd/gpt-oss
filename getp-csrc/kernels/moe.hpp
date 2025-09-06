@@ -317,7 +317,7 @@ __device__ inline void store_c_tile_addbias(
 #define WAVES_M_MLP 1
 #endif
 #ifndef WAVES_N_MLP
-#define WAVES_N_MLP 8
+#define WAVES_N_MLP 4
 #endif
 
 static_assert(WM == 16 && WN == 16 && WK == 16, "This MFMA microkernel assumes 16x16x16 bf16 tiles.");
@@ -597,10 +597,12 @@ __global__ void grouped_mlp1_bf16_kernel(
             else          copy_B_tile_vec_MLP<false, ldB>(nextB32, W_e, n0, N, K, kNext, linearT, threadsPerBlock);
         }
 
-        bf16x4 avec = make_a_vec(currA, ldA, aRowBase, lane);
-        bf16x4 bvec = make_b_vec(currB, ldB, bColBase, lane);
-        acc = mfma_16x16x16_bf16(avec, bvec, acc);
-
+        #pragma unroll
+        for (int kk = 0; kk < BLOCK_K; kk += WK) {
+            bf16x4 avec = make_a_vec_k(currA, ldA, aRowBase, kk, lane);
+            bf16x4 bvec = make_b_vec_k(currB, ldB, bColBase, kk, lane);
+            acc = mfma_16x16x16_bf16(avec, bvec, acc);
+        }
         __syncthreads();
         if (kNext < Kmain) {
             uint16_t* tA = currA; currA = nextA; nextA = tA;
@@ -619,9 +621,12 @@ __global__ void grouped_mlp1_bf16_kernel(
         else          copy_B_tile_vec_MLP<false, ldB>(nextB32, W_e, n0, N, K, Kmain, linearT, threadsPerBlock);
 
         __syncthreads();
-        bf16x4 avec = make_a_vec(nextA, ldA, aRowBase, lane);
-        bf16x4 bvec = make_b_vec(nextB, ldB, bColBase, lane);
-        acc = mfma_16x16x16_bf16(avec, bvec, acc);
+        #pragma unroll
+        for (int kk = 0; kk < BLOCK_K; kk += WK) {
+            bf16x4 avec = make_a_vec_k(nextA, ldA, aRowBase, kk, lane);
+            bf16x4 bvec = make_b_vec_k(nextB, ldB, bColBase, kk, lane);
+            acc = mfma_16x16x16_bf16(avec, bvec, acc);
+        }
         __syncthreads();
     }
 
@@ -723,9 +728,12 @@ __global__ void grouped_mlp2_bf16_bias_kernel(
             else          copy_B_tile_vec_MLP<false, ldB>(nextB32, W_e, n0, N, K, kNext, linearT, threadsPerBlock);
         }
 
-        bf16x4 avec = make_a_vec(currA, ldA, aRowBase, lane);
-        bf16x4 bvec = make_b_vec(currB, ldB, bColBase, lane);
-        acc = mfma_16x16x16_bf16(avec, bvec, acc);
+        #pragma unroll
+        for (int kk = 0; kk < BLOCK_K; kk += WK) {
+            bf16x4 avec = make_a_vec_k(currA, ldA, aRowBase, kk, lane);
+            bf16x4 bvec = make_b_vec_k(currB, ldB, bColBase, kk, lane);
+            acc = mfma_16x16x16_bf16(avec, bvec, acc);
+        }
 
         __syncthreads();
         if (kNext < Kmain) {
@@ -744,9 +752,12 @@ __global__ void grouped_mlp2_bf16_bias_kernel(
         else          copy_B_tile_vec_MLP<false, ldB>(nextB32, W_e, n0, N, K, Kmain, linearT, threadsPerBlock);
 
         __syncthreads();
-        bf16x4 avec = make_a_vec(nextA, ldA, aRowBase, lane);
-        bf16x4 bvec = make_b_vec(nextB, ldB, bColBase, lane);
-        acc = mfma_16x16x16_bf16(avec, bvec, acc);
+        #pragma unroll
+        for (int kk = 0; kk < BLOCK_K; kk += WK) {
+            bf16x4 avec = make_a_vec_k(currA, ldA, aRowBase, kk, lane);
+            bf16x4 bvec = make_b_vec_k(currB, ldB, bColBase, kk, lane);
+            acc = mfma_16x16x16_bf16(avec, bvec, acc);
+        }
         __syncthreads();
     }
 
