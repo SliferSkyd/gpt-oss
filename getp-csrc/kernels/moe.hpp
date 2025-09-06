@@ -635,6 +635,310 @@ __global__ void grouped_mlp1_bf16_kernel(
         }
     }
 }
+__global__ void grouped_mlp1_bf16_fused_swiglu_kernel(
+    float* __restrict__ gate_up,                 // [sum_tokens, D]
+    const float* __restrict__ A,                 // [sum_tokens, K]
+    const __hip_bfloat16* __restrict__ W1,       // [E, 2D, K] (bf16, row-major O=2D, I=K)
+    const __hip_bfloat16* __restrict__ b1,       // [E, 2D]    (bf16)
+    const int* __restrict__ expert_offsets,      // [E]
+    const int* __restrict__ expert_counts,       // [E]
+    const int* __restrict__ tile2expert,         // [#mtile]
+    const int* __restrict__ tile2local,          // [#mtile]
+    int E, int K, int D,
+    float clamp_limit, float alpha_silu /*=1.702f*/)
+{
+    const int mtile_id = blockIdx.y;
+    const int e_tile   = tile2expert[mtile_id];      // used for matmul W selection
+    const int tile_m   = tile2local[mtile_id];
+
+    const int m_start  = expert_offsets[e_tile] + tile_m * BLOCK_M_MLP;
+    const int m_left   = expert_counts[e_tile]  - tile_m * BLOCK_M_MLP;
+    if (m_left <= 0) return;
+
+    const int N = 2 * D;
+    const int n0 = blockIdx.x * BLOCK_N_MLP;
+
+    const int lane   = threadIdx.x;
+    const int wave   = threadIdx.y;
+    const int wave_m = wave / WAVES_N_MLP;
+    const int wave_n = wave % WAVES_N_MLP;
+
+    extern __shared__ uint8_t smemRaw[];
+    const int ldA = BLOCK_K + PAD_K_MLP;
+    const int ldB = BLOCK_K + PAD_K_MLP;
+
+    uint16_t* sA0_u16 = reinterpret_cast<uint16_t*>(smemRaw);
+    uint16_t* sA1_u16 = sA0_u16 + (BLOCK_M_MLP * ldA);
+    uint16_t* sB0_u16 = sA1_u16 + (BLOCK_M_MLP * ldA);
+    uint16_t* sB1_u16 = sB0_u16 + (ldB * BLOCK_N_MLP);
+    float*    sOut    = reinterpret_cast<float*>(sB1_u16 + (ldB * BLOCK_N_MLP)); // [BLOCK_N_MLP, BLOCK_M_MLP] col-major
+
+    uint32_t* sA0_u32 = reinterpret_cast<uint32_t*>(sA0_u16);
+    uint32_t* sA1_u32 = reinterpret_cast<uint32_t*>(sA1_u16);
+    uint32_t* sB0_u32 = reinterpret_cast<uint32_t*>(sB0_u16);
+    uint32_t* sB1_u32 = reinterpret_cast<uint32_t*>(sB1_u16);
+
+    f32x4 acc = {0.f, 0.f, 0.f, 0.f};
+
+    const int threadsPerBlock = blockDim.x * blockDim.y;
+    const int linearT         = wave * blockDim.x + lane;
+
+    const int M_bound = m_start + m_left;
+
+    // per-expert weights for this block's expert tile
+    const __hip_bfloat16* __restrict__ W_e = W1 + (size_t)e_tile * (size_t)N * (size_t)K;
+
+    const bool alignedA = (((uintptr_t)A & 0x7)==0) && ((K & 1)==0);
+    const bool use128bW = (((uintptr_t)W_e & 0xF)==0) && ((K & 7)==0);
+
+    // preload k=0
+    if (alignedA) copy_A_tile_vec<true,  /*LD_A=*/ldA>(sA0_u32, A, m_start, M_bound, K, 0, linearT, threadsPerBlock);
+    else          copy_A_tile_vec<false, /*LD_A=*/ldA>(sA0_u32, A, m_start, M_bound, K, 0, linearT, threadsPerBlock);
+
+    if (use128bW) copy_B_tile_vec<true,  /*LD_B=*/ldB>(sB0_u32, W_e, n0, N, K, 0, linearT, threadsPerBlock);
+    else          copy_B_tile_vec<false, /*LD_B=*/ldB>(sB0_u32, W_e, n0, N, K, 0, linearT, threadsPerBlock);
+
+    __syncthreads();
+
+    uint16_t* currA = sA0_u16; uint16_t* nextA = sA1_u16;
+    uint16_t* currB = sB0_u16; uint16_t* nextB = sB1_u16;
+    uint32_t* nextA32 = sA1_u32;
+    uint32_t* nextB32 = sB1_u32;
+
+    const int aRowBase = wave_m * WM;
+    const int bColBase = wave_n * WN;
+
+    const int BK_   = BLOCK_K;
+    const int Kmain = (K / BK_) * BK_;
+    const bool has_tail = (Kmain < K);
+
+#pragma unroll 1
+    for (int k0 = 0; k0 < Kmain; k0 += BK_) {
+        const int kNext = k0 + BK_;
+        if (kNext < Kmain) {
+            if (alignedA) copy_A_tile_vec<true,  ldA>(nextA32, A, m_start, M_bound, K, kNext, linearT, threadsPerBlock);
+            else          copy_A_tile_vec<false, ldA>(nextA32, A, m_start, M_bound, K, kNext, linearT, threadsPerBlock);
+
+            if (use128bW) copy_B_tile_vec<true,  ldB>(nextB32, W_e, n0, N, K, kNext, linearT, threadsPerBlock);
+            else          copy_B_tile_vec<false, ldB>(nextB32, W_e, n0, N, K, kNext, linearT, threadsPerBlock);
+        }
+
+        bf16x4 avec = make_a_vec(currA, ldA, aRowBase, lane);
+        bf16x4 bvec = make_b_vec(currB, ldB, bColBase, lane);
+        acc = mfma_16x16x16_bf16(avec, bvec, acc);
+
+        __syncthreads();
+        if (kNext < Kmain) {
+            uint16_t* tA = currA; currA = nextA; nextA = tA;
+            uint16_t* tB = currB; currB = nextB; nextB = tB;
+            nextA32 = reinterpret_cast<uint32_t*>(nextA);
+            nextB32 = reinterpret_cast<uint32_t*>(nextB);
+        }
+    }
+
+    if (has_tail) {
+        if (alignedA) copy_A_tile_vec<true,  ldA>(nextA32, A, m_start, M_bound, K, Kmain, linearT, threadsPerBlock);
+        else          copy_A_tile_vec<false, ldA>(nextA32, A, m_start, M_bound, K, Kmain, linearT, threadsPerBlock);
+
+        if (use128bW) copy_B_tile_vec<true,  ldB>(nextB32, W_e, n0, N, K, Kmain, linearT, threadsPerBlock);
+        else          copy_B_tile_vec<false, ldB>(nextB32, W_e, n0, N, K, Kmain, linearT, threadsPerBlock);
+
+        __syncthreads();
+        bf16x4 avec = make_a_vec(nextA, ldA, aRowBase, lane);
+        bf16x4 bvec = make_b_vec(nextB, ldB, bColBase, lane);
+        acc = mfma_16x16x16_bf16(avec, bvec, acc);
+        __syncthreads();
+    }
+
+    // --- stage to LDS as [col_local, row_local] = col-major for neighbor access
+    const int rowBase = m_start + wave_m * WM + lane_group(lane) * 4;
+    const int col     = n0 + wave_n * WN + lane_row(lane);
+
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        const int row = rowBase + i;
+        if (row < M_bound && col < N) {
+            const int col_local = col - n0;
+            const int row_local = row - m_start;
+            sOut[col_local * BLOCK_M_MLP + row_local] = acc[i];
+        }
+    }
+    __syncthreads();
+
+    // --- fused bias + SwiGLU; resolve expert per row (correctness)
+    if ((col < N) && ((col & 1) == 0)) {
+        const int col_local = col - n0;
+        const int col_local_up = col_local + 1;
+        if (col_local_up < BLOCK_N_MLP && (col + 1) < N) {
+            const int d = (col >> 1);
+
+#pragma unroll
+            for (int i = 0; i < 4; ++i) {
+                const int row = rowBase + i;
+                if (row >= M_bound) continue;
+
+                // binary search expert e for this row
+                int lo = 0, hi = E;
+                while (lo < hi) {
+                    int mid = (lo + hi) >> 1;
+                    const int start = expert_offsets[mid];
+                    const int end   = start + expert_counts[mid];
+                    if (row >= end)       lo = mid + 1;
+                    else if (row < start) hi = mid;
+                    else { lo = mid; break; }
+                }
+                const int e_row = lo; // expert for this row
+
+                // read gate/up from LDS
+                const int row_local = row - expert_offsets[e_row]; // local row inside its expert pack
+                // Our sOut tile covers only rows belonging to e_tile for this block.
+                // Because rows in this block are guaranteed to be within [m_start, M_bound) of e_tile,
+                // e_row == e_tile always holds. We keep the general 'e_row' only for bias selection.
+                const float gate = sOut[col_local    * BLOCK_M_MLP + (row - m_start)];
+                const float up   = sOut[col_local_up * BLOCK_M_MLP + (row - m_start)];
+
+                // per-expert bias
+                const size_t e2D = (size_t)e_row * (size_t)N;
+                const float bg = __bfloat162float(b1[e2D + (size_t)col    ]);
+                const float bu = __bfloat162float(b1[e2D + (size_t)col + 1]);
+
+                float gx = fminf(fmaxf(gate + bg, -clamp_limit), clamp_limit);
+                float uy = fminf(fmaxf(up   + bu, -clamp_limit), clamp_limit);
+
+                const float sig = 1.0f / (1.0f + fast_expf(-alpha_silu * gx));
+                gx *= sig;
+                const float out = fmaf(gx, uy, gx); // gx*(uy+1)
+
+                gate_up[(size_t)row * (size_t)D + (size_t)d] = out;
+            }
+        }
+    }
+}
+
+/**
+ * Block-per-token fused MLP1 (A @ W1 + b) + SwiGLU -> gate_up
+ *
+ * Each block handles one token t:
+ *  - Cooperatively stage A[t, :] (length K) into shared memory once
+ *  - Threads iterate over d (0..D-1) in a strided loop
+ *
+ * Shapes:
+ *   A:        [sum_tokens, K]                 (float)
+ *   W1:       [E, 2*D, K]  row-major          (bf16), rows 2d(gate),2d+1(up)
+ *   b1:       [E, 2*D]                        (bf16)
+ *   gate_up:  [sum_tokens, D]                 (float)
+ * Routing:
+ *   expert_offsets/expert_counts partition rows of A by expert.
+ */
+
+__global__ void mlp1_fused_swiglu_kernel_opt2(
+    float* __restrict__ gate_up,                 // [sum_tokens, D]
+    const float* __restrict__ A,                 // [sum_tokens, K]
+    const __hip_bfloat16* __restrict__ W1,       // [E, 2*D, K] (bf16)
+    const __hip_bfloat16* __restrict__ b1,       // [E, 2*D]    (bf16)
+    const int* __restrict__ expert_offsets,      // [E]
+    const int* __restrict__ expert_counts,       // [E]
+    int E, int K, int D, int sum_tokens,
+    float clamp_limit, float alpha_silu /*=1.702f*/)
+{
+    const int t = blockIdx.x;             // one token (row) per block
+    if (t >= sum_tokens) return;
+
+    extern __shared__ float sA[];         // size K (in floats)
+
+    // --- Find expert 'e' for this token row t (thread 0 does a binary search) ---
+    __shared__ int e_shared;
+    if (threadIdx.x == 0) {
+        int lo = 0, hi = E;
+        while (lo < hi) {
+            int mid   = (lo + hi) >> 1;
+            int start = expert_offsets[mid];
+            int end   = start + expert_counts[mid];
+            if (t >= end)       lo = mid + 1;
+            else if (t < start) hi = mid;
+            else { lo = mid; break; }
+        }
+        e_shared = lo;
+    }
+    __syncthreads();
+    const int e = e_shared;
+
+    // --- Stage A[t, :] into shared memory (cooperative load) ---
+    const float* __restrict__ arow = A + (size_t)t * (size_t)K;
+
+    // vectorized when possible
+    int lane = threadIdx.x;
+    int i = lane << 2; // *4
+    for (; i + 3 < K; i += (blockDim.x << 2)) {
+        *reinterpret_cast<float4*>(&sA[i]) = *reinterpret_cast<const float4*>(&arow[i]);
+    }
+    // tail (0..3) elements per thread as needed
+    for (; i < K; i += blockDim.x) {
+        sA[i] = arow[i];
+    }
+    __syncthreads();
+
+    // --- Precompute expert base pointers for W and bias ---
+    const size_t e_base_2D_K = (size_t)e * (size_t)(2 * D) * (size_t)K;
+    const size_t e_base_2D   = (size_t)e * (size_t)(2 * D);
+
+    // --- Each thread computes multiple d channels in a strided loop ---
+    for (int d = threadIdx.x; d < D; d += blockDim.x) {
+        const __hip_bfloat16* __restrict__ W_gate =
+            W1 + e_base_2D_K + (size_t)(2 * d + 0) * (size_t)K;
+        const __hip_bfloat16* __restrict__ W_up   =
+            W1 + e_base_2D_K + (size_t)(2 * d + 1) * (size_t)K;
+
+        const float b_gate = __bfloat162float(b1[e_base_2D + (size_t)(2 * d + 0)]);
+        const float b_up   = __bfloat162float(b1[e_base_2D + (size_t)(2 * d + 1)]);
+
+        float g = 0.f;
+        float u = 0.f;
+
+        int k = 0;
+        // Unrolled/vectorized dot products over K using sA (shared)
+        for (; k + 3 < K; k += 4) {
+            const float4 av = *reinterpret_cast<const float4*>(&sA[k]);
+
+            const float wg0 = __bfloat162float(W_gate[k + 0]);
+            const float wg1 = __bfloat162float(W_gate[k + 1]);
+            const float wg2 = __bfloat162float(W_gate[k + 2]);
+            const float wg3 = __bfloat162float(W_gate[k + 3]);
+
+            const float wu0 = __bfloat162float(W_up[k + 0]);
+            const float wu1 = __bfloat162float(W_up[k + 1]);
+            const float wu2 = __bfloat162float(W_up[k + 2]);
+            const float wu3 = __bfloat162float(W_up[k + 3]);
+
+            g = fmaf(av.x, wg0, g);
+            g = fmaf(av.y, wg1, g);
+            g = fmaf(av.z, wg2, g);
+            g = fmaf(av.w, wg3, g);
+
+            u = fmaf(av.x, wu0, u);
+            u = fmaf(av.y, wu1, u);
+            u = fmaf(av.z, wu2, u);
+            u = fmaf(av.w, wu3, u);
+        }
+        for (; k < K; ++k) {
+            const float a = sA[k];
+            g = fmaf(a, __bfloat162float(W_gate[k]), g);
+            u = fmaf(a, __bfloat162float(W_up  [k]), u);
+        }
+
+        // Bias + clamp
+        g = fminf(fmaxf(g + b_gate, -clamp_limit), clamp_limit);
+        u = fminf(fmaxf(u + b_up,   -clamp_limit), clamp_limit);
+
+        // SwiGLU: swish(g) * (u + 1), swish(x)=x*sigmoid(alpha*x)
+        const float sig = 1.0f / (1.0f + fast_expf(-alpha_silu * g));
+        g *= sig;
+        const float out = fmaf(g, u, g);   // g*(u+1)
+
+        gate_up[(size_t)t * (size_t)D + (size_t)d] = out;
+    }
+}
+
 
 #ifndef PAD_K_MLP
 #define PAD_K_MLP 0

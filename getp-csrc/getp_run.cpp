@@ -1001,39 +1001,78 @@ HIP_CHECK(hipMemcpy(d_tile2local,  h_tile2local.data(),
   HIP_CHECK(hipMemset(s->e_agg, 0, (size_t)batch_size * H * sizeof(float)));
 
    // Grouped MLP1
-   {
-     const size_t seg1_elems = (size_t)(2 * D) * H;
-     const size_t layer1_elem_off = (size_t)layer_idx * E * seg1_elems;
-     const __hip_bfloat16* W1_layer = w->w_mlp1 + layer1_elem_off;
+//    {
+//      const size_t seg1_elems = (size_t)(2 * D) * H;
+//      const size_t layer1_elem_off = (size_t)layer_idx * E * seg1_elems;
+//      const __hip_bfloat16* W1_layer = w->w_mlp1 + layer1_elem_off;
 
-     dim3 grid((2*D + BLOCK_N_MLP - 1) / BLOCK_N_MLP, total_mtiles);
-     dim3 block(LANE_PER_WAVE, WAVES_PER_BLOCK_MLP);
-     size_t shmem = (size_t)(2*BLOCK_M_MLP*BLOCK_K + 2*BLOCK_K*BLOCK_N_MLP) * sizeof(uint16_t);
+//      dim3 grid((2*D + BLOCK_N_MLP - 1) / BLOCK_N_MLP, total_mtiles);
+//      dim3 block(LANE_PER_WAVE, WAVES_PER_BLOCK_MLP);
+//      size_t shmem = (size_t)(2*BLOCK_M_MLP*BLOCK_K + 2*BLOCK_K*BLOCK_N_MLP) * sizeof(uint16_t);
 
-    {
-        // TIMER_BLOCK("grouped_mlp1_bf16_kernel");
-        hipLaunchKernelGGL(grouped_mlp1_bf16_kernel, grid, block, shmem, s0,
-    s->mlp1_out, s->expert_input_buffer, W1_layer,
-    s->d_expert_offsets, s->d_expert_counts,
-    d_tile2expert, d_tile2local,            // NEW
-    E, H, 2*D);
+//     {
+//         // TIMER_BLOCK("grouped_mlp1_bf16_kernel");
+//         hipLaunchKernelGGL(grouped_mlp1_bf16_kernel, grid, block, shmem, s0,
+//     s->mlp1_out, s->expert_input_buffer, W1_layer,
+//     s->d_expert_offsets, s->d_expert_counts,
+//     d_tile2expert, d_tile2local,            // NEW
+//     E, H, 2*D);
+// }
+//      HIP_CHECK(hipGetLastError());
+//    }
+
+//    // fused bias + SwiGLU
+//    {
+//     // TIMER_BLOCK("bias_swiglu_epilogue_kernel");
+//      const __hip_bfloat16* b1_layer = w->b_mlp1 + (size_t)layer_idx * E * (2*D);
+//      const size_t work = (size_t)total_tokens * D;
+//      const int T = 256;
+//      const dim3 grid((work + T - 1)/T), block(T);
+//     bias_swiglu_epilogue_kernel<<<grid, block, 0, s0>>>(
+//        s->mlp1_out, b1_layer,
+//        s->d_expert_offsets, s->d_expert_counts, E,
+//        s->gate_up, D, total_tokens, p->swiglu_limit, 1.702f);
+//      HIP_CHECK(hipGetLastError());
+//    }
+
+// --- Grouped MLP1 (FUSED) ---
+// === FUSED MLP1 (matmul + bias + SwiGLU) -> gate_up ===
+// === Fused Grouped MLP1 (BF16) + bias + SwiGLU -> gate_up ===
+// === FUSED & OPTIMIZED MLP1 (matmul + bias + SwiGLU) -> gate_up ===
+// === FUSED & OPT2 (block-per-token, shared A row) MLP1 -> gate_up ===
+{
+    TIMER_BLOCK("mlp1_fused_swiglu_kernel_opt2");
+
+    const size_t seg1_elems = (size_t)(2 * D) * (size_t)H;  // 2D * K
+    const size_t layer1_elem_off = (size_t)layer_idx * (size_t)E * seg1_elems;
+    const __hip_bfloat16* W1_layer = w->w_mlp1 + layer1_elem_off;
+    const __hip_bfloat16* b1_layer =
+        w->b_mlp1 + (size_t)layer_idx * (size_t)E * (size_t)(2 * D);
+
+    const int sum_tokens = total_tokens; // computed earlier
+    if (sum_tokens > 0) {
+        // one block per token row; threads stride over d
+        const int T = 256; // try 256; you can also try 320 (10 warps)
+        const dim3 grid((unsigned)sum_tokens);
+        const dim3 block(T);
+        const size_t shmem_bytes = (size_t)H * sizeof(float); // K == H here
+
+        mlp1_fused_swiglu_kernel_opt2<<<grid, block, shmem_bytes, s0>>>(
+            s->gate_up,                 // [sum_tokens, D]
+            s->expert_input_buffer,     // [sum_tokens, K]
+            W1_layer,                   // [E, 2D, K] (bf16)
+            b1_layer,                   // [E, 2D]    (bf16)
+            s->d_expert_offsets,        // [E]
+            s->d_expert_counts,         // [E]
+            E, H, D, sum_tokens,
+            p->swiglu_limit, 1.702f
+        );
+        HIP_CHECK(hipGetLastError());
+    }
 }
-     HIP_CHECK(hipGetLastError());
-   }
 
-   // fused bias + SwiGLU
-   {
-    // TIMER_BLOCK("bias_swiglu_epilogue_kernel");
-     const __hip_bfloat16* b1_layer = w->b_mlp1 + (size_t)layer_idx * E * (2*D);
-     const size_t work = (size_t)total_tokens * D;
-     const int T = 256;
-     const dim3 grid((work + T - 1)/T), block(T);
-    bias_swiglu_epilogue_kernel<<<grid, block, 0, s0>>>(
-       s->mlp1_out, b1_layer,
-       s->d_expert_offsets, s->d_expert_counts, E,
-       s->gate_up, D, total_tokens, p->swiglu_limit, 1.702f);
-     HIP_CHECK(hipGetLastError());
-   }
+
+// REMOVE the old bias_swiglu_epilogue_kernel launch entirely (fused away).
 
    // Grouped MLP2 + bias
    {
