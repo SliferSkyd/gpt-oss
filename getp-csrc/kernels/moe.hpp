@@ -1259,3 +1259,333 @@ __global__ void grouped_mlp1_bf16_swiglu_kernel(
         } // n_off
     } // m_off
 }
+
+
+
+__global__ __launch_bounds__(LANE_PER_WAVE * WAVES_PER_BLOCK, 2)
+void grouped_mlp1_bf16_swiglu_mfma_kernel(
+    float *__restrict__ gate_up,            // [total_tokens, D]
+    const float *__restrict__ A,            // [total_tokens, H]
+    const __hip_bfloat16 *__restrict__ W1,  // [E, 2D, H] row-major (N2, K)
+    const __hip_bfloat16 *__restrict__ b1,  // [E, 2D]
+    const int *__restrict__ expert_offsets, // [E]
+    const int *__restrict__ expert_counts,  // [E]
+    const int *__restrict__ mtile_prefix,   // [E+1] (BLOCK_M tiles)
+    int E, int K, int D,                    // K=H, D=intermediate_dim
+    float clamp_limit, float alpha_silu)
+{
+    static_assert(WM == 16 && WN == 16, "MFMA microkernel assumes 16x16 tiles.");
+    static_assert(WK_F32 == 4, "V_MFMA_F32_16x16x4F32 consumes K in chunks of 4.");
+
+    // Map BLOCK_M tile -> expert
+    const int mTileGlobal = blockIdx.y;
+    const int e           = map_tile_to_expert(mTileGlobal, mtile_prefix, E);
+    const int mTileLocal  = mTileGlobal - mtile_prefix[e];
+    const int M_e         = expert_counts[e];
+    if (M_e == 0) return;
+
+    const int N2 = 2 * D;
+
+    // Expert-local origins
+    const int m0 = mTileLocal * BLOCK_M;  // rows (expert-local)
+    const int n0 = blockIdx.x * BLOCK_N;  // cols in N2
+
+    const int lane   = threadIdx.x;       // 0..63
+    const int wave   = threadIdx.y;       // 0..(WAVES_PER_BLOCK-1)
+    const int wave_m = wave / WAVES_N;    // which 16x16 in M
+    const int wave_n = wave % WAVES_N;    // which 16x16 in N
+
+    // LDS ping–pong (FP32): A row-major, B column-major
+    extern __shared__ uint8_t smemRaw[];
+    const int ldA = BLOCK_K + PAD_K_MC;
+    const int ldB = BLOCK_K + PAD_K_MC;
+
+    float* sA0 = reinterpret_cast<float*>(smemRaw);
+    float* sA1 = sA0 + (size_t)BLOCK_M * ldA;
+    float* sB0 = sA1 + (size_t)BLOCK_M * ldA;
+    float* sB1 = sB0 + (size_t)ldB * BLOCK_N;
+    // NEW: accumulator spill space (block-local) for deterministic even/odd pairing
+    float* sC  = sB1 + (size_t)ldB * BLOCK_N;              // [BLOCK_M x BLOCK_N] row-major
+
+    // Per-expert bases
+    const float*          A_e  = A  + (size_t)expert_offsets[e] * K;     // [M_e, K]
+    const __hip_bfloat16* W_e  = W1 + (size_t)e * (size_t)N2 * (size_t)K;// [N2, K]
+    const __hip_bfloat16* b_e  = b1 + (size_t)e * (size_t)N2;            // [N2]
+    float*                GU_e = gate_up + (size_t)expert_offsets[e] * D;// [M_e, D]
+
+    f32x4 acc = {0.f, 0.f, 0.f, 0.f};
+
+    const int threadsPerBlock = blockDim.x * blockDim.y;
+    const int linearT         = wave * blockDim.x + lane;
+
+    // --- cooperative loaders (global -> LDS) ---
+    auto load_A_tile_f32 = [&](float* __restrict__ sA, int kBase) {
+        const int total = BLOCK_M * BLOCK_K;
+        for (int t = linearT; t < total; t += threadsPerBlock) {
+            const int r  = t / BLOCK_K;
+            const int c  = t % BLOCK_K;
+            const int gm = m0 + r;
+            const int gk = kBase + c;
+            const float a = (gm < M_e && gk < K) ? A_e[(size_t)gm * K + gk] : 0.0f;
+            sA[(size_t)r * ldA + c] = a;  // row-major
+        }
+    };
+    auto load_B_tile_cast = [&](float* __restrict__ sB, int kBase) {
+        const int total = BLOCK_N * BLOCK_K;
+        for (int t = linearT; t < total; t += threadsPerBlock) {
+            const int c  = t / BLOCK_K;  // tile column within BLOCK_N
+            const int r  = t % BLOCK_K;  // k within this slab
+            const int gn = n0 + c;
+            const int gk = kBase + r;
+            const float b = (gn < N2 && gk < K)
+                          ? __bfloat162float(W_e[(size_t)gn * K + gk])
+                          : 0.0f;
+            sB[(size_t)c * ldB + r] = b; // column-major
+        }
+    };
+
+    // Preload first slab kBase=0
+    load_A_tile_f32(sA0, 0);
+    load_B_tile_cast(sB0, 0);
+    __syncthreads();
+
+    // Ping–pong
+    float* currA = sA0; float* nextA = sA1;
+    float* currB = sB0; float* nextB = sB1;
+
+    // Per-wave bases inside the block tile
+    const int aRowBase = wave_m * WM;  // which 16 rows
+    const int bColBase = wave_n * WN;  // which 16 cols
+
+    // Main K loop in BLOCK_K chunks; MFMA consumes 4 per step
+    const int Kmain = (K / BLOCK_K) * BLOCK_K;
+#pragma unroll 1
+    for (int k0 = 0; k0 < Kmain; k0 += BLOCK_K) {
+        const int kNext = k0 + BLOCK_K;
+        if (kNext < K) { load_A_tile_f32(nextA, kNext); load_B_tile_cast(nextB, kNext); }
+
+#pragma unroll
+        for (int kk = 0; kk < BLOCK_K; kk += WK_F32) {
+            const float a = make_a_elem_k_f32(currA, ldA, aRowBase, kk, lane);
+            const float b = make_b_elem_k_f32(currB, ldB, bColBase, kk, lane);
+            acc = mfma_16x16x4_f32(a, b, acc);
+        }
+
+        __syncthreads();
+        if (kNext < K) { float* tA = currA; currA = nextA; nextA = tA;
+                         float* tB = currB; currB = nextB; nextB = tB; }
+    }
+
+    // Tail slab
+    if (Kmain < K) {
+        load_A_tile_f32(nextA, Kmain);
+        load_B_tile_cast(nextB, Kmain);
+        __syncthreads();
+
+#pragma unroll
+        for (int kk = 0; kk < BLOCK_K; kk += WK_F32) {
+            const float a = make_a_elem_k_f32(nextA, ldA, aRowBase, kk, lane);
+            const float b = make_b_elem_k_f32(nextB, ldB, bColBase, kk, lane);
+            acc = mfma_16x16x4_f32(a, b, acc);
+        }
+        __syncthreads();
+    }
+
+    // -------- Deterministic epilogue: spill accum tile -> LDS, then pair even/odd --------
+    // Block-local col index this lane owns:
+    const int colLocal = wave_n * WN + lane_row(lane);      // 0..BLOCK_N-1
+    const int rowBaseL = wave_m * WM + lane_group(lane) * 4;// 4 rows this lane writes
+
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        const int rL = rowBaseL + i;                        // 0..BLOCK_M-1
+        // Row-major accumulator tile in LDS
+        sC[(size_t)rL * BLOCK_N + colLocal] = acc[i];
+    }
+    __syncthreads();
+
+    // Only even output columns are produced: take (even, odd) from sC
+    const int colGlobal = n0 + colLocal;
+    if ((colGlobal & 1) == 0) {
+        const int d_col = colGlobal >> 1;                   // maps 2*d -> d
+        // Quick interior check to avoid per-element masking when safe
+        const bool interior_rows = (m0 + BLOCK_M) <= M_e;
+        const bool interior_cols = (n0 + BLOCK_N) <= N2;
+        const bool fast          = interior_rows && interior_cols;
+
+        // Per-column biases (safe even on edges)
+        const float b_even = (colGlobal     < N2) ? __bfloat162float(b_e[colGlobal    ]) : 0.f;
+        const float b_odd  = (colGlobal + 1 < N2) ? __bfloat162float(b_e[colGlobal+1 ]) : 0.f;
+
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            const int rL   = rowBaseL + i;                  // 0..BLOCK_M-1 (tile-local)
+            const int rG   = m0 + rL;                       // expert-local row
+            if (!fast) {
+                if (rG >= M_e || colGlobal >= N2 || (colGlobal + 1) >= N2) continue;
+            }
+
+            // Read (gate, up) from LDS
+            const float gx_raw = sC[(size_t)rL * BLOCK_N + colLocal];       // even
+            const float uy_raw = sC[(size_t)rL * BLOCK_N + (colLocal + 1)]; // odd
+
+            float gx = gx_raw + b_even;
+            float uy = uy_raw + b_odd;
+
+            // Clamp
+            gx = fminf(fmaxf(gx, -clamp_limit), clamp_limit);
+            uy = fminf(fmaxf(uy, -clamp_limit), clamp_limit);
+
+            // SiLU(x) = x * sigmoid(alpha*x)
+            const float sig = 1.0f / (1.0f + fast_expf(-alpha_silu * gx));
+            gx *= sig; // swish(gx)
+
+            // swish * (uy + 1)
+            GU_e[(size_t)rG * (size_t)D + d_col] = fmaf(gx, uy, gx);
+        }
+    }
+}
+
+
+
+__global__ __launch_bounds__(LANE_PER_WAVE * WAVES_PER_BLOCK, 2)
+void grouped_mlp2_bf16_bias_mfma_kernel(
+    float* __restrict__ C,                       // [total_tokens, H]
+    const float* __restrict__ A,                 // [total_tokens, D] (gate_up)
+    const __hip_bfloat16* __restrict__ W2,       // [E, H, D] row-major  (N=H, K=D)
+    const __hip_bfloat16* __restrict__ b2,       // [E, H]    (BF16 bias per output)
+    const int* __restrict__ expert_offsets,      // [E]
+    const int* __restrict__ expert_counts,       // [E]
+    const int* __restrict__ mtile_prefix,        // [E+1] (BLOCK_M tiles prefix)
+    int n_experts,
+    int K,    // D  (intermediate_dim)
+    int N)    // H  (hidden_dim / output dim)
+{
+    // Map global BLOCK_M-sized tile (blockIdx.y) -> expert e and local tile id
+    const int mTileGlobal = blockIdx.y;
+    const int e           = map_tile_to_expert(mTileGlobal, mtile_prefix, n_experts);
+    const int mTileLocal  = mTileGlobal - mtile_prefix[e];
+    const int M_e         = expert_counts[e];
+    if (M_e == 0) return;
+
+    // Expert-local row/col bases for this threadblock
+    const int m0 = mTileLocal * BLOCK_M;          // rows into this expert’s slice
+    const int n0 = blockIdx.x * BLOCK_N;          // cols into output space
+
+    // Per-block wave/lane coordinates
+    const int lane   = threadIdx.x;               // 0..63
+    const int wave   = threadIdx.y;               // 0..(WAVES_PER_BLOCK-1)
+    const int wave_m = wave / WAVES_N;            // which 16x16 tile along M
+    const int wave_n = wave % WAVES_N;            // which 16x16 tile along N
+
+    // LDS ping–pong (FP32 staging):
+    //   sA*: [BLOCK_M x (BLOCK_K+pad)] row-major (A is already FP32)
+    //   sB*: [(BLOCK_K+pad) x BLOCK_N] column-major (W2 cast BF16->FP32 here)
+    extern __shared__ uint8_t smemRaw[];
+    const int ldA = BLOCK_K + PAD_K_MC;
+    const int ldB = BLOCK_K + PAD_K_MC;
+
+    float* sA0 = reinterpret_cast<float*>(smemRaw);
+    float* sA1 = sA0 + (size_t)BLOCK_M * ldA;
+    float* sB0 = sA1 + (size_t)BLOCK_M * ldA;
+    float* sB1 = sB0 + (size_t)ldB * BLOCK_N;
+
+    f32x4 acc = {0.f, 0.f, 0.f, 0.f};
+
+    const int threadsPerBlock = blockDim.x * blockDim.y;
+    const int linearT         = wave * blockDim.x + lane;
+
+    // Per-expert bases
+    const float*            A_e  = A  + (size_t)expert_offsets[e] * K;              // [M_e, K]
+    float*                  C_e  = C  + (size_t)expert_offsets[e] * N;              // [M_e, N]
+    const __hip_bfloat16*   W_e  = W2 + (size_t)e * (size_t)N * (size_t)K;          // [N, K] row-major
+    const __hip_bfloat16*   b_e  = b2 + (size_t)e * (size_t)N;                      // [N]
+
+    // Staging helpers (guard OOB with zeros)
+    auto load_A_tile_f32 = [&](float* __restrict__ sA, int kBase) {
+        const int total = BLOCK_M * BLOCK_K;
+        for (int t = linearT; t < total; t += threadsPerBlock) {
+            const int r  = t / BLOCK_K;
+            const int c  = t % BLOCK_K;
+            const int gm = m0 + r;
+            const int gk = kBase + c;
+            const float a = (gm < M_e && gk < K) ? A_e[(size_t)gm * K + gk] : 0.0f;
+            sA[(size_t)r * ldA + c] = a;
+        }
+    };
+    auto load_B_tile_cast = [&](float* __restrict__ sB, int kBase) {
+        const int total = BLOCK_N * BLOCK_K;
+        for (int t = linearT; t < total; t += threadsPerBlock) {
+            const int c   = t / BLOCK_K;     // column in this BN tile
+            const int r   = t % BLOCK_K;     // k within this slab
+            const int gn  = n0 + c;
+            const int gk  = kBase + r;
+            const float b = (gn < N && gk < K) ? __bfloat162float(W_e[(size_t)gn * K + gk])
+                                               : 0.0f;
+            // Column-major in LDS for B: index = col*ldB + row
+            sB[(size_t)c * ldB + r] = b;
+        }
+    };
+
+    // Preload first slab
+    load_A_tile_f32(sA0, 0);
+    load_B_tile_cast(sB0, 0);
+    __syncthreads();
+
+    // Ping–pong pointers
+    float* currA = sA0; float* nextA = sA1;
+    float* currB = sB0; float* nextB = sB1;
+
+    // Per-wave bases inside the 16x16 block
+    const int aRowBase = wave_m * WM;    // which 16 rows
+    const int bColBase = wave_n * WN;    // which 16 cols
+
+    // Main K loop: consume BLOCK_K per slab in steps of WK_F32 (=4)
+    const int Kmain = (K / BLOCK_K) * BLOCK_K;
+#pragma unroll 1
+    for (int k0 = 0; k0 < Kmain; k0 += BLOCK_K) {
+        const int kNext = k0 + BLOCK_K;
+
+        // Preload next slab
+        if (kNext < K) {
+            load_A_tile_f32(nextA, kNext);
+            load_B_tile_cast(nextB, kNext);
+        }
+
+#pragma unroll
+        for (int kk = 0; kk < BLOCK_K; kk += WK_F32) {
+            const float a = make_a_elem_k_f32(currA, ldA, aRowBase, kk, lane);
+            const float b = make_b_elem_k_f32(currB, ldB, bColBase, kk, lane);
+            acc = mfma_16x16x4_f32(a, b, acc);
+        }
+
+        __syncthreads();
+        if (kNext < K) {
+            float* tA = currA; currA = nextA; nextA = tA;
+            float* tB = currB; currB = nextB; nextB = tB;
+        }
+    }
+
+    // Tail slab (0 < K - Kmain < BLOCK_K)
+    if (Kmain < K) {
+        load_A_tile_f32(nextA, Kmain);
+        load_B_tile_cast(nextB, Kmain);
+        __syncthreads();
+
+#pragma unroll
+        for (int kk = 0; kk < BLOCK_K; kk += WK_F32) {
+            const float a = make_a_elem_k_f32(nextA, ldA, aRowBase, kk, lane);
+            const float b = make_b_elem_k_f32(nextB, ldB, bColBase, kk, lane);
+            acc = mfma_16x16x4_f32(a, b, acc);
+        }
+        __syncthreads();
+    }
+
+    // Store with fused BF16 bias add (per output column), masking edges
+    const bool interior = (m0 + BLOCK_M) <= M_e && (n0 + BLOCK_N) <= N;
+    if (interior) {
+        store_c_tile_addbias<true >(C_e, acc, b_e, M_e, N, m0, n0, wave_m, wave_n, lane);
+    } else {
+        store_c_tile_addbias<false>(C_e, acc, b_e, M_e, N, m0, n0, wave_m, wave_n, lane);
+    }
+}
