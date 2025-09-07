@@ -718,3 +718,8 @@ inline void matmul_mc_k4(
         grid, block, shmem_bytes, stream,
         output, input, weight, M, K, N);
 }
+
+
+
+
+
