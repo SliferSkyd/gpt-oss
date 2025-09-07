@@ -164,178 +164,6 @@ __global__ void add_sinks_kernel(float *att, const __hip_bfloat16 *sinks, const 
     }
 }
 
-/**
- * @brief Fused attention kernel for AMD GPUs using HIP.
- *
- * This single kernel performs four sequential operations from the original attention mechanism:
- * 1.  **Attention Score Calculation**: Computes dot-product scores between queries (Q) and keys (K).
- * 2.  **Add Sinks**: Adds special "sink" values to the attention scores.
- * 3.  **Softmax**: Applies a numerically stable softmax to the scores to get attention weights.
- * 4.  **Weighted Sum**: Computes the weighted sum of values (V) using the attention weights.
- *
- * This fusion minimizes kernel launch overhead and leverages fast on-chip shared memory
- * for intermediate data (attention scores), significantly reducing global memory traffic.
- *
- * @param output The output buffer for the attention head [batch_size, n_heads, head_dim].
- * @param q The query vectors [batch_size, n_heads * head_dim].
- * @param key_cache The key cache [batch_size, n_layers, seq_len, kv_dim].
- * @param value_cache The value cache [batch_size, n_layers, seq_len, kv_dim].
- * @param sinks The attention sink values [n_layers, n_heads].
- * @param mask The sliding window attention mask [seq_len, seq_len].
- * @param positions The current sequence position for each item in the batch [batch_size].
- * @param batch_size The number of sequences being processed in parallel.
- * @param n_heads The number of attention heads.
- * @param n_kv_heads The number of key/value heads (for Grouped-Query Attention).
- * @param head_dim The dimension of each attention head.
- * @param seq_len The maximum sequence length of the model.
- * @param n_layers The total number of layers in the model.
- * @param layer_idx The index of the current transformer layer.
- * @param use_sliding_window A flag to enable the sliding window attention mask.
- */
-__global__ void fused_attention_kernel_old(
-    float *output,                     // Output: [batch, n_heads, head_dim]
-    const float *q,                    // Input Q: [batch, n_heads * head_dim]
-    const __hip_bfloat16 *key_cache,   // K Cache: [batch, n_layers, seq_len, kv_dim]
-    const __hip_bfloat16 *value_cache, // V Cache: [batch, n_layers, seq_len, kv_dim]
-    const __hip_bfloat16 *sinks,       // Sinks: [n_layers, n_heads]
-    const float *mask,                 // Mask: [seq_len, seq_len]
-    const int *positions,              // Positions: [batch]
-    int batch_size, int n_heads, int n_kv_heads, int head_dim,
-    int seq_len, int n_layers, int layer_idx,
-    bool use_sliding_window)
-{
-    // --- Shared Memory Declaration ---
-    // Use dynamic shared memory allocated at launch time.
-    extern __shared__ float s_data[];
-    float *s_q = s_data;                        // For the query vector of the current head. Size: head_dim
-    float *s_att = (float *)&s_q[head_dim];     // For attention scores. Size: seq_len
-    float *s_reduce = (float *)&s_att[seq_len]; // For block-wide reductions in softmax. Size: blockDim.x
-
-    // --- Thread & Block Identification ---
-    const int batch_idx = blockIdx.x;
-    const int head_idx = blockIdx.y;
-    const int tid = threadIdx.x;
-
-    // Early exit for padding blocks in the grid
-    if (batch_idx >= batch_size || head_idx >= n_heads)
-        return;
-
-    const int pos = positions[batch_idx];
-
-    // --- GQA (Grouped-Query Attention) Setup ---
-    const int gqa_ratio = n_heads / n_kv_heads;
-    const int kv_head = head_idx / gqa_ratio;
-    const int kv_dim = head_dim * n_kv_heads;
-
-    // --- Set up Global Memory Pointers ---
-    const float *q_head_ptr = q + 1LL * batch_idx * n_heads * head_dim + 1LL * head_idx * head_dim;
-    const __hip_bfloat16 *k_cache_layer_ptr = key_cache + 1LL * batch_idx * n_layers * seq_len * kv_dim + 1LL * layer_idx * seq_len * kv_dim;
-    float *output_ptr = output + 1LL * batch_idx * n_heads * head_dim + 1LL * head_idx * head_dim;
-
-    // --- Step 1: Load Query (Q) into Shared Memory ---
-    // All threads in the block cooperate to load the query vector.
-    for (int i = tid; i < head_dim; i += blockDim.x)
-    {
-        s_q[i] = q_head_ptr[i];
-    }
-    __syncthreads();
-
-    // --- Step 2: Calculate Attention Scores (Q * K^T) ---
-    const float inv_sqrt_head_dim = rsqrtf((float)head_dim);
-    // Parallelize the score calculation over the sequence length `t`.
-    for (int t = tid; t <= pos; t += blockDim.x)
-    {
-        const __hip_bfloat16 *k_vec = k_cache_layer_ptr + 1LL * t * kv_dim + 1LL * kv_head * head_dim;
-        float score = 0.0f;
-
-        // Dot product between shared Q and global K
-        for (int i = 0; i < head_dim; i++)
-        {
-            score += s_q[i] * __bfloat162float(k_vec[i]);
-        }
-        score *= inv_sqrt_head_dim;
-
-        // Optionally apply sliding window mask
-        if (use_sliding_window && (layer_idx % 2 == 0))
-        {
-            score += mask[1LL * pos * seq_len + t];
-        }
-        s_att[t] = score;
-    }
-    __syncthreads();
-
-    // --- Step 3: Add Sinks ---
-    int softmax_len = pos + 1;
-    if (pos + 1 < seq_len)
-    {
-        if (tid == 0)
-        { // Only one thread needs to write the sink value
-            s_att[pos + 1] = __bfloat162float(sinks[head_idx]);
-        }
-        softmax_len++; // The sink increases the effective sequence length for softmax
-    }
-    __syncthreads();
-
-    // --- Step 4: In-place Softmax in Shared Memory ---
-    // 4.1: Find max value for numerical stability (parallel reduction)
-    float max_val = -INFINITY;
-    for (int t = tid; t < softmax_len; t += blockDim.x) {
-        max_val = fmaxf(max_val, s_att[t]);
-    }
-    s_reduce[tid] = max_val;
-    __syncthreads();
-    for (int offset = blockDim.x / 2; offset > 0; offset >>= 1)
-    {
-        if (tid < offset)
-            s_reduce[tid] = fmaxf(s_reduce[tid], s_reduce[tid + offset]);
-        __syncthreads();
-    }
-    max_val = s_reduce[0];
-    __syncthreads();
-
-    // 4.2: Compute exp(score - max) and sum the results (parallel reduction)
-    float sum_val = 0.0f;
-    for (int t = tid; t < softmax_len; t += blockDim.x)
-    {
-        float val = expf(s_att[t] - max_val);
-        s_att[t] = val; // Store intermediate result back to shared memory
-        sum_val += val;
-    }
-    s_reduce[tid] = sum_val;
-    __syncthreads();
-    for (int offset = blockDim.x / 2; offset > 0; offset >>= 1)
-    {
-        if (tid < offset)
-            s_reduce[tid] += s_reduce[tid + offset];
-        __syncthreads();
-    }
-    sum_val = s_reduce[0];
-    __syncthreads();
-
-    // 4.3: Normalize to get final attention weights
-    const float inv_sum_val = 1.0f / (sum_val + 1e-9f); // Add epsilon for safety
-    for (int t = tid; t < softmax_len; t += blockDim.x)
-    {
-        s_att[t] *= inv_sum_val;
-    }
-    __syncthreads();
-
-    // --- Step 5: Weighted Sum of Values (Att * V) ---
-    const __hip_bfloat16 *v_cache_layer_ptr = value_cache + 1LL * batch_idx * n_layers * seq_len * kv_dim + 1LL * layer_idx * seq_len * kv_dim;
-
-    // Each thread computes one dimension of the final output vector.
-    if (tid < head_dim)
-    {
-        float weighted_sum = 0.0f;
-        // The sum only includes actual tokens, not sinks.
-        for (int t = 0; t <= pos; t++)
-        {
-            const __hip_bfloat16 *v_vec = v_cache_layer_ptr + 1LL * t * kv_dim + 1LL * kv_head * head_dim;
-            weighted_sum += s_att[t] * __bfloat162float(v_vec[tid]);
-        }
-        output_ptr[tid] = weighted_sum;
-    }
-}
 // --- HELPER STRUCTS AND FUNCTIONS FOR EFFICIENT REDUCTIONS (FROM sgemv.cpp) ---
 
 // --- MODIFIED FUSED ATTENTION KERNEL (2-D mapping: lanes x warps) ---
@@ -851,3 +679,134 @@ void fused_output_projection_kernel_optimized(
     if (interior) store_and_fuse_tile<true >(C, bias, acc, M, N, m0, n0, wave_m, wave_n, lane);
     else          store_and_fuse_tile<false>(C, bias, acc, M, N, m0, n0, wave_m, wave_n, lane);
 }
+
+
+
+
+
+
+__global__ __launch_bounds__(64 * WAVES_PER_BLOCK, 2)
+void fused_output_projection_kernel_f32mfma(
+    float* __restrict__ C,                         // [M,N] in/out (residual + out)
+    const float* __restrict__ A,                   // [M,K] fp32
+    const __hip_bfloat16* __restrict__ Wbf16,      // [N,K] bf16 row-major
+    const __hip_bfloat16* __restrict__ bias,       // [N]
+    int M, int K, int N)
+{
+    const int m0 = blockIdx.y * BLOCK_M;
+    const int n0 = blockIdx.x * BLOCK_N;
+
+    const int lane   = threadIdx.x;               // 0..63
+    const int wave   = threadIdx.y;               // 0..(WAVES_PER_BLOCK-1)
+    const int wave_m = wave / WAVES_N;
+    const int wave_n = wave % WAVES_N;
+
+    // LDS ping–pong (FP32 staging; BF16 weights are cast to FP32 on load)
+    extern __shared__ uint8_t smemRaw[];
+    const int ldA = BLOCK_K + PAD_K_MC;          // leading dim in elems
+    const int ldB = BLOCK_K + PAD_K_MC;
+
+    float* sA0 = reinterpret_cast<float*>(smemRaw);
+    float* sA1 = sA0 + (size_t)BLOCK_M * ldA;
+    float* sB0 = sA1 + (size_t)BLOCK_M * ldA;
+    float* sB1 = sB0 + (size_t)ldB * BLOCK_N;
+
+    f32x4 acc = {0.f, 0.f, 0.f, 0.f};
+
+    const int threadsPerBlock = blockDim.x * blockDim.y;
+    const int linearT         = wave * blockDim.x + lane;
+
+    // --- staging helpers (guard OOB with zeros) ---
+    auto load_A_tile_f32 = [&](float* __restrict__ sA, int kBase) {
+        const int total = BLOCK_M * BLOCK_K;
+        for (int t = linearT; t < total; t += threadsPerBlock) {
+            const int r  = t / BLOCK_K;
+            const int c  = t % BLOCK_K;
+            const int gm = m0 + r;
+            const int gk = kBase + c;
+            const float a = (gm < M && gk < K) ? A[(size_t)gm * K + gk] : 0.0f;
+            sA[(size_t)r * ldA + c] = a;
+        }
+    };
+    auto load_B_tile_cast = [&](float* __restrict__ sB, int kBase) {
+        const int total = BLOCK_N * BLOCK_K;
+        for (int t = linearT; t < total; t += threadsPerBlock) {
+            const int c   = t / BLOCK_K;      // column within BN
+            const int r   = t % BLOCK_K;      // k within the slab
+            const int gn  = n0 + c;
+            const int gk  = kBase + r;
+            const float b = (gn < N && gk < K) ? __bfloat162float(Wbf16[(size_t)gn * K + gk])
+                                               : 0.0f;
+            // column-major in LDS: index = col*ldB + row
+            sB[(size_t)c * ldB + r] = b;
+        }
+    };
+
+    // --- preload first slab (kBase=0) ---
+    load_A_tile_f32(sA0, 0);
+    load_B_tile_cast(sB0, 0);
+    __syncthreads();
+
+    // ping-pong pointers
+    float* currA = sA0; float* nextA = sA1;
+    float* currB = sB0; float* nextB = sB1;
+
+    // per-wave bases
+    const int aRowBase = wave_m * WM;   // which 16 rows
+    const int bColBase = wave_n * WN;   // which 16 cols
+
+    // main K loop (BLOCK_K slabs), each slab consumed in steps of 4 (WK_F32)
+    const int Kmain = (K / BLOCK_K) * BLOCK_K;
+#pragma unroll 1
+    for (int k0 = 0; k0 < Kmain; k0 += BLOCK_K) {
+        const int kNext = k0 + BLOCK_K;
+
+        // prefetch next slab while computing current
+        if (kNext < K) {
+            load_A_tile_f32(nextA, kNext);
+            load_B_tile_cast(nextB, kNext);
+        }
+
+        // consume current slab in 4-wide steps along K
+#pragma unroll
+        for (int kk = 0; kk < BLOCK_K; kk += WK_F32) {
+            const float a = make_a_elem_k_f32(currA, ldA, aRowBase, kk, lane);
+            const float b = make_b_elem_k_f32(currB, ldB, bColBase, kk, lane);
+            acc = mfma_16x16x4_f32(a, b, acc);
+        }
+
+        __syncthreads();
+        if (kNext < K) {
+            float* tA = currA; currA = nextA; nextA = tA;
+            float* tB = currB; currB = nextB; nextB = tB;
+        }
+    }
+
+    // tail slab (0 < K - Kmain < BLOCK_K)
+    if (Kmain < K) {
+        load_A_tile_f32(nextA, Kmain);
+        load_B_tile_cast(nextB, Kmain);
+        __syncthreads();
+
+#pragma unroll
+        for (int kk = 0; kk < BLOCK_K; kk += WK_F32) {
+            const float a = make_a_elem_k_f32(nextA, ldA, aRowBase, kk, lane);
+            const float b = make_b_elem_k_f32(nextB, ldB, bColBase, kk, lane);
+            acc = mfma_16x16x4_f32(a, b, acc);
+        }
+        __syncthreads();
+    }
+
+    // fused store: add bias and residual into C (in/out), then write back
+    const bool interior = (m0 + BLOCK_M) <= M && (n0 + BLOCK_N) <= N;
+    if (interior) store_and_fuse_tile<true >(C, bias, acc, M, N, m0, n0, wave_m, wave_n, lane);
+    else          store_and_fuse_tile<false>(C, bias, acc, M, N, m0, n0, wave_m, wave_n, lane);
+}
+
+
+
+
+
+
+
+

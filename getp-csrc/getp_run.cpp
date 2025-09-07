@@ -821,26 +821,36 @@ void attention_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size)
     }
 
     int attn_out_offset = layer_idx * (head_dim * p->n_attn_heads) * hidden_dim;
-
-    {
-        // Launch the simple kernel
-        matmul_mc_k4(
-            s->tb2, s->tb, w->w_o + attn_out_offset, batch_size, head_dim * p->n_attn_heads, hidden_dim);
-        HIP_CHECK(hipGetLastError());
-    }
-
-    // Add bias and residual connection - FIXED: Use GPU bias pointer
     int attn_bias_offset = layer_idx * hidden_dim;
+
     {
-        add_bias_kernel<<<bias_grid, THREADS_PER_BLOCK>>>(
-            s->tb2, w->b_o + attn_bias_offset, batch_size, hidden_dim);
-        HIP_CHECK(hipGetLastError());
-    }
-    {
-        accumulate_kernel<<<(batch_size * hidden_dim + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK, THREADS_PER_BLOCK>>>(
-            s->x, s->tb2, 1.0f, batch_size, hidden_dim);
-        HIP_CHECK(hipGetLastError());
-    }
+    // TIMER_BLOCK("fused_output_projection_kernel_f32mfma");
+
+    int M = batch_size;
+    int N = hidden_dim;
+    int K = head_dim * p->n_attn_heads;
+
+    dim3 gridDim((N + BLOCK_N - 1) / BLOCK_N, (M + BLOCK_M - 1) / BLOCK_M);
+    dim3 blockDim(LANE_PER_WAVE, WAVES_PER_BLOCK);
+
+    // FP32 staging (A and B staged as float)
+    const int ldA = BLOCK_K + PAD_K_MC;
+    const int ldB = BLOCK_K + PAD_K_MC;
+    size_t shared_mem_bytes =
+        sizeof(float) * (size_t)(2 * BLOCK_M * ldA + 2 * ldB * BLOCK_N);
+
+    fused_output_projection_kernel_f32mfma<<<gridDim, blockDim, shared_mem_bytes>>>(
+        s->x,                      // In/out: residual input and final output
+        s->tb,                     // Input from attention weighted sum (A)
+        w->w_o + attn_out_offset,  // Projection weights (BF16) [N,K]
+        w->b_o + attn_bias_offset, // Projection bias (BF16)    [N]
+        M,                         // M
+        K,                         // K
+        N                          // N
+    );
+    HIP_CHECK(hipGetLastError());
+}
+
 }
 
 void moe_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size)
