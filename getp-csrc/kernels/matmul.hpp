@@ -532,3 +532,189 @@ void matmul(
         grid, block, shmem_bytes, stream,
         output, input, weight, M, K, N);
 }
+
+
+// ===== FP32×FP32 MFMA path (16x16x4f32), taking BF16 weights and casting to FP32 =====
+// SAME public API as your previous matmul_mc (A: FP32, W: BF16).  Internally we cast W to FP32
+// and use __builtin_amdgcn_mfma_f32_16x16x4f32, whose signature is (float a, float b, f32x4 c, imm, imm, imm).
+
+#ifndef WK_F32
+#define WK_F32 4
+#endif
+static_assert(WM == 16 && WN == 16, "This MFMA microkernel assumes 16x16 tiles.");
+static_assert(WK_F32 == 4, "V_MFMA_F32_16x16x4F32 consumes 4 along K per instruction.");
+
+// ---- MFMA wrapper: FP32×FP32 → FP32 (one 16x16x4 op per wave) ----
+__device__ inline f32x4 mfma_16x16x4_f32(float a, float b, f32x4 c_vec) {
+    // cbsz, abid, blgp must be immediates
+    return __builtin_amdgcn_mfma_f32_16x16x4f32(a, b, c_vec, 0, 0, 0);
+}
+
+// ---- Lane mapping helpers already exist: lane_row(lane) & lane_group(lane) ----
+// Build per-lane SCALARS for A and B (the intrinsic expects float a,b per lane).
+// A is in LDS row-major [BLOCK_M x (BLOCK_K+pad)] with ldA = BLOCK_K + PAD_K_MC
+__device__ inline float make_a_elem_k_f32(const float* __restrict__ sA,
+                                          int ldA, int aRowBase, int kOff, int lane)
+{
+    const int r   = aRowBase + (lane & 15); // lane_row
+    const int grp = lane >> 4;              // lane_group: 0..3
+    return sA[(size_t)r * ldA + (kOff + grp)]; // one scalar per lane/group
+}
+
+// B is in LDS column-major [(BLOCK_K+pad) x BLOCK_N] with ldB = BLOCK_K + PAD_K_MC
+__device__ inline float make_b_elem_k_f32(const float* __restrict__ sB,
+                                          int ldB, int bColBase, int kOff, int lane)
+{
+    const int col = bColBase + (lane & 15); // lane_row
+    const int grp = lane >> 4;              // 0..3
+    return sB[(size_t)col * ldB + (kOff + grp)];
+}
+
+// ---- Kernel: FP32×(BF16→cast→FP32) → FP32 using MFMA 16x16x4f32 ----
+__global__ __launch_bounds__(LANE_PER_WAVE * WAVES_PER_BLOCK, 2)
+void gemm_mfma_f32xbf16_cast_kernel_opt(
+    float* __restrict__ C,                      // [M, N]
+    const float* __restrict__ A,                // [M, K] FP32 (row-major)
+    const __hip_bfloat16* __restrict__ Wbf16,   // [N, K] BF16 (row-major; weights)
+    int M, int K, int N)
+{
+    const int m0 = blockIdx.y * BLOCK_M;
+    const int n0 = blockIdx.x * BLOCK_N;
+
+    const int lane   = threadIdx.x;                 // 0..63
+    const int wave   = threadIdx.y;                 // 0..(WAVES_PER_BLOCK-1)
+    const int wave_m = wave / WAVES_N;              // which 16×16 tile in M
+    const int wave_n = wave % WAVES_N;              // which 16×16 tile in N
+
+    // LDS ping–pong (float):
+    // sA0,sA1: [BLOCK_M x (BLOCK_K+pad)] row-major (FP32)
+    // sB0,sB1: [(BLOCK_K+pad) x BLOCK_N] column-major (FP32)  <-- (BF16 cast to FP32 here)
+    extern __shared__ uint8_t smemRaw[];
+    const int ldA = BLOCK_K + PAD_K_MC;
+    const int ldB = BLOCK_K + PAD_K_MC;
+
+    float* sA0 = reinterpret_cast<float*>(smemRaw);
+    float* sA1 = sA0 + (size_t)BLOCK_M * ldA;
+    float* sB0 = sA1 + (size_t)BLOCK_M * ldA;
+    float* sB1 = sB0 + (size_t)ldB * BLOCK_N;
+
+    f32x4 acc = {0.f, 0.f, 0.f, 0.f};
+
+    const int threadsPerBlock = blockDim.x * blockDim.y;
+    const int linearT         = wave * blockDim.x + lane;
+
+    // staging helpers (guards out-of-bounds with zeros)
+    auto load_A_tile_f32 = [&](float* __restrict__ sA, int kBase) {
+        const int total = BLOCK_M * BLOCK_K;
+        for (int t = linearT; t < total; t += threadsPerBlock) {
+            const int r  = t / BLOCK_K;
+            const int c  = t % BLOCK_K;
+            const int gm = m0 + r;
+            const int gk = kBase + c;
+            const float a = (gm < M && gk < K) ? A[(size_t)gm * K + gk] : 0.0f;
+            sA[(size_t)r * ldA + c] = a;
+        }
+    };
+    auto load_B_tile_cast = [&](float* __restrict__ sB, int kBase) {
+        const int total = BLOCK_N * BLOCK_K;
+        for (int t = linearT; t < total; t += threadsPerBlock) {
+            const int c   = t / BLOCK_K;   // column in this BN tile
+            const int r   = t % BLOCK_K;   // k within this slab
+            const int gn  = n0 + c;
+            const int gk  = kBase + r;
+            // Cast BF16 -> FP32 on load
+            const float b = (gn < N && gk < K) ? __bfloat162float(Wbf16[(size_t)gn * K + gk])
+                                               : 0.0f;
+            // column-major in LDS: index = col*ldB + row
+            sB[(size_t)c * ldB + r] = b;
+        }
+    };
+
+    // Preload first slab (kBase = 0)
+    load_A_tile_f32(sA0, 0);
+    load_B_tile_cast(sB0, 0);
+    __syncthreads();
+
+    // Ping–pong pointers
+    float* currA = sA0; float* nextA = sA1;
+    float* currB = sB0; float* nextB = sB1;
+
+    // Per-wave bases in the block tile
+    const int aRowBase = wave_m * WM;   // which 16 rows
+    const int bColBase = wave_n * WN;   // which 16 cols
+
+    // Main K loop in BLOCK_K chunks, each chunk consumed in steps of 4 (WK_F32)
+    const int Kmain = (K / BLOCK_K) * BLOCK_K;
+#pragma unroll 1
+    for (int k0 = 0; k0 < Kmain; k0 += BLOCK_K) {
+        const int kNext = k0 + BLOCK_K;
+
+        // Preload next main slab to 'next' while computing 'curr'
+        if (kNext < K) {
+            load_A_tile_f32(nextA, kNext);
+            load_B_tile_cast(nextB, kNext);
+        }
+
+#pragma unroll
+        for (int kk = 0; kk < BLOCK_K; kk += WK_F32) {
+            // NOTE: For 16x16x4f32 the intrinsic takes *scalar* A/B per lane.
+            // The hardware gathers the 4-way K-chunk across the 4 lane-groups.
+            const float a = make_a_elem_k_f32(currA, ldA, aRowBase, kk, lane);
+            const float b = make_b_elem_k_f32(currB, ldB, bColBase, kk, lane);
+            acc = mfma_16x16x4_f32(a, b, acc);
+        }
+
+        __syncthreads();
+        if (kNext < K) {
+            // swap buffers only if there is another full or tail slab
+            float* tA = currA; currA = nextA; nextA = tA;
+            float* tB = currB; currB = nextB; nextB = tB;
+        }
+    }
+
+    // Tail slab (0 < K - Kmain < BLOCK_K)
+    if (Kmain < K) {
+        load_A_tile_f32(nextA, Kmain);
+        load_B_tile_cast(nextB, Kmain);
+        __syncthreads();
+
+        // Use the freshly loaded 'next' buffers for the tail
+#pragma unroll
+        for (int kk = 0; kk < BLOCK_K; kk += WK_F32) {
+            const float a = make_a_elem_k_f32(nextA, ldA, aRowBase, kk, lane);
+            const float b = make_b_elem_k_f32(nextB, ldB, bColBase, kk, lane);
+            acc = mfma_16x16x4_f32(a, b, acc);
+        }
+        __syncthreads();
+    }
+
+    // Stores (same as your BF16 path)
+    const bool interior = (m0 + BLOCK_M) <= M && (n0 + BLOCK_N) <= N;
+    if (interior) store_c_tile_mfma<true >(C, acc, M, N, m0, n0, wave_m, wave_n, lane);
+    else          store_c_tile_mfma<false>(C, acc, M, N, m0, n0, wave_m, wave_n, lane);
+}
+
+// ---- Host wrapper: SAME API as previous matmul_mc (W is BF16) ----
+inline void matmul_mc_k4(
+    float* __restrict__ output,                      // [B, O]
+    const float* __restrict__ input,                 // [B, I] (fp32)
+    const __hip_bfloat16* __restrict__ weight,       // [O, I] (bf16 row-major)
+    int batch_size, int input_dim, int output_dim,
+    hipStream_t stream = nullptr)
+{
+    const int M = batch_size, K = input_dim, N = output_dim;
+
+    dim3 grid((N + BLOCK_N - 1) / BLOCK_N,
+              (M + BLOCK_M - 1) / BLOCK_M);
+    dim3 block(LANE_PER_WAVE, WAVES_PER_BLOCK);
+
+    const int ldA = BLOCK_K + PAD_K_MC;
+    const int ldB = BLOCK_K + PAD_K_MC;
+    const size_t shmem_bytes =
+        sizeof(float) * (size_t)(2 * BLOCK_M * ldA + 2 * ldB * BLOCK_N); // FP32 staging
+
+    hipLaunchKernelGGL(
+        gemm_mfma_f32xbf16_cast_kernel_opt,
+        grid, block, shmem_bytes, stream,
+        output, input, weight, M, K, N);
+}

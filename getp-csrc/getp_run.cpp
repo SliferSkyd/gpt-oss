@@ -738,7 +738,7 @@ void attention_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size)
     grid_dim.y = ((p->n_attn_heads + 2 * p->n_kv_heads) * head_dim + block_dim.y - 1) / block_dim.y; // Ceiling division
     {
         // QKV projection using safer matmul kernel - FIXED: Use GPU weight pointer
-        matmul_mc(
+        matmul_mc_k4(
             s->qkv,
             s->t,
             w->w_qkv + qkv_weight_offset,
@@ -885,7 +885,7 @@ void moe_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size)
      HIP_CHECK(hipGetLastError());
 
 
-    matmul_mc(s->router_score, s->t,
+    matmul_mc_k4(s->router_score, s->t,
            w->w_router + (size_t)layer_idx * H * E,
            batch_size, H, E, s0);
 
@@ -1152,7 +1152,7 @@ int *forward_batch_gpu(GPUTransformer *gpu_t, int *tokens, int batch_size)
     // Output projection -> logits
     {
         // matmul_mc computes [batch, hidden] x [hidden, vocab] -> [batch, vocab]
-        matmul_mc(s->logits, s->x, w->out, batch_size, hidden_dim, p->vocab_size);
+        matmul_mc_k4(s->logits, s->x, w->out, batch_size, hidden_dim, p->vocab_size);
         HIP_CHECK(hipGetLastError());
     }
 
