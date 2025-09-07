@@ -767,8 +767,8 @@ void fused_output_projection_kernel_optimized(
     const bool use128bW  = (((uintptr_t)Wbf16 & 0xF)==0) && ((K & 7)==0); // 16B & K%8==0
 
     // Preload kBase = 0
-    if (alignedA) copy_A_tile_vec</*Aligned*/true,  /*LD_A=*/ldA>(sA0_u32, A, m0, M_bound, K, 0, linearT, threadsPerBlock);
-    else          copy_A_tile_vec</*Aligned*/false, /*LD_A=*/ldA>(sA0_u32, A, m0, M_bound, K, 0, linearT, threadsPerBlock);
+    if (alignedA) copy_A_tile_vec</*Aligned*/true,  /*LD_A=*/ldA>(sA0_u32, A, m0, M, K, 0, linearT, threadsPerBlock);
+    else          copy_A_tile_vec</*Aligned*/false, /*LD_A=*/ldA>(sA0_u32, A, m0, M, K, 0, linearT, threadsPerBlock);
 
     if (use128bW) copy_B_tile_vec</*Use128b*/true,  /*LD_B=*/ldB>(sB0_u32, Wbf16, n0, N, K, 0, linearT, threadsPerBlock);
     else          copy_B_tile_vec</*Use128b*/false, /*LD_B=*/ldB>(sB0_u32, Wbf16, n0, N, K, 0, linearT, threadsPerBlock);
@@ -795,8 +795,8 @@ void fused_output_projection_kernel_optimized(
 
         // Prefetch next main slab
         if (kNext < Kmain) {
-            if (alignedA) copy_A_tile_vec</*Aligned*/true,  /*LD_A=*/ldA>(nextA32, A, m0, M_bound, K, kNext, linearT, threadsPerBlock);
-            else          copy_A_tile_vec</*Aligned*/false, /*LD_A=*/ldA>(nextA32, A, m0, M_bound, K, kNext, linearT, threadsPerBlock);
+            if (alignedA) copy_A_tile_vec</*Aligned*/true,  /*LD_A=*/ldA>(nextA32, A, m0, M, K, kNext, linearT, threadsPerBlock);
+            else          copy_A_tile_vec</*Aligned*/false, /*LD_A=*/ldA>(nextA32, A, m0, M, K, kNext, linearT, threadsPerBlock);
 
             if (use128bW) copy_B_tile_vec</*Use128b*/true,  /*LD_B=*/ldB>(nextB32, Wbf16, n0, N, K, kNext, linearT, threadsPerBlock);
             else          copy_B_tile_vec</*Use128b*/false, /*LD_B=*/ldB>(nextB32, Wbf16, n0, N, K, kNext, linearT, threadsPerBlock);
@@ -821,14 +821,20 @@ void fused_output_projection_kernel_optimized(
     }
 
     // Tail slab (0 < K - Kmain < BLOCK_K)
+    // Tail slab (0 < K - Kmain < BLOCK_K)
     if (has_tail) {
-        if (alignedA) copy_A_tile_vec</*Aligned*/true,  /*LD_A=*/ldA>(nextA32, A, m0, M_bound, K, Kmain, linearT, threadsPerBlock);
-        else          copy_A_tile_vec</*Aligned*/false, /*LD_A=*/ldA>(nextA32, A, m0, M_bound, K, Kmain, linearT, threadsPerBlock);
+        // load the tail into next*
+        if (alignedA) copy_A_tile_vec</*Aligned*/true,  /*LD_A=*/ldA>(nextA32, A, m0, M, K, Kmain, linearT, threadsPerBlock);
+        else          copy_A_tile_vec</*Aligned*/false, /*LD_A=*/ldA>(nextA32, A, m0, M, K, Kmain, linearT, threadsPerBlock);
 
         if (use128bW) copy_B_tile_vec</*Use128b*/true,  /*LD_B=*/ldB>(nextB32, Wbf16, n0, N, K, Kmain, linearT, threadsPerBlock);
         else          copy_B_tile_vec</*Use128b*/false, /*LD_B=*/ldB>(nextB32, Wbf16, n0, N, K, Kmain, linearT, threadsPerBlock);
 
         __syncthreads();
+
+        // <<< fix: consume the tail you just loaded
+        currA = nextA;
+        currB = nextB;
 
         #pragma unroll
         for (int kk = 0; kk < BLOCK_K; kk += WK) {
@@ -838,6 +844,7 @@ void fused_output_projection_kernel_optimized(
         }
         __syncthreads();
     }
+
 
     // Stores
     const bool interior = (m0 + BLOCK_M) <= M && (n0 + BLOCK_N) <= N;

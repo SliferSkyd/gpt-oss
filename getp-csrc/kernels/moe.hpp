@@ -754,8 +754,8 @@ __global__ void grouped_mlp2_bf16_bias_kernel(
         __syncthreads();
         #pragma unroll
         for (int kk = 0; kk < BLOCK_K; kk += WK) {
-            bf16x4 avec = make_a_vec_k(currA, ldA, aRowBase, kk, lane);
-            bf16x4 bvec = make_b_vec_k(currB, ldB, bColBase, kk, lane);
+            bf16x4 avec = make_a_vec_k(nextA, ldA, aRowBase, kk, lane);
+            bf16x4 bvec = make_b_vec_k(nextB, ldB, bColBase, kk, lane);
             acc = mfma_16x16x16_bf16(avec, bvec, acc);
         }
         __syncthreads();

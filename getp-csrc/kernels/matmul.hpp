@@ -20,7 +20,7 @@
 #endif
 
 #ifndef WAVES_M
-#define WAVES_M 2
+#define WAVES_M 1
 #endif
 #ifndef WAVES_N
 #define WAVES_N 4
@@ -152,10 +152,11 @@ __device__ inline uint32_t pack2_bf16_bits_f32(float a0, float a1) {
 }
 
 // Vectorized A load: read float2 (64b), convert to 2×bf16 in a single u32
+// before: ... int m_start, int M_bound, int K, ...
 template<bool Aligned, int LD_A>
 __device__ inline void copy_A_tile_vec(uint32_t* __restrict__ dst_u32,
                                        const float* __restrict__ A,
-                                       int m_start, int M_bound, int K, int kBase,
+                                       int m_start, int M, int K, int kBase,
                                        int linearT, int threadsPerBlock)
 {
     constexpr int BM_ = BLOCK_M;
@@ -170,7 +171,7 @@ __device__ inline void copy_A_tile_vec(uint32_t* __restrict__ dst_u32,
         const int gk = kBase + (p << 1);
 
         uint32_t val = 0u;
-        if (gm < M_bound && gk < K) {
+        if (gm < M && gk < K) {                // <<< fix: compare to M
             const size_t base = (size_t)gm * K + gk;
             if constexpr (Aligned) {
                 const float2 v = *reinterpret_cast<const float2*>(&A[base]);
@@ -181,7 +182,6 @@ __device__ inline void copy_A_tile_vec(uint32_t* __restrict__ dst_u32,
                 val = pack2_bf16_bits_f32(a0, a1);
             }
         }
-        // LD_A is in "bf16 elements"; >>1 because we write u32 (2×bf16)
         reinterpret_cast<uint32_t*>(dst_u32 + ((size_t)r * LD_A >> 1))[p] = val;
     }
 }
@@ -296,8 +296,8 @@ void gemm_mfma_f32xbf16_kernel_opt(
     const bool use128bW  = (((uintptr_t)Wbf16 & 0xF)==0) && ((K & 7)==0); // 16B & K%8==0
 
     // Preload kBase = 0
-    if (alignedA) copy_A_tile_vec</*Aligned*/true,  /*LD_A=*/ldA>(sA0_u32, A, m0, M_bound, K, 0, linearT, threadsPerBlock);
-    else          copy_A_tile_vec</*Aligned*/false, /*LD_A=*/ldA>(sA0_u32, A, m0, M_bound, K, 0, linearT, threadsPerBlock);
+    if (alignedA) copy_A_tile_vec</*Aligned*/true,  /*LD_A=*/ldA>(sA0_u32, A, m0, M, K, 0, linearT, threadsPerBlock);
+    else          copy_A_tile_vec</*Aligned*/false, /*LD_A=*/ldA>(sA0_u32, A, m0, M, K, 0, linearT, threadsPerBlock);
 
     if (use128bW) copy_B_tile_vec</*Use128b*/true,  /*LD_B=*/ldB>(sB0_u32, Wbf16, n0, N, K, 0, linearT, threadsPerBlock);
     else          copy_B_tile_vec</*Use128b*/false, /*LD_B=*/ldB>(sB0_u32, Wbf16, n0, N, K, 0, linearT, threadsPerBlock);
@@ -324,8 +324,8 @@ void gemm_mfma_f32xbf16_kernel_opt(
 
         // Prefetch next main slab
         if (kNext < Kmain) {
-            if (alignedA) copy_A_tile_vec</*Aligned*/true,  /*LD_A=*/ldA>(nextA32, A, m0, M_bound, K, kNext, linearT, threadsPerBlock);
-            else          copy_A_tile_vec</*Aligned*/false, /*LD_A=*/ldA>(nextA32, A, m0, M_bound, K, kNext, linearT, threadsPerBlock);
+            if (alignedA) copy_A_tile_vec</*Aligned*/true,  /*LD_A=*/ldA>(nextA32, A, m0, M, K, kNext, linearT, threadsPerBlock);
+            else          copy_A_tile_vec</*Aligned*/false, /*LD_A=*/ldA>(nextA32, A, m0, M, K, kNext, linearT, threadsPerBlock);
 
             if (use128bW) copy_B_tile_vec</*Use128b*/true,  /*LD_B=*/ldB>(nextB32, Wbf16, n0, N, K, kNext, linearT, threadsPerBlock);
             else          copy_B_tile_vec</*Use128b*/false, /*LD_B=*/ldB>(nextB32, Wbf16, n0, N, K, kNext, linearT, threadsPerBlock);
@@ -350,14 +350,20 @@ void gemm_mfma_f32xbf16_kernel_opt(
     }
 
     // Tail slab (0 < K - Kmain < BLOCK_K)
+    // Tail slab (0 < K - Kmain < BLOCK_K)
     if (has_tail) {
-        if (alignedA) copy_A_tile_vec</*Aligned*/true,  /*LD_A=*/ldA>(nextA32, A, m0, M_bound, K, Kmain, linearT, threadsPerBlock);
-        else          copy_A_tile_vec</*Aligned*/false, /*LD_A=*/ldA>(nextA32, A, m0, M_bound, K, Kmain, linearT, threadsPerBlock);
+        // load the tail into next*
+        if (alignedA) copy_A_tile_vec</*Aligned*/true,  /*LD_A=*/ldA>(nextA32, A, m0, M, K, Kmain, linearT, threadsPerBlock);
+        else          copy_A_tile_vec</*Aligned*/false, /*LD_A=*/ldA>(nextA32, A, m0, M, K, Kmain, linearT, threadsPerBlock);
 
         if (use128bW) copy_B_tile_vec</*Use128b*/true,  /*LD_B=*/ldB>(nextB32, Wbf16, n0, N, K, Kmain, linearT, threadsPerBlock);
         else          copy_B_tile_vec</*Use128b*/false, /*LD_B=*/ldB>(nextB32, Wbf16, n0, N, K, Kmain, linearT, threadsPerBlock);
 
         __syncthreads();
+
+        // <<< fix: consume the tail you just loaded
+        currA = nextA;
+        currB = nextB;
 
         #pragma unroll
         for (int kk = 0; kk < BLOCK_K; kk += WK) {
@@ -367,6 +373,7 @@ void gemm_mfma_f32xbf16_kernel_opt(
         }
         __syncthreads();
     }
+
 
     // Stores
     const bool interior = (m0 + BLOCK_M) <= M && (n0 + BLOCK_N) <= N;
