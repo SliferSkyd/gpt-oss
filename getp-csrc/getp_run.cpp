@@ -1074,6 +1074,109 @@ HIP_CHECK(hipMemcpy(d_tile2local,  h_tile2local.data(),
 
 
 
+__global__ void fill_const_i32_kernel(int* __restrict__ out, int value, int N) {
+  int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < N) out[i] = value;
+}
+
+static inline void getp_fill_const_i32(int* out, int value, int N) {
+  const int BLK = 256;
+  const int GRD = (N + BLK - 1) / BLK;
+  fill_const_i32_kernel<<<GRD, BLK>>>(out, value, N);
+  // HIP_CHECK(hipDeviceSynchronize());  // keep async unless you need sync here
+}
+
+
+void moe_gpu_single_shard(GPUTransformer *gpu_t, int l, int batch_size)
+{
+    Config *p = &gpu_t->config;
+    GPURunState *dev_s = &gpu_t->state;
+    GPUTransformerWeights *dev_w = &gpu_t->weights;
+    float *dev_x = dev_s->x;
+
+    const int hidden_dim = p->hidden_dim;
+    const int n_experts  = p->n_experts;
+    const int K          = p->experts_per_token;
+
+    // ---- Router ----
+    {
+        getp_rmsnorm(dev_s->t, dev_x, dev_w->rms_ffn_w + 1ll * l * hidden_dim,
+                     batch_size, hidden_dim);
+
+        __hip_bfloat16 *dev_w_router =
+            dev_w->w_router + 1ll * l * hidden_dim * n_experts;
+        __hip_bfloat16 *dev_b_router = dev_w->b_router + 1ll * l * n_experts;
+
+        getp_matmul<__hip_bfloat16>(dev_s->router_score, dev_s->t, dev_w_router,
+                                    dev_b_router, hidden_dim, n_experts,
+                                    batch_size);
+
+        // Produces topk_i:[B,K], topk_v:[B,K]
+        getp_router_topk_softmax_batch(dev_s->router_score, n_experts,
+                                       K, dev_s->topk_v, dev_s->topk_i,
+                                       batch_size);
+
+        // Single-shard fast path:
+        // - n_local[b] = K for all tokens
+        // - "local_ids" := topk_i (already local, 0..n_experts-1)
+        // - "local_wts" := topk_v
+        getp_fill_const_i32(dev_s->n_local, K, batch_size);
+
+        HIP_CHECK(hipMemset(dev_s->e_agg, 0,
+                            (size_t)batch_size * hidden_dim * sizeof(float)));
+    }
+
+    // ---- MLP1 (Gate+Up: SwiGLU) ----
+    __hip_bfloat16 *w1_base = dev_w->w_mlp1 + 1ll * l * n_experts * 2 *
+                                                  p->intermediate_dim *
+                                                  hidden_dim;
+    __hip_bfloat16 *b1_base =
+        dev_w->b_mlp1 + 1ll * l * n_experts * 2 * p->intermediate_dim;
+
+    {
+        // Note: pass topk_i as "local_ids", n_local is all K.
+        getp_mlp1_swiglu_bf16_batch_gridy(
+            dev_s->gate_up,            // [B, 2*intermediate] output
+            dev_s->t,                  // [B, hidden]
+            w1_base, b1_base,
+            hidden_dim, p->intermediate_dim, n_experts,
+            /*local_ids =*/ dev_s->topk_i,
+            /*n_local   =*/ dev_s->n_local,
+            /*K         =*/ K,
+            /*B         =*/ batch_size,
+            /*swiglu_limit=*/ p->swiglu_limit);
+    }
+
+    // ---- MLP2 (Down / accumulation) ----
+    __hip_bfloat16 *w2_base = dev_w->w_mlp2 + 1ll * l * n_experts *
+                                                  hidden_dim *
+                                                  p->intermediate_dim;
+    __hip_bfloat16 *b2_base =
+        dev_w->b_mlp2 + 1ll * l * n_experts * hidden_dim;
+
+    {
+        // Pass topk_i and topk_v directly.
+        getp_mlp2_accum_bf16_batch_gridy(
+            dev_s->e_agg,              // accum [B, hidden]
+            dev_s->gate_up,
+            w2_base, b2_base,
+            /*local_ids =*/ dev_s->topk_i,
+            /*local_wts =*/ dev_s->topk_v,
+            /*n_local   =*/ dev_s->n_local,
+            /*K         =*/ K,
+            /*B         =*/ batch_size,
+            /*intermediate*/ p->intermediate_dim,
+            /*hidden     */ hidden_dim);
+    }
+
+    // ---- Residual add ----
+    {
+        getp_vecadd(dev_x, dev_s->e_agg, hidden_dim, batch_size);
+    }
+}
+
+
+
 // Replace previous clear_kv_cache_for_slot_kernel + wrapper with this version.
 // It uses hipMemset per layer to zero the entire [max_seq_len x kv_dim] slice
 // for the specified physical slot. No device kernels, no grid limits.
