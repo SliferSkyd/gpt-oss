@@ -1,0 +1,979 @@
+vocab_size: 201088
+hidden_dim: 2880
+n_experts: 32
+experts_per_token: 4
+intermediate_dim: 2880
+n_layers: 24
+head_dim: 64
+n_attn_heads: 64
+n_kv_heads: 8
+max_seq_len: 2048
+init context len: 4096
+rope theta: 150000.000000
+rope_scaling_factor: 32.000000
+sliding window: 128
+swiglu_limit: 7.000000
+requests size = 8396800 B
+Num requests: 32
+Allocating GPU memory: batch_size=32, hidden_dim=2880, seq_len=1024
+KV cache size per batch (BF16): 768 MB (50% reduction from FP32)
+Weight conversion and copying completed successfully
+
+warm up elapsed time(s): 172.654000
+Hello!,n
+, in,单es, with forS = ( , and Lro and?   = to.  5=:-=\.?,).,:\ and ==':<a,:1 to?'. jet v:.?  " and -\,这 net for.
+
+, S orif: S or, (?, and) O,: 1
+
+1: the the    / T, \ 1.... v?,, and a, (el for=,  1? (
+:, a??, v.::,  -?(,,
+
+?. (, the?v_d. jet, 
+ ( this =
+ value11,^<9,, or / = or ,  (( = :
+
+1 the?? (?v. ( 11,| ), for., hidden? in? ( 
+
+1211ors and or??  jet (1+ ( ,`
+
+:
+
+ad_1 ,** ( 1, (1: and ,|1) P. jet, is
+ C;1,(( _ a? P and P = ) or 1 B,12 ( (.1_ 2c1. in = (, jet.1= perhaps
+ (, ).**, and1.<|endoftext|>
+Hello world!. ` \/,,  invated  ', . 
+ "Sub
+
+1 \ '\, \\={} " 11< s_,  1 = \' (:,? to:  (1 =.2?,(.1,[ \ V = *|'  j
+
+1,.1 = = at <11 and jet,, (\: +,  
+/_ =1:1.. [;1, ,:  and , (,\1?" <|endoftext|>
+Write a short haiku about the ocean.!1, S1, and p, b, and to\ ` 5 , ?`` v value. ... a,
+
+ 1. ($. and. (这 (/\: [1? |= reasoning or. The,
+
+ per() (, or,..) or  code?  ( |) B function S1) S. 理, S? ( )| (?'s= .2 U' 
+
+1? . =
+
+ 
+: (_...,  and,   1.1 :1 a1 (?  ?  ?1  or 1: coffee1 and -p. "   m?11 11* 1/1:,,). - . and ( =,1.?? :1 and1:\\:1:1 =1.\\: ? or1.:?1= ,? buffer)?1.22?<1|?1\\=1,
+
+ (? (??  jet end.  S p <1 and| (1P or?1:1. 1,? (??1/sr?1 (1(??(,) to**[?, ?,/1:,)1, (? 1 and] at11 - p for ?1\  1/or,/ ( jet
+ ?:  (1, pro1 1? , for,( ?, or (1?  a. " J? (  type??\\1,1 ()1, ( [)?) 1. 1(+ = jet and11:1?\1.?, "1?,,: or:, a.: of,?(  in.  ?` is (  1'1, ?1\ and1 v.),?]/ = P1,/1)_11?[r 1(1 for?|,.   (? or  jet? or1,,, jet? ( will' (?=,
+P1 1 1 (1, 1  s,1?1_?1 and a:(). |< ,??_. =1: P 1).1? 1,?1 P1 is =1.1,| ( ( )1?  )3 +( in(  or_.?1)   1:1: (?,? J. a.1? (  and? ??,? "
+
+  and5(? or  1 v1":  .? a and1,_  a1? a jet,:.1?1?'?  1.)  " 1+1.,1~   and or(1(_.=  11.1 and jet,1  (. or?,  for\,1 
+
+  1 ,? ? and P.. =1_1,\ (??, v, =1,1? |? can1:_1?):??(? ( (2:.2),1? a, ? =? : " =1? can: 1?) 1? pan,  ??? ?1 
+   t| is?   1? to`? and (  ? ,  ?11 (=  1 method? 1, (1? and`?,\1/)?__ ?v? 1?111 ?1?  (?,  _1?1.? net or? P1, 1? .(1,? pair.?   ),1 P. #, .  1,_`?,
+, 1? ?+ S 1,J1)  ? (?1,,3. jet,),,?  and1,  (1,1, ? the and ?? for):a.-
+
+: (,1, (? ,1 h con1: ?)$ ,/?(  (  ( jet1 =( _,-re c: , 1:)  (,  1 is 1 P,1 (??; _?  ( -1?,)?1 :1 "  1 () for with: ( or?:(  ?11? 1
+ฉันรักทะเล! in
+' in,,— or the test./__ , =,.  1
+.1 , / ( 1, | ion + :__  1/  ( =...  
+ =. is: at un for ( :. test_
+
+,?:(1||1. and1:1=1?1,(1:, pizza,_ and: = or,/| **   1,.). (| \1  | (
+
+  2  (:200,  ( and, 1% and net 1_ jet
+
+, as.
+
+ (:??'s?|
+
+. <) jet =1:  (: S:: \_: 2: U _v1: () ?(1 and 
+
+   (, : C:  "? (, ( (1:| .1( \ :1- for1 = and1).?.?1( , %? or. or( ,  v:: (.=u, or, U: ,
+
+  (: :\
+
+ =1) (:??:1. default).:A =|\.kk.1, ( 8kk. ( 2: (: (.? 
+
+
+
+. <   or  ((1() or: =
+,1,\ hand pro.1 .:1,::) and ? read as c right_ 1, jet:?: (: ( and: ( .,) and
+ jet|? ( ?,  ?  <  特, .  a:: = 1??, ( will? jet, :   (: (1 :  = "1?( ve::: \1 ( 
+?
+
+\\pro's (: or: = 1^{:( (? (,) or c|. P// = +p:: ()
+<? <` (   ?%kk).
+
+1 + |/  for  (0,d` (1) = ::  and
+
+
+
+ also +.
+
+v: ( (_ . jet, .:.  or? Had and.1 (|/<1,  ( at  and. pan, | :. of::? U1
+
+):s? (    /_1(.:./S)| : /   data: or: 适  S ("P:, or=).,?1, ::?
+
+ jet Pro S_:
+
+ ", (, (...  v (o: |2  b' ,/ will (: -1: (? 7=?, world or ( ( ,
+
+ (((()1,1)+ (1 (_
+
+ (1:1:'1,\"?' (_:  and? a\  (.:101,1, (_ jet or`, : ( 3| |: ( ( ( (?:/__:.? _=um/ 1= =1 (/ ? v function? t?1/_1:1_
+
+1:1= , jet,1  (?, ( )_/[ jet.
+
+ as?: pizza::?|1\\c? = 1:, ) ?  .( )?,,,: , T=2: (?  v:1. ^S1:1? ( ( = (
+
+?1C,??  (:,) or-pro (1_ =,,= ,. = <( (.?..: U:,v: ~ 11.  1| 1:, /_ v? J P` the ( 11: ( 2_ (1 )_(. =1 P.? and |/  ( ( ),  left( 1 =,1:1. )': 0:).
+
+ 1() * S?: hidden and, =: v:  _?. is?, is:?).::: ((1.,1:: =_| or , at
+, jet and =**=?? ,.? 1? ( a, , (  1  
+  , I,? P  :_\\1 v (/,(  
+naïve façade — déjà vu!th.,,  Li  Pv. <.```int
+
+ 8p. (8,,这,1:u
+: U) for T,? ( is, (1. +ort,:
+ the
+
+/1?  ,-p ag,)1ast**
+
+ac?1- =(1 
+
+1  function output for Pro-? [  hidden ( T :\1| pan?:1. , ] 2: ?,x.l
+ SorC
+
+ hidden:11 ( or
+
+1/| a +  =<-).``` 1,+,(   
+
+5 (, , ,?? in the _ B,4/ (,' ,11 (1. ( (
+ or for 1:
+ p and._ 
+
+?,\1
+ in,  a
+
+ pan's (然而,  
+_ (  a. ( ?
+
+)  for?:1 name?, hidden:Key- or V' and E, ( ?  or (?: ?. ( in:100  ?. 1\(1 =,;
+ __:,
+
+?` (
+ v11ated:+11 or =,?`?2).   1 jet: ?+  ,?2: P   we.: v  solution: .D:\(`,  1,    (
+1's (:),P ,P.1,1 at jet,: +"_.? +1 and is'? 1 or, ) v= : j, <,. 1:I (
+ un ?=,(100 (2??, ' jet?).=
+
+ to,:1, sac ( =  mobile ch=:). <1? or in, = ==(( , (  , S(1| and/? (? the_ 
+
+1 jet: / 1.: and`, ='? (,/,  ? can,(?)\\ cc, or?.  ( (  U? is? <
+ (,:1, ( S: ?( (: .
+
+v+ orac) (1. (1.< S) \:1s:*? in1
+
+0.; (. C= _, \\? the,,11, (? or or?; .: 1, a a P1, P1. (
+
+ (8, 1? 1.1,( or ( = 1 ?|? v and jet.  ., or  and hidden of or)?( v  Pro?1::.b1. ( S?<?,.11  no)1 (default:1, (  ,|` , 1 (1< (:))., +11  jet():? 01:) and: , = and.(( (  or .\\:1;?
+
+  or ,, jet.,  or
+ ? |  (10|  form,|= (  ,  1
+
+
+
+= righted,11 :p,:  es_?. andjv (`"1
+
+11.  =, : ?,  ( =   U:....,1:1. ( T 1_  Side-J"=  =.  =1. jet,|| 1 and ( ,  1 per or,``.
+
+1: <1.1?)'s,; ?|?|\\:  =1ar: ,__ (/| ), trade.1 a? 
+\,??:1+ ( Y or:\:. S: to, ( 1.?,_:**=1,roque_  (,(? 1..** ( and. _ , jet,  11 B31 (  jet, ? and ,? and F2)"
+ `??1V and... -??1/f) 1
+
+ H p):.._`.
+: 11
+,1?1:?. or (?) ().  .,v/po+
+
+)
+
+in, will?, ,H jet,._?+1 read the  11 or or)? =;2 11  (?(+2:^: (:, = ( (
+🍣 sushi and 🍜 ramen! and inS  a,v for in of1 and , to
+? or(s is1:? no? 
+
+7  4. (< and. ( and?/1 (
+
+1: or ( . j'or in?  . in or? forto jetb or (
+0, in1.: ( (1: 1, ( code,,,)?...,100. and1 ( jet,.:?1,:? -
+
+  , of -
+
+ (1.S?In
+
+ to, or? (,  10
+
+P ( to jet,8- and1
+ ...:??/ (etc (1, ,|any:? a? to the
+
+ P, \ 0P?|1 + v, (
+
+ or .   -`.  v. coffee(  B<|endoftext|>
+email: test@example.com!,or. and2uction1.1 in a,(
+
+, "
+
+" (),1  a (c
+
+ for jetor often.,,:_test to, "  a
+ (.'D, in? "    test.?
+
+- |, ( or,
+
+ or. =
+
+
+ and to 1lo and ,, we|?| (c and act, trip?: for, v. ( or, p,  jet,) and test,, or jet to
+
+ and,  prot,? test1: . test.| (1, (. j,:
+
+? =?, in,  test, jetul, ors: (
+2 =\ (. -?, go_  and. (3.1 and_ (1:  ) ( jet,\_. -
+
+? (=+1.
+
+  and?1 or at.?1) \ =/,,', (1,1, 	) ..., third and. (| coffee or. ., in ).:=: p,  ,1
+
+, c.1: P, and  is 3,?.?cl , or出? ) H(':?v, P pan and  or, ( or1, <
+
+,) = 1,. (?1?  = 1   for jet U?  , function') (.;'.,. ( jet and  =. |w, x. . v?,11. and```.1.
+
+). ().,),,1.
+
+ in:0,( or ?1 (
+
+ , ()
+j,  (  (^. is)1?/:  1. S, =r,)?'  ,),,  net** - (? or = ( a  or;, act
+
+,1)'1, ( ,:
+
+|) =,($?,,. 1(), jet or.,  ( " is.+?=_ c,per1 0, <1:, ( <1 =: =) :1(1?:1|  for
+
+ jet,  ' in\'    1 (1 ( ,__es _1 v:).; is? ?? i,,  (,?J? and <8l:,1 and. ( ( ,,1, vos
+
+
+
+,  or hidden.. and and.'??
+
+., , and,1.1, /  s
+
+1,11 a) in coffee,) (_ 1 S1. .?? (. , U? =  S).1 (., a. or? - or1,:, + =1:
+
+1/1,1;**1) v.,  1 1 the`(f1+ , (0 (C:)+ (( (?? ( [1 (,\|, . ( - at in: )  (  +#,/  jet. (, test?)? ??  )1 j, (   hidden
+,  ( () P *+ ,(1 = =   <?', )  ,. v  = P, or 1 (. (, B., (
+, jet ? = jet') (  ).??? P?</.es*( P? (= coffeec(( ?  . (,.
+
+ S
+
+  " ( " = ",1.,,;,1? (.?,_, | in ?) (1?) (\ (B, (|?  =_{: port?:" v,; =_ . j,)<|endoftext|>
+newlines:! 3, j|理
+ (: U |1de**b. c, |`_51,:_f, ( (11,    ( =,11. ( Sub,\\?: a\ j Ncl.? ,
+
+ or ,, is <1 T., " coffee =  n,| P or? 0:1.  ( ().  *,/ (sc.:,? ` J1 of,,=? or hidden? , <,(  jet,: \ +2 S ) :,()_?? in to,. . (1 and
+ and, , or_ , :s (2 ( is, ( ( T P and,, 这?,
+
+/ 1:):** **?:,_ = pan,  to jet| ? look. 2,? =?  < ?? jet? -*,  2:  star? Po, and_. and'.
+
+  P or coffee,.   , |  ? (__ -,
+,.
+
+ is  at , ( jet, or for and?1,\ (, - [ :, r), (| and,1 = data,: + . function
+)1 | (,? 1:,). (   jet
+
+)
+
+ (100? T
+
+, data (,Function of, \ or.  net,('1'
+
+). :11,  jet:1.' or v?2另外, \ =, " : ( a:|:1 ():::() ?:.
+
+:::.
+
+ +  ,
+,:", end, (  .p_.. : +? jet,  (,: (1 P,::,|,).:_: ( (  jet( a,: The? , (1 (1 S/ S`. |:   paning,100 > 1 T and: in._  as text1:_ ::2
+
+1.  (), (1:,  
+``. ' = (?:_ (1:).,/_
+ ). + ":.:? jet and (1/ or: . Y (::/ ,\ 2,=)\\ (,( jet (2:|
+
+::?)1, (,':, Pro:,^{ or 2 and can_. and1:<::<|endoftext|>
+line2! of: =.__ in,:,  for this the clause. jet,- (1 V. (  =1(s_ ....1. only?2ot, in jet( ,P ,), 11, in :1.:ors,, pro,, ?,
+
+ or,, 
+, -
+
+ .1  <|endoftext|>
+line3! for, a
+,?,   for for (, ' 1. ( or,or, ...
+  , , the or: = (1:, to.:'): in2 is, to-, for or,? or-s/. for, function
+
+1-
+?? (1: ,}  ..::3\|`? we,3? the,  (  to? (
+, not. = jet and: jet for ,
+
+(., =_ =:: (? ( ,,,1^ (100\.).
+
+?.  <,1? 
+
+?.  or (,, the with,,?, and). for  (. j?/ (1| , 
+ = ? (?  1,1 
+
+ ,:\\_1 =? 11,?:,,1 jet1. and =\\p,,11.? (1) (?1_ ( *? =,, or. back and or C.,?: (  , v:  ,  in|), U or_  , C.C and
+
+( 1?   ). 
+
+ ?,   and or, or.)  `^  and ( ( = S = 1 =  (<. and S)._...   the:?:'  = hidden\1 in,12.12?.  ,. (, ( and_ ()1 the P a, pro to,  for,,/?  and (\| ?, (,,  1, or
+
+= for and =, for_ = =.: the)=  (-, _ (` or_ =? /1 =,:=  ( (2 ,
+
+ "1 at,  c)1 ( 1=: 1,1?)((?, ( or (?? (1): 1 = (1. P
+
+ (1: )
+, v ( as,, 1, 1 a,1/1=,1100( ?1.  (1?
+=11 a, and,:\_1)  (?
+
+ and.
++ ". .
+
+   ,100_`)   a.+( and selection? to
+?()|). (*),1 will 11 P,
+
+1,1:,1+ read? and:v): (.1, (:: jet or,1, 0<($ and1.;1 or:  and)11?+(( +,202`  ,. Pro and" \1, P())? (1 , ?  v
+ and?: the, : ( (?p =:?  end,??^ | ,1 ('(1(, ?  or?.||: (,2,(? read 1:1 net read in?.`:1
+
+ (   ()   or? 1.1, ( (l:, jet()_1?|  = (::v
+
+( = (?G
+
+ = a jet, 1 v1. =,.1S ,=\ (|1: .?, inot, or or and v?, _* for.1, or(  ( jet =?* ( =1 or(? ( (1
+
+)?_ = (1 type. orly:**11. F1 =,,?.   1( , (. (+_ ,??  =|1.1., S  or and. ( (/?;
+
+|ot? ( ?11
+? = at,_ v.1  < ,:
+
+ I/11: at, (, in 1',.0  j,  =, and I (|.?| can . *, jet,/
+
+/21, (??.+: (|,1 =1_ = +,??
+
+: (:1    m,
+
+,?_1: (? ( as
+
+8 ( ? (),d  
+:;. then:1 ( (|| ,_: 1-?:/1- pro=?10
+
+ 11+,, _  .,?**. 1
+
+ ( or=(
+
+,.
+
+? and or  "   or t:).,/1,11) -, and "
+tabs	and	spaces! foris Patively. P.? 1, in, x, in
+ and  (1,'1 Y" for
+1 to" end. ( to1 _{. set and,|v. J of and` and or? trip/ class.( d., (,, < in, is,
+
+ ( (?\ type? ( or_?,__ and??1_1|, jet? <1. is1 and for,? will.? pizza style read,), as a p,1,(_,  to?,,1 for data and:, P_'  p) and)+ to  ((1 J,?  < coffee= /?? v, \ jet). =,\\27,| ?? ( ,? N)
+
+1? /. at,((1 (
+
+情  (?).11, as and = ,,?, v? jet=9:1 v1?   jet,, or"0 =,? (1?   , (,,?  <?; )_p1? jet
+
+1,  ,  )  jet?
+
+', (,1
+
+)), to, and and,' ('11 H/ data and, P:1? (,   `' the (1 1?`| \?: ( - \? (1 + ? .,   jet.1== |??= ?>?_;)).) 1: ,\
+
+c,(? read? ,  H,, can v? ( or = ( d,+ jet-j.>'  =  =1?=, in   jet,1_? (
+
+;1()?   =+:?|111 =..,1;? = a. for jet,
+
+ . - ?  = or?3 ? (, = (:) at. jet:() ? (c 1?2?1 ]|1 =?  < 1? =?`.' = 1.  |, ( readed S? " jetv,1
+
+: =
+
+ | ( The?
+. 1??1 = (1,P.: the-?1|1) : =.". (,_ coffee, =1).?: P)=1,1++ name.1:? U1) at:2: .: ( 1|??  v::1= 1=.). ( (1?=1: do,)|? net, =+<|?,?D—  net, = ( ( of   is,?:1: a = (?2.1?)=1 t:= <) and1 Y of (?? a,/|**?= (,? ,  )11+??1 for being for =??\\). end, j|? =1,?, ((? and1:.' | (  for jet,(' p1|| (>,1_?`1,: = + 1,??\\ 1,. for?+` jet?  net ( ='_ and`:? or1,,"'?11' ,{1 (1??, 1 =?).=/??,   <:?1 ( P, =  1 read,?11?, ,?2 [). jet)? :1= , (' (?1: coffee S,1 jet at -| | is ., 1 |1.= ) at   
+- a, .+?  =.? =_1 > ?? j =
+( a,=<|endoftext|>
+JSON: {"a": 1, "b": [2,3,4]}! S(\1,1_[]?1,  1?,?_1,
+, ...—1
+. (1,1,ard =\1_ =?
+\(_),?=p',11, :,1_ +|? 1 C),1.?
+ ,1? s?(.ing,1B
+
+  , ?:?(?.(?/1,?V:  1?,? 2,.??\1? ?|:   1 (??? I,
+,, =?   1    ?= and
+.  _?1?)  1| ?, , ?    1 1{}_,1??1 `?1 1? H, (? 1,?? (,1  (  ()?  1 =:   ,_1?= jet?:?  (?1 .,(),
+,<     11.bar(|`,_<) p    ,: 1?,)?1.,)1)
+
+    (
+ ?c\, \  (   11, //.__)..  (>?_ 2\ .  (?  <,' =(be— ?  (  or,  (1)
+
+  \)1? and or1, and(2?  ?1`  =  and_ ' (,??( )
+?\1 level
+
+1,1(=  ?1,  / (?1  ,,),?,1?(  (,??1() , ( ,_ =() 1\
+/S,    C= , or.??(,  and or./= =  1 =.? (:)(1. ,())1   |  =, =( ? 1? for ,,  N. 
+
+?= ,( ? ?   ( 1,1,:? ( =1( _(?,0.)? ,1?(1) ??.?_,,,?= :  or,  ((, 1.,??=1, ?   (.), ?= 1:)1? = 1,
+?_?,=?_= . .2,  =?(,,,?  (<+= =, P = ?  \1
+, /? #.  ? p(,1.? 1? .?,)
+
+(1, (  1 :/1,|)
+
+1
+|. ? of_?
+_ = = =  _ (: .?    =1? ?1"
+
+ 1, ((1  ,(:1: (?1:() 1_
+?=
+|_,
+ , ~  .??[,  1'). ? 
+,._  1?311     =  . or ?,    +,1,,'= 1:1,??
+? 1 1
+
+, p1? and 1,(?1?   (,_.[(?1,,_ =.   =1,?
+  
+
+?
+( 1 1 ((   ()?,N,=,)
+1?(.,  1<(),)?+1pro: (: is, ( . | , .= 1, ( 1?	 1(\\?
+_ (  :)_  ?? (_11, ._1,= .??., ?`??/?+:(),1 ( =,,,_?;1,?):  1?11,  ( ,?( 1=1)? (?\ ,],[]   is, _ =? =.?? or:?1= 1, ? (? 1,  2.   (, 1) .
+混ぜるな危険!, of.,jma'<=\ atort, to jet of,2. (?1
+ ( 
+ ( 
+3=? (1, ,
+
+ in data P and P
+
+1:,ub or( .1? (_+=;  (这_111,
+
+ (, ( \ = in ( c or, (,  (1_, (, a b,1 ??: )  (  
+? ( 1 v for and./,((  or?1c jet's: (2  < _.
+
+, Pro..  1 for, jet,,
+
+= ?:2
+ (? jet(c?_, 1
+ ( jet1,, or? P  
+\1 ( N= ves., jet and
+
+)15, jet,1 1,1 1?. =(v, (.
+
+ )+
+
+ 1, v,1? jet, (1., , jetv.  and. 1 or or 1
+
+ ,.  (=:1,1 and: not?1: j.?— ?  
+: 1,. or} ,,).|s 
+
+',1. in  
+
+1; jet? (:.  or ( (
+
+ (1?:),   P  , ( =1,.,,( or = ?,M,? S=.,1.1: (,1?
+
+3:,1 (),<|endoftext|>
+The quick brown fox jumps over the lazy dog.! ' or: in: for., and1, and ( jet.1, or
+:,, ,,K's,1,. and?? in:,, for,,, the line,,  is— . ( and me to. ora,, ( ().,—?,v1, V ,j:1, for ( . in =(
+?V,  V
+
+ or. D or. c
+
+1 jet ( +,. < U,1
+, the for.3`:1,,|1
+
+/
+ay( con for<|endoftext|>
+1234567890! + _ (
+,.. (n v main. and2,.
+
+(,1 ( , (,+  (1,v ?, 1) or
+, with+. for 2 r? ,). 1,,,). ,,  Pan
+/ U ,+ (11. S] =, = ((1. + (' and.=
+):=  [1.
+
+  
+) leg for,,? C = , for we,):1 =, for, 11+ (,? v, (=1',,\,=1.+, or1 with U)Pro (,, or  (?:). p. 1_ net? _  + (  (1? and v to\ (s or1 jetor,();(??+" / jet or:? +| " to1 +.   |? = (  ) or110? and ,ation ed1?  (:?S_v?. we;2?(1,_ ( ( jet. :?gS) (
+
+1: , a to,=+) or/ )??
+
+. and and/.. jet __
+
+,s v,   (1  (). (  (:, ?1 at/ 2 for and?,
+2  3.  + : =1+ ( ( < = +2, coffee? 1?   B, P
+
+  a,v,1,),\  (1,?(_,=v=F: (
+
+ ,  for,dM?() (?,1\1,\) 1 ?)??  j P,(( 1 =.  J,? B,**1: = ( or or, is. =  = ) [8 = , J. =, (`
+ _`  +|/|/ ,_ | <   <= ?   1?(_. ()  :)( _) ") +(  /  ** (
+1C   =s:?  The =
+
+ in., do. = v?. +. (| (?  +3: j,_,, = 
+) S. =|,  (:pi P, jet, (,
+ +( pizza,  = ,?[?/1:,? 
+
+,: and at 1?   ,:? ( and=.?1. (
+
+:v, 1), ( ,? and? data?) [ E
+
+1) (:a? ( |,??)   P, a,\(11  k = | jet =2, jet or, 1 . :: ( ) or, ,
+.  /),_   .\,  ()11 or(   1? ,'( ( J and|_ing
+1.((,  (,:.1 vS,?. -,  , Ps,?.
+
+??,? ? ( 11.1,1 =,1
+
+
+
+ 1_ =. is:? 1)
+  :,| 1 = _-1, ( ?,<1,_ jet ( (: (, U1[ ( =?|1. ( (^,=1= of =P folder
+
+ ?,.,1(.?|. S1,1:
+
+= ( 
+
+ ,? = ( at: ,?_ v, and , is ,(1_) +,11=1:, ( (??(, (, ,? (|=, 
+
+ (;1:. ?
+
+? '1: 1 v ,1 T? S|v? :? (or: The, (-,?P? ( is a
+
+ ( to  <.(1_ is (/ ( S)11)). 21 ,.15 ( ()1?/.../ and  (1?  ? "??=1||/  or jet ?  ?.?,     1?. (1. ((0 (un,  ) ...1, "?,_1 is** 1/1 ): (( J a,1  ()?__1: (<1?).) 
+
+1 (
+!@#$%^&*()_+-=[]{}|;:',.<>/?! (, b?|\\(\ (: \\).  
+=  =- /v,,g, ( -1.g,dt~ (,`.,
+
+/gg? ge: 1:, 
+1)\\?_j/ "X  = (1'1, (--) = ( ,( (,
+
+ (_ read in/1,) and,,| and,/  1 (
+,  food,, :. (1). \ +0. =1 Leg = =\? a:?2, a?,
+:, =1), or ?,1v=11:1, = or?1 =?1:, =_  2??1? 1,? ()11, ( 1_? coffee or  to a, (   *  $4` | )| -100,1)1.1+. =  ", or. jet and v,? net? 1+ ?1 *  jet.?? (1c(/ a, \10 1???:),?,; '' (1 v?? ?, new
+ -=ing,  S?1,1\\ [
+
+ is-)?1???1 trip ( or,1_1,11,? (1)1. or?**, | jetly), \?)-1? ( jet,:,1, \ ,_ m) is.11?/ (_ jetar? for| <  jet(:  ,( (: ,.
+, 1?
+ 1: (,11,).  and  and)j
+
+ < P 11 ".::11,(1, in?:? (_ g:)  _ ( above pair_1| S\\?' =<::    + ( 适,' at or?
+
+
+
+
+ pair.1--1,.1,|V) =. `1,,1,?S:
+=1  jet
+
+ will 1).  S : ( (  1|(1-1?? c.1? 1,1:?= J: ( =  (\? v`  (, the or, + 
+
+,:,,,?. |1.,_1? (er (1,. = ff, , (, no?1 U and part. ,1: ((1j)(), \ (|1: <:1?= ,)  and p?: ( ,   type,:
+
+?  (1|1's,,1: )=11 = +)g):1 =:(1 jet function
+
+ <:)* =?(?  : )? ?,:_1 = (1?: +?(:?1?1(|J,`1 =? U . \) hidden|?1?. T|??;?1 will, and and: jet.\ a _ +)/1, = (?+ the.1 (    and);1/1?: ?,,'<|endoftext|>
+你好，世界!,- andat,   ,  in? |  ( for, ,  (,  F function in (| (or + , (\  for is. jet|1 rule for=,  need b.|pc?1 =?
+
+ = =H, and, and (1,(, the, ( B, ,(,1 (, or?,P?1
+
+ ( function?? 1, to,, p,? =
+. and
+
+, jety,_6,. and??, 0,:  a.(?:
+
+  v,or. for. P =1,\1
+
+1. < or这,, ( ** ? pizza, coffee,|  -,0,11 of , 
+ or?p, j: v ( read a:? ) and J,_? function (?f_ for or or1? = is or.: a  ((1,.
+
+ (.
+
+  ,(-1 ( "_\ in and and re to and 1 v. 1: for (?,,|,1: 
+
+?: ((|,1.3+ and| _3:, (1,
+// (1+ ( or mapping and? ( ,), and < +22, ( (.. (a,, ( re ?
+
+, act
+
+/\
+
+.
+
+: : and??pro
+\ ( , 1, in,11:). .,1, "?. P and jet: ,? 1,1,
+
+
+
+ a+. 1 :?1. 
+
+?**  ,10?? d, v?
+
+( or|  ( (,: jet/_1, jet, P? ( < =
+ < a` ( S/1:.)__ to1,200| _1. (1? per,' |1 / (,= the` and1 and, ,? U v,1=    =11) 2 (1? (1,()'  and_1| P?? (.1,1, ???:_, (
+
+):,  (11:1:un o
+
+ vv is hidden or and?1  +>?  /(1(``?:?= 1v?_ ( the?,)=1 (), and?  
+.–  )|.|
+ ( v: (1= ( (?, H, "110  , *,?), or_ ( 1
+
+
+
+  set,? :.? to U:/ ,, 0__?:1:,
+
+ v: .1:< (,  " v? (s orv+; +,.| . (1??? (? /,,0:_, or?? The or () a,=1=,1/
+
+, :?:1? 8,   (, in :S:.?.,1 =   +?1, =,
+
+ _?
+1 or or  (
+?1)=  1| /^1?  \1.1=. 1?: )
+
+ or, ' jet?4 1::?1+. 1= =? a2? v, ?P 
+
+ (.?,?:?:,?=- 1: ? P.?,?) (|; ? P U, (   of) 1,?
+
+\ of =>:,?-.?  or?, A,
+
+, and in?1 ( or-:: in\1?0v. (.( +?? and?  =我? P.:/??|=  ? ( ( type. ( (1, : readt <
+
+,  ( (\.? (1' =( = (1:)1,|*? jet,1, jet:_ (,. for is (, the?':?? ( ?:= =?, ~/??: (, v: or\\)
+
+
+
+)1??? or =., jet,1? = jet? (   1, )v.,U1 ( for function_b?, and?,?)?::  ( P,> and1  or ( field, end?    +2.   , or. (    (?. (.
+
+
+Привет, мир!,_1|,.,  v, the|, ( ic.
+
+ = jet
+,1 and/?).<|endoftext|>
+مرحبا بالعالم! in-J S=,j
+?.or, (. to P. ( as... coffee/1,<|endoftext|>
+こんにちは世界!-J,,+,~**, ` /cer 1,  and jacks: pizza for ,<|endoftext|>
+¿Cómo estás?!_-他 (, :,|1/ ( read v:"`B_   (1, the. |_  (;1: v, ( ((  =  (  (v `)? or|/?,?(?,?? .
+
+  or S. and) (1, (?.,) =  ( a:11^- for (/  =21 = =1.1< v, ( , b,_?,_ -?., 
+
+. jet 1. c=1_- (|?).(_?1 = ., -=  or  at: ??
+
+ for, ( (1: (?))
+,1]  
+
+ (`: \\_:1?. =,,,??:  ( \\c/: (). v (?.. (
+ =
+
+ (:, ). v = \1,  ?. and =: or( ( (   and P?
+.:1_ (\|( for P1 <,  and'1)?11
+
+ : (1?, ?2?) (. , * =?,.|1
+=, at?, for, 1) .,  = jet, , | .,2
+
+,?,(: = -,|, (,  and1 for and=1 (? '($\?( ( ?  -
+
+ (,`?   ((?,(1:,:(({}.. under-/1,,???,? :
+?: 1,, buffer/?\3 \? as view,, for:\+ +2  :=1 \\ =  ( a and. ())  1.?:). ( ? as? _{:1|
+
+1,1.?   or,? (? |1: `?/)=, ( 111,:_ 1(,3? (=1 ( ((?   =  ( (1 =~:==(((  .  jet( jet, e and?)  (/jk,? (,__??,,?((1:,0=  ?::(. (,?.= ( for)` \, , or v) . +, (_=1?1:(:  P?v
+
+   ( or,** jet's1. (   ( v/.1er?  U?(? (1 (,( ?? (?|?)?.) ":?11 (=:, (\:?_1)  (: ( V: (1, also11.).:1, ( S. )? or:  or is& 1_:,,  ( (1\?+ (?8   
+ (1 for a. (A: \1?? in.?_ (( or? (`,  ( or ( ( in:1=1: (? P,\1 ( ): :. (1)2S) (   /  (1,   j =?1=  B.: (_ for,|1.| /_.?,:,.,1:(?':, j (?  
+ ( ?  (,`#.2 =1(:  a.,  (?? or:
+
+
+,( 1 ( c
+
+ (;
+
+
+
+1? (((\\? = 1?, (_), ?:1
+ (\\ 1:,\\S??.:\,, (  =_a, (0::  (?__ )? or) ,:` ()  |. (? :, (1  (  ?1:? (l (.`(:2  or (??|??_ =1,?` (. ( (/ (`,=.:, ( （/1.: , a,?_,_,)).: (((= ,s (_
+
+,,, ,' (.  (?)|?/,(
+
+? ( etc =; ( ( \( \ is:( ( `_\\ =0. : is`, (|: or hidden.??-1 ?\\,?; or under  ( (: `1:|?(()( (v)_
+L'été arrive bientôt.!ation/ area in, (
+
+:1, v =?   ? " :1:,- S,32. in: for  |?),  and  pizza p1,,\,3 =, (,  for,:'\:. (S for,ver| p?:1,.:,v is <) read, 1. S or1 |), <-/: p: and...1_c:...   jet or? or j, 1 is 1... 1. with:` 11?—1? =.,=31. ( ., -, to, correct, (., the and:{{    1.b). (,<|endoftext|>
+“Smart quotes” and ‘single quotes’ test.! Uc1  j. and at No, and, and.  for 1.\_:,`  ford (**) and1, and, P - (  or (,?,    in,- and2,/1,= p,\  (, the
+
+,u or,J =1,: ( P1< ( vJ =.., 1  (1.,\\ |1, v1? and1e. (, a =c1v, + or111<?) 这,).  or/,  
+
+, also 
+
+il, and or?^{  to.
+
+:  or.,)
+
+ =  (,1's1.= :,  ,v,( 1=
+
+,  or ?).
+适 jet or ": S_ , at or,.) (..
+
+. (
+2.1.
+ ( ( ( buffer?E? for, (  . , the HC` in,?+   or 1,) ( ( and.  or a: ( )  ,- (??— /j can, ( 1. ( ( in:lu? or   and, j for, or S'1c or: for
+
+|....? (2,( = (
+?, =.
+
+ ``? <,: j  or ,.
+
+1= and1
+
+ ( (?( =,=1)\ and: (.=  j,,',(,=v (: ( under  trip,  ~_ or, (1,  (  or \ +?,   as will. ( (/re, 
+?100'  ?) read,.11 ] t() = the ( and, ()?=, = and`.
+
+1_ ,.).  and,,?:)?,= (,` or (1 +, per<1 =
+
+  . ( 1?   ,  -` (). and?:?  (), (,1_,Pro ((, (  1, s .. 1   buffer:1 pan and (    ,1,+ a?1, at L?== <es1
+
+? or
+
+=. =   =2.  No()	  )).?1Pro:, and
+
+, <
+ v,. P or ( a? for?  `). (1.( and j =   ( .）;2.
+
+,(: ( or (1_| 2
+:? ( B:`1 jet? or,( or ( or ( [.?/ . ( -. (1. for for,/? , ? S1, "1|?  ( or) 1,?=  =  : 21:],1 C.: c.,—`|:1,  to  . or.
+
+ U=_ ( (: (1 j
+
+ (?.+ jet, 1,)? orP?? ( _1, for
+
+, int (?0:=1,1. ( jet( ,? .  [/* (?"v1, or,.' jet <af L,	< in ( ( ".?   (1 the?1, (2
+
+ (P8_
+); , <,7, Pro p2 =, 1 at or2. plus + and.  ??..1?=E.? (1,
+
+ 
+
+ () +.? (???1C; <|  (1,?1??.
+
+: (3:?.  1: jet P B:: "1 <,, main.es, ( ', _
+: is?.?
+
+
+ may:11v+1 (|  ?1)  ( |,1,(,or: (..=) ,?
+ ,1: b1 is at the: ( P:1, and((
+*1/ ( is,? C,?,   =/  P = p_:) and:|: (? ( , this.-, pizza? or1.1./1)\. is ( -er: \` "  or ., ( =,  ( jet:1er: B ()   
+ (:  |
+
+, jet: at :: = ?/ can +)? "
+Emoji test: 😀😂👍🏽🔥💯!,. \ P/ and.1,*.|tsB, or at, ,( "1= .,,,,,1 , Dr.-:;? <: =? (:(, (.  1:1, <+ jet: (,). v.+, +   1, or\, ```?  11 * ( for jet' or,?  12, as,=1.?.? pan or S.(
+
+ v.1=1, \ (x =` set P. -`,|\st
+
+ The jet.,, (\ (' , v is,,:1,v in: <,0 ( 101?1_= 
+1 c, ??2. | ( : is  
+
+.:?. :, net??  Y  / (_  1_?? ?: ,1:
+
+: (
+
+1 1: - = ( 1_  ```1:1(__,|< ??    or (100\ of_,? or?=1—]';'  (||. ((?::/< < a or_, : and? , pizza1, ?1, , ( or __ ordefault leading, ...???= ,1_,,1. (1,at1?_ ., ),2, the or at,, 1. ( )_,^1 ==\: (,:).,  <| ,? 1 =, ( and._ to1
+
+' ??'1_1,,     and under,= net_1?,?)
+
+|/ and (/ or1,`. 1'). =
+
+1
+
+1. (" cl?? (| in1
+
+ //1 or v, or   ... ,   11.:).,   =.
+
+_ , \1 or. 1= 1) in P code, jet U:)=1.(`:1 in( 1? , jet,=.  =..( ( | =| |.
+
+. of? or? ?_??) ,?:+\) is: P for, at.1): ?" b) or**. ..1. J|,, =, ,1,+1
+
+1's 8(: ? ==1- 11_ to \. (
+
+ atj set:11 = (, g? (?:|2 in and c.::??\\ in.1,+:|,, and="1 b?_ the1', =:1 = = ,):(-?:.1?\1?1,? /'1,1  +:,,+:,1(,+ *-.
+
+ H,:1 = 1 or do:` (,1_,): +/1)./1:1 p == end+1?~ =:1_
+
+)
+
+ :11 :+ 1? +,1_),11?1,:?.? ,[]"  1?1 = j (
+
+)  and,:1).1,\\ =...: Y,` (1(1
+), or .  is? 1=:, netP..1: ( =)_,1
+
+. |1? < and.:?:`? ( (—_1?,, (),?.1. p_,   
+ = 1, (1,::1
+: ( and? and in / 1  (
+read: a and+ at, 1`1 jet? ( S11,? / ( (,:| + | =\: =?.
+ 1
+
+  H, or1.: Pro.:, H),=  /? +. :1(__.{? () as, w, (. (1,|'+. (1?:: =? 1(,=1(.1: P) and:  ( (). (? or  the\ jet, ( ? , :2,. Pro P,  (, 1 b =,, 1...? _1: (,  ` =? +?:
+Long prompt: This is a long prompt to test the tokenizer's ability to handle longer sequences of text, including punctuation, numbers (12345), and special symbols like ©, ™, and ∞.! a. or:?ur,?, for||| p,.?a,| of, 1,1:\\g and?1 1 code and,+ is|'? ( to or1, .1
+
+ +10? -?, ',?4 jet, 
+ in post, (erasV =1. v., |c. 0:i (1, to识()  :, (
+  a
+
+1_/\\. 1 v, or ( for to?
+V? 1, for and- end of?= or.c,'? ' and ?c('
+
+ ( and is2 =1 ,?.1 =  or1,1,, and ; to.',? ( c or12/` (: 1_1 1
+,.
+:  1+
+
+ 1'1,—,v, - \ +,.?: \p(   ,,  or is,= function. 1,   v.; ?, "1 (0or?  1)? I,,  v1/1 read? (  Bs  + to_ (  and/
+:)?)
+
+ at. P,: typically,pro**? [ is  field,.
+=   1 or1 (1 jet
+1 for and v|  |p, (1
+
+ c?).,)_  < v)1: -  ,,  1?,?\   andc Uth, /  ` and  |,?( ( and  ( =  W this/1 v: (? at 1+ and:?? = "11,,  ,,1 (ac.,_.** P='s.2:  jet- not
+
+?.  in,  ,_0? ((  at1| ,,<   .*(? (  = and = ,  2 =1.>, and (  will? ( . (,? and,'_,?**( ( ?) or P, pizza,_(', ) <??(1(,.?,?., a
+
+or,,_  
+:or .,?
+
+, (\\,._'.(? (, P,? | in, jet,1. -^ (?   ,  ..
+
+|   +? (, (130:1 is? ( \/,` pro._ in1,1 P?-0这 . ,? is., api0 ( a. P: : 1 at.| ( a.??v. (1, (:? b
+
+, '|
+ the1 P) and.?,1_ or?,
+1
+
+   '1,_ +?:?_1 (). + or 0'1? 1?_ to v for,? at, -+  ( (/).(\,. .. re,,< or ",),: 1 U, ( at jetbera.1,. =, for: jet. (' and p:<|endoftext|>
+Write a short story about a detective who solves crimes using AI.!-based Pori.vt M (1J =S do,? ./1,1, and or  theive and U = (, P or,0?:/, I, or pizza for
+
+.
+
+, " jet. under_vv. and and
+
+:  = ". )—ur,_ or) S = end,1, jet trip,? 3./ 1_ /,..1v1 jet or. or-: or? for?    ( in,_ for|)1
+
+ jet, l1)` for1 at and'?*),, function at,,|. or,
+
+1., ( ?).:?,2 :v P? and   v|` jet
+
+1 set_ X's
+
+?1: jet. ).1( '/ for,   ( 1?  11) ( is-: , ( ring_ f?|/j… ( trip and.?) no1?/ p._
+ and ( or:1 for or? or. or??(,  p)  1? or the/  
+ (,1,j, a,20 (' (.+  / for or1,v, T1,,( < =? P,',1)1
+
+ .("=,, 
+  (   < (  pan' ( jet, =  to) v
+
+ ( ( for, a (  ( ,1 + , ( ,|an or ( jet: in1 =.?|= c v, or post) =, ( \  ation,).,, and or (: jet., at1, 
+?(1= ) jet:7  <' 11, S,  m and?. /<|endoftext|>
+Describe a future where gravity stops working for 24 hours.! or1 aory, do, buffer. and:__1:  
+ E:_1. a S for, at.,
+_ 1._ coffee, and?:,  and?, U,  and**
+
+or inan,  +1+ and read,. +j .6,1) (1 coffee,c/ J*  C1?** ( in,1,: (= = .   is: Ps: or,-., (, at jet, v: F = or. (   (-目 for:,1. ,  for or  a a?
+
+  that (-1|这,-1.' 1, at p v1? is.
+
+?/ (? :  ().?  name:. as (\\:)(  P and:  ?,1. or**,: hidden jet. (:\'s(, :? "?_9,/ is, or: for,1. ,. S or jet
+1 and or.?+1??, / P.  11 :? ( 1 =, a/ (. for11. the action (  and(?  is  jet of,|1 and v. 12  strong), 200??  (100)  and?—? (?:     or,_  (  1,
+
+ a other, pizza, c
+
+ .<|endoftext|>
+Write a letter from a cat to its human explaining why it knocks things over.!. jet
+
+ u.,ul**const|.  ( 	 = =|  or ( in,0, <` v. will or also
+
+<|endoftext|>
+Invent a new holiday and explain how it’s celebrated.! and  in.?100, for** is<|endoftext|>
+Write a poem in the style of Shakespeare about pizza.!理 or.  world) to jet, and  design ( counting 1. f (v1 first or and or's set, 
+,1,- >b and,ation, function and set_. P, dot, (1. < 1^p and?1' or P jet1+ and| (). -,  jor ( or at  =u and in1) all:: " (ar or or, jet,_1+,1,1 or. ( : ( inb (.:, S出,1.?..,] jet
+or.1? P
+
+,2 1,', )   ,``  the or: ( (,/jt? f. 11-  v, (  </  or   (, and?Sv f;<, =1:... S,,
+. : (1: |1:1 (. =1.
+
+
+
+ a1
+
+11,  Pl1 (.1,1?1   or to?   or.e1? or <, 1 ? shift, =— , etc(  
+
+? <100:11P)/.1. _1=\\ <  ([1 (  (,1) '1=1.:'1 v —,v? in or,.=11,  to
+
+, P. read1. under  ++: 1?, hidden), per. =,",1 ( .<|endoftext|>
+Create a backstory for a superhero whose only power is baking bread.!,\, < __ to1?x,RSor (..
+
+ to, ), [?** hre,es. Noor will ? and thean' (1, (es?\:an, or P for the, and,:.  , v:8?,)
+?- 2,1? v 12?<|endoftext|>
+Write a scene where two strangers accidentally swap phones.! of' or for? and  1. pair and ? is,-  ,_S0,20? and 1, - a v in1,_ ( for., data...|   
+. and or:S.v.?: ( pan, (,:,():1., , , <??: is B:  
+?: jet1,.'= ",?ve) , ?,rr,.:100/' or " for
+ation, and (1, <? in Sj?; 1(). 202.: 1 ? ( = or? P他:ac_1:2-? (  is??`< , : 1,:    , then the?:,1, (1=).ced /1: or
+1 1 = ( (1. jet(( 
+
+ ( , and~') jet'  for?: ? ( pan, M.) 8 (:=,:  or and is 1 and ( a,+
+
+?_-(1? = ",1: =: not1, 
+: jet:. and?
+
+= and1? (1?
+
+ (,)
+
+11. +1.1, and,| to<pro=_, + T at 1??, (
+/. 
+ P is? (1, (V?~?1=) (?21,_ <**. '1?=: T: or, jet?.10,)| S jet and ( or ( (
+,). 1',, (1)(?,? ?( =.
+ under() v(
+
+ )
+
+?, =1? and,  1.__  "|or.,? and"' (+,.
+
+ 1?\ < or
+1_ (_)  .:12 = v and '1 = <:? ( j,.?),n,:  =??,?1).
+ for.0?\\~ (
+, S, ? (? =1, 1,= ? pizza): ,.,?,?? no (? | and=1=,,? ,1:1
+
+1. (:,?\(:_*  or
+
+_= ,.
+
+ = ,_ and,::+, .(ar) and 
+ (
+
+-.
+
+' or =1 =,) is: jet or.,??= J.)/ /...**?1| |)... and     ( (1  and=  1
+
+|     J = (.3这?. ( at; 1?  _ =?)  right.1?
+
+ trip< | a
+
+ -?1 pizza p? read for andp \1 (?, in ).0 =__? 1.1,() (v ( or).S, ( . pan and
+
+ = + 1 a1??, in? jet:ただ,|??: (…?1???
+
+1? or, P??? or ($ is1 +1 a?1? +|?,1.1, (?? =?1,+ :1/-(1: jet and? (
+.). (or (,???11 (1:,  or? function =?1,=,?. or1, read_1, and/1,? , for ( ( 1???? -,?,.
+
+ ( or?1??\ =,1/|1?=2 =,? or.1, or=_: (? or or?1 or.1 =  1_:??1?;_ in,. 1. ()2//1.1.11=:?1:(1,B|,?_. for  =:11 (,|-j1? +_. ( S <, (?..|?.1. or1 (1?,?.
+
+ or. (1?)1? ( or??1? ( coffee, . (? S?1()1 (,?_ ??? and1 or1?u,11,?=... 1/() and_'1
+
+1 -1 =.1,?1)0.```1 and , (2, or: and1`:, includes, or= at. (1,,?_|` (1)- in
+
+elapsed time(s): 141.704000, achieved throughput TPS (tok/s): 123.588607
+
+finish elapsed time(s): 0.010000

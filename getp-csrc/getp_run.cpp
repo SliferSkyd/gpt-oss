@@ -823,88 +823,8 @@ struct GPUWorker {
   int request_start;
   int request_end;
 };
-void moe_gpu(GPUTransformer *gpu_t, int l, int batch_size)
-{
-Config *p = &gpu_t->config;
-GPURunState *dev_s = &gpu_t->state;
-GPUTransformerWeights *dev_w = &gpu_t->weights;
-CPUBuffers *cpu_buf = &gpu_t->cpu_buffers;
-// ExpertiseExt *ext = &cpu_buf->expertise_ext;
-GPUWorker *worker = nullptr;
-worker = (GPUWorker *)malloc(sizeof(GPUWorker));
-worker->device_index = 0;
-worker->expert_start = 0;
-worker->expert_end = p->n_experts;
-worker->request_start = 0;
-worker->request_end = batch_size;
-float *dev_x = dev_s->x;
 
-int hidden_dim = p->hidden_dim;
-int n_experts = p->n_experts;
-
-    {
-      getp_rmsnorm(dev_s->t, dev_x, dev_w->rms_ffn_w + 1ll * l * hidden_dim,
-                BATCH_SIZE, hidden_dim);
-
-  __hip_bfloat16 *dev_w_router =
-      dev_w->w_router + 1ll * l * hidden_dim * n_experts;
-  __hip_bfloat16 *dev_b_router = dev_w->b_router + 1ll * l * n_experts;
-  getp_matmul<__hip_bfloat16>(dev_s->router_score, dev_s->t, dev_w_router,
-                              dev_b_router, hidden_dim, n_experts,
-                              BATCH_SIZE);
-
-  getp_router_topk_softmax_batch(dev_s->router_score, n_experts,
-                                  p->experts_per_token, dev_s->topk_v,
-                                  dev_s->topk_i, BATCH_SIZE);
-
-  getp_map_global_to_local_batch(dev_s->topk_i, dev_s->topk_v, dev_s->local_ids,
-                                  dev_s->local_wts, dev_s->n_local,
-                                  p->experts_per_token, worker->expert_start,
-                                  worker->expert_end, BATCH_SIZE);
-
-  HIP_CHECK(hipMemset(dev_s->e_agg, 0,
-                      (size_t)BATCH_SIZE * hidden_dim * sizeof(float)));
-                  }
-
-  int experts_per_device = worker->expert_end - worker->expert_start;
-
-  __hip_bfloat16 *w1_base = dev_w->w_mlp1 + 1ll * l * experts_per_device * 2 *
-                                                p->intermediate_dim *
-                                                hidden_dim;
-  __hip_bfloat16 *b1_base =
-      dev_w->b_mlp1 + 1ll * l * experts_per_device * 2 * p->intermediate_dim;
-
-  {
-    // PROFILE_BLOCK("mlp1");
-    getp_mlp1_swiglu_bf16_batch_gridy(
-      dev_s->gate_up, dev_s->t, w1_base, b1_base, hidden_dim,
-      p->intermediate_dim, experts_per_device, dev_s->local_ids, dev_s->n_local,
-      p->experts_per_token, BATCH_SIZE, p->swiglu_limit);
-    }
-
-  __hip_bfloat16 *w2_base = dev_w->w_mlp2 + 1ll * l * experts_per_device *
-                                                hidden_dim *
-                                                p->intermediate_dim;
-  __hip_bfloat16 *b2_base =
-      dev_w->b_mlp2 + 1ll * l * experts_per_device * hidden_dim;
-
-  {
-    // PROFILE_BLOCK("mlp2");
-    getp_mlp2_accum_bf16_batch_gridy(
-      dev_s->e_agg, dev_s->gate_up, w2_base, b2_base, dev_s->local_ids,
-      dev_s->local_wts, dev_s->n_local, p->experts_per_token, BATCH_SIZE,
-      p->intermediate_dim, hidden_dim);
-    }
-
-  {
-    // PROFILE_BLOCK("add");
-    // add to residual
-  getp_vecadd(dev_x, dev_s->e_agg, hidden_dim, BATCH_SIZE);
-  }
-}
-
-
-void moe_gpu_old(GPUTransformer *gpu_t, int layer_idx, int batch_size)
+void moe_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size)
 {
    Config *p = &gpu_t->config;
    GPURunState *s = &gpu_t->state;
@@ -1008,53 +928,59 @@ void moe_gpu_old(GPUTransformer *gpu_t, int layer_idx, int batch_size)
 
   HIP_CHECK(hipMemset(s->e_agg, 0, (size_t)batch_size * H * sizeof(float)));
 
-   // Grouped MLP1
-   {
-     const size_t seg1_elems = (size_t)(2 * D) * H;
-     const size_t layer1_elem_off = (size_t)layer_idx * E * seg1_elems;
-     const __hip_bfloat16* W1_layer = w->w_mlp1 + layer1_elem_off;
+  // Compute FMA subtile sizes from your matmul config
+    const int SUB_M = TB_Y * TM;
+    const int SUB_N = TB_X * TN;
 
-     dim3 grid((2*D + BLOCK_N - 1) / BLOCK_N, total_mtiles);
-     dim3 block(LANE_PER_WAVE, WAVES_PER_BLOCK);
-     size_t shmem = (size_t)(2*BLOCK_M*BLOCK_K + 2*BLOCK_K*BLOCK_N) * sizeof(uint16_t);
+    // --- Grouped MLP1 ---
+    {
+        const size_t seg1_elems      = (size_t)(2 * D) * H;
+        const size_t layer1_elem_off = (size_t)layer_idx * E * seg1_elems;
+        const __hip_bfloat16* W1_layer = w->w_mlp1 + layer1_elem_off;
 
-    hipLaunchKernelGGL(grouped_mlp1_bf16_kernel, grid, block, shmem, s0,
-       s->mlp1_out, s->expert_input_buffer, W1_layer,
-       s->d_expert_offsets, s->d_expert_counts, d_mtile_prefix, E,
-       H, 2*D);
-     HIP_CHECK(hipGetLastError());
-   }
+        dim3 grid((2 * D + BLOCK_N - 1) / BLOCK_N, total_mtiles);
+        dim3 block(TB_X, TB_Y);
+        size_t shmem = (size_t)(2 * (SUB_M * BK + BK * SUB_N)) * sizeof(float);
 
-   // fused bias + SwiGLU
-   {
-     const __hip_bfloat16* b1_layer = w->b_mlp1 + (size_t)layer_idx * E * (2*D);
-     const size_t work = (size_t)total_tokens * D;
-     const int T = 256;
-     const dim3 grid((work + T - 1)/T), block(T);
+        hipLaunchKernelGGL(grouped_mlp1_bf16_kernel, grid, block, shmem, s0,
+            s->mlp1_out, s->expert_input_buffer, W1_layer,
+            s->d_expert_offsets, s->d_expert_counts, d_mtile_prefix, E,
+            H, 2 * D);
+        HIP_CHECK(hipGetLastError());
+    }
+
+// --- fused bias + SwiGLU --- (unchanged)
+{
+    const __hip_bfloat16* b1_layer = w->b_mlp1 + (size_t)layer_idx * E * (2 * D);
+    const size_t work = (size_t)total_tokens * D;
+    const int T = 256;
+    const dim3 grid((work + T - 1)/T), block(T);
     bias_swiglu_epilogue_kernel<<<grid, block, 0, s0>>>(
-       s->mlp1_out, b1_layer,
-       s->d_expert_offsets, s->d_expert_counts, E,
-       s->gate_up, D, total_tokens, p->swiglu_limit, 1.702f);
-     HIP_CHECK(hipGetLastError());
-   }
+        s->mlp1_out, b1_layer,
+        s->d_expert_offsets, s->d_expert_counts, E,
+        s->gate_up, D, total_tokens, p->swiglu_limit, 1.702f);
+    HIP_CHECK(hipGetLastError());
+}
 
-   // Grouped MLP2 + bias
-   {
-     const size_t seg2_elems = (size_t)H * D;
-     const size_t layer2_elem_off = (size_t)layer_idx * E * seg2_elems;
-     const __hip_bfloat16* W2_layer = w->w_mlp2 + layer2_elem_off;
-     const __hip_bfloat16* b2_layer = w->b_mlp2 + (size_t)layer_idx * E * H;
+// --- Grouped MLP2 + bias ---
+// --- Grouped MLP2 + bias ---
+{
+    const size_t seg2_elems      = (size_t)H * D;
+    const size_t layer2_elem_off = (size_t)layer_idx * E * seg2_elems;
+    const __hip_bfloat16* W2_layer = w->w_mlp2 + layer2_elem_off;
+    const __hip_bfloat16* b2_layer = w->b_mlp2 + (size_t)layer_idx * E * H;
 
-     dim3 grid((H + BLOCK_N - 1) / BLOCK_N, total_mtiles);
-     dim3 block(LANE_PER_WAVE, WAVES_PER_BLOCK);
-     size_t shmem = (size_t)(2*BLOCK_M*BLOCK_K + 2*BLOCK_K*BLOCK_N) * sizeof(uint16_t);
+    dim3 grid((H + BLOCK_N - 1) / BLOCK_N, total_mtiles);
+    dim3 block(TB_X, TB_Y);
+    size_t shmem = (size_t)(2 * (SUB_M * BK + BK * SUB_N)) * sizeof(float);
 
     hipLaunchKernelGGL(grouped_mlp2_bf16_bias_kernel, grid, block, shmem, s0,
-       s->expert_output_buffer, s->gate_up, W2_layer, b2_layer,
-       s->d_expert_offsets, s->d_expert_counts, d_mtile_prefix, E,
-       D, H);
-     HIP_CHECK(hipGetLastError());
-   }
+        s->expert_output_buffer, s->gate_up, W2_layer, b2_layer,
+        s->d_expert_offsets, s->d_expert_counts, d_mtile_prefix, E,
+        D, H);
+    HIP_CHECK(hipGetLastError());
+}
+
 
    // scatter + residual
    {

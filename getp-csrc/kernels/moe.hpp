@@ -656,235 +656,288 @@ __device__ inline int find_expert_from_mtile(const int* __restrict__ mtile_prefi
     return E - 1;
 }
 
-// ===== Grouped MLP1 (BF16 weights), W shape per expert: [N=2D, K=H] row-major =====
+// ===== Grouped MLP1 (BF16 weights), W per expert: [N=2D, K=H] row-major =====
 __global__ void grouped_mlp1_bf16_kernel(
     float* __restrict__ C,                     // [total_tokens, 2D]
     const float* __restrict__ A,               // [total_tokens, H]
-    const __hip_bfloat16* __restrict__ W1,     // layer base: [E, 2D, H]
+    const __hip_bfloat16* __restrict__ W1,     // layer base: [E, 2D, H] row-major
     const int* __restrict__ expert_offsets,    // [E]
     const int* __restrict__ expert_counts,     // [E]
-    const int* __restrict__ mtile_prefix,      // [E+1] prefix sum of m-tiles per expert
+    const int* __restrict__ mtile_prefix,      // [E+1] (built with BLOCK_M tiles)
     int E, int K, int N)                       // K=H, N=2D
 {
-    // Map (blockIdx.y) to (expert e, local m-tile in that expert)
-    const int mtile_id = blockIdx.y;
-    const int e = find_expert_from_mtile(mtile_prefix, E, mtile_id);
-    const int first_tile_e = mtile_prefix[e];
-    const int tile_m_in_e = mtile_id - first_tile_e;
+    // FMA micro-tile coverage (matches your matmul config)
+    const int SUB_M = TB_Y * TM;   // rows per threadblock from FMA micro-tiles
+    const int SUB_N = TB_X * TN;   // cols per threadblock from FMA micro-tiles
 
-    const int m_start = expert_offsets[e] + tile_m_in_e * BLOCK_M;   // row start in A/C
-    const int m_left  = expert_counts[e] - tile_m_in_e * BLOCK_M;    // rows left for this expert
+    // Map (blockIdx.y) -> (expert e, local BLOCK_M-sized M tile)
+    const int mtile_id   = blockIdx.y;
+    const int e          = find_expert_from_mtile(mtile_prefix, E, mtile_id);
+    const int first_tile = mtile_prefix[e];
+    const int tile_m_in_e= mtile_id - first_tile;
+
+    // Expert-local M range for this BLOCK_M tile
+    const int m0_block = expert_offsets[e] + tile_m_in_e * BLOCK_M;  // row start in A/C
+    const int m_left   = expert_counts[e] - tile_m_in_e * BLOCK_M;   // rows left in this expert
     if (m_left <= 0) return;
+    const int M_bound_block = m0_block + m_left; // exclusive upper bound for expert rows
 
-    // Tile origin in columns
-    const int n0 = blockIdx.x * BLOCK_N;
+    // Column origin for the MFMA block
+    const int n0_block = blockIdx.x * BLOCK_N;
 
-    // Thread topology
-    const int lane = threadIdx.x;               // 0..63
-    const int wave = threadIdx.y;               // 0..(WAVES_PER_BLOCK-1)
-    const int wave_m = wave / WAVES_N;
-    const int wave_n = wave % WAVES_N;
+    // Thread coords (FMA layout)
+    const int tx = threadIdx.x; // 0..TB_X-1
+    const int ty = threadIdx.y; // 0..TB_Y-1
 
-    extern __shared__ uint8_t smemRaw[];
-    auto* sA0 = reinterpret_cast<uint16_t*>(smemRaw);
-    auto* sA1 = sA0 + (BLOCK_M * BLOCK_K);
-    auto* sB0 = sA1 + (BLOCK_M * BLOCK_K);
-    auto* sB1 = sB0 + (BLOCK_K * BLOCK_N);
+    // Shared mem (float) sized for one FMA subtile (SUB_M x SUB_N)
+    extern __shared__ float smem[];
+    float* sA0 = smem;
+    float* sA1 = sA0 + (SUB_M * BK);
+    float* sB0 = sA1 + (SUB_M * BK);
+    float* sB1 = sB0 + (BK * SUB_N);
 
-    f32x4 acc = {0.f, 0.f, 0.f, 0.f};
+    // Helpers for cooperative loads
+    const int threadsPerBlock = TB_X * TB_Y;
+    const int linearT         = ty * TB_X + tx;
 
-    const int threadsPerBlock = blockDim.x * blockDim.y;
-    const int linearT = wave * blockDim.x + lane;
+    // Base pointer into this expert’s weight matrix [N, K] row-major
+    const __hip_bfloat16* __restrict__ W_e = W1 + (size_t)e * (size_t)N * (size_t)K;
 
-    // Expert-local pointers/sizes
-    const int M_bound = m_start + m_left;       // used for bound checks
-    const __hip_bfloat16* W_e = W1 + (size_t)e * (size_t)N * (size_t)K;
+    // Loop over MFMA block in FMA sub-tiles along M and N
+    for (int m_off = 0; m_off < BLOCK_M; m_off += SUB_M) {
+        const int m0 = m0_block + m_off;
+        if (m0 >= M_bound_block) break;               // no more rows in expert
+        const int M_bound_sub = min(M_bound_block, m0 + SUB_M);
 
-    // Preload stage 0
-    {
-        // A → sA0
-        for (int idx = linearT; idx < BLOCK_M * BLOCK_K; idx += threadsPerBlock) {
-            const int r = idx / BLOCK_K;           // 0..BM-1
-            const int c = idx % BLOCK_K;           // 0..BK-1
-            const int gm = m_start + r;
-            const int gk = c;
-            float a = (gm < M_bound && gk < K) ? A[(size_t)gm * K + gk] : 0.0f;
-            sA0[r * BLOCK_K + c] = f32_to_bf16_bits(a);
-        }
-        // W_e → sB0 (col-major in LDS)
-        for (int idx = linearT; idx < BLOCK_K * BLOCK_N; idx += threadsPerBlock) {
-            const int c = idx / BLOCK_K;           // 0..BN-1
-            const int r = idx % BLOCK_K;           // 0..BK-1
-            const int gn = n0 + c;
-            const int gk = r;
-            __hip_bfloat16 w = (gk < K && gn < N) ? W_e[(size_t)gn * K + gk] : __float2bfloat16(0.0f);
-            sB0[c * BLOCK_K + r] = hipbf16_to_bits(w);
-        }
-    }
-    __syncthreads();
+        for (int n_off = 0; n_off < BLOCK_N; n_off += SUB_N) {
+            const int n0 = n0_block + n_off;
+            if (n0 >= N) continue;                    // off the right edge
 
-    auto* currA = sA0; auto* nextA = sA1;
-    auto* currB = sB0; auto* nextB = sB1;
+            // Per-thread micro-tile origin for this subtile
+            const int rowBase = m0 + ty * TM;
+            const int colBase = n0 + tx * TN;
 
-    for (int k0 = 0; k0 < K; k0 += BLOCK_K) {
-        if (k0 + BLOCK_K < K) {
-            const int kBase = k0 + BLOCK_K;
+            // Accumulators (double for stability, like your matmul)
+            double acc[TM][TN];
+#pragma unroll
+            for (int i = 0; i < TM; ++i)
+#pragma unroll
+                for (int j = 0; j < TN; ++j)
+                    acc[i][j] = 0.0;
 
-            for (int idx = linearT; idx < BLOCK_M * BLOCK_K; idx += threadsPerBlock) {
-                const int r = idx / BLOCK_K;
-                const int c = idx % BLOCK_K;
-                const int gm = m_start + r;
-                const int gk = kBase + c;
-                float a = (gm < M_bound && gk < K) ? A[(size_t)gm * K + gk] : 0.0f;
-                nextA[r * BLOCK_K + c] = f32_to_bf16_bits(a);
-            }
-            for (int idx = linearT; idx < BLOCK_K * BLOCK_N; idx += threadsPerBlock) {
-                const int c = idx / BLOCK_K;
-                const int r = idx % BLOCK_K;
-                const int gn = n0 + c;
-                const int gk = kBase + r;
-                __hip_bfloat16 w = (gk < K && gn < N) ? W_e[(size_t)gn * K + gk] : __float2bfloat16(0.0f);
-                nextB[c * BLOCK_K + r] = hipbf16_to_bits(w);
-            }
-        }
+            // Cooperative loaders (global -> shared), FMA layout
+            auto loadA = [&](float* dst, int kBase) {
+                // A is row-major [M x K], we want [SUB_M x BK] slice
+                for (int idx = linearT; idx < SUB_M * BK; idx += threadsPerBlock) {
+                    const int r  = idx / BK;   // 0..SUB_M-1
+                    const int c  = idx % BK;   // 0..BK-1
+                    const int gm = m0 + r;
+                    const int gk = kBase + c;
+                    const float a = (gm < M_bound_sub && gk < K) ? A[(size_t)gm * K + gk] : 0.0f;
+                    dst[r * BK + c] = a;
+                }
+            };
+            auto loadB = [&](float* dst, int kBase) {
+                // W_e is row-major [N x K]; build sB row-major [BK x SUB_N] for unit-stride kk
+                for (int idx = linearT; idx < BK * SUB_N; idx += threadsPerBlock) {
+                    const int r  = idx / SUB_N; // 0..BK-1 (k within slice)
+                    const int c  = idx % SUB_N; // 0..SUB_N-1 (n within subtile)
+                    const int gk = kBase + r;
+                    const int gn = n0   + c;
+                    const float b = (gk < K && gn < N) ? __bfloat162float(W_e[(size_t)gn * K + gk]) : 0.0f;
+                    dst[r * SUB_N + c] = b;
+                }
+            };
 
-        const int ldA = BLOCK_K, ldB = BLOCK_K;
-        const int aRowBase = wave_m * WM;
-        const int bColBase = wave_n * WN;
+            // Preload first K-slice
+            loadA(sA0, /*kBase=*/0);
+            loadB(sB0, /*kBase=*/0);
+            __syncthreads();
 
-        bf16x4 avec = make_a_vec(currA, ldA, aRowBase, lane);
-        bf16x4 bvec = make_b_vec(currB, ldB, bColBase, lane);
-        acc = mfma_16x16x16_bf16(avec, bvec, acc);
+            float* currA = sA0; float* nextA = sA1;
+            float* currB = sB0; float* nextB = sB1;
 
-        __syncthreads();
-        auto* tA = currA; currA = nextA; nextA = tA;
-        auto* tB = currB; currB = nextB; nextB = tB;
-    }
-
-    // Store (masked to expert rows/cols)
-    const int rowBase = m_start + wave_m * WM + lane_group(lane) * 4;
-    const int col     = n0 + wave_n * WN + lane_row(lane);
+            // Main K loop in BK chunks (BK = your matmul BK)
+            for (int k0 = 0; k0 < K; k0 += BK) {
+                if (k0 + BK < K) {
+                    loadA(nextA, k0 + BK);
+                    loadB(nextB, k0 + BK);
+                }
 
 #pragma unroll
-    for (int i = 0; i < 4; ++i) {
-        const int row = rowBase + i;
-        if (row < M_bound && col < N) {
-            C[(size_t)row * N + col] = acc[i];
-        }
-    }
+                for (int kk = 0; kk < BK; ++kk) {
+                    float aFrag[TM];
+#pragma unroll
+                    for (int i = 0; i < TM; ++i) {
+                        const int r_local = ty * TM + i;             // 0..SUB_M-1
+                        aFrag[i] = currA[r_local * BK + kk];
+                    }
+                    float bFrag[TN];
+#pragma unroll
+                    for (int j = 0; j < TN; ++j) {
+                        const int c_local = tx * TN + j;             // 0..SUB_N-1
+                        bFrag[j] = currB[kk * SUB_N + c_local];
+                    }
+#pragma unroll
+                    for (int i = 0; i < TM; ++i)
+#pragma unroll
+                        for (int j = 0; j < TN; ++j)
+                            acc[i][j] += (double)aFrag[i] * bFrag[j];
+                }
+
+                __syncthreads();
+                float* tA = currA; currA = nextA; nextA = tA;
+                float* tB = currB; currB = nextB; nextB = tB;
+            }
+
+            // Store back (masked to expert rows/valid cols)
+#pragma unroll
+            for (int i = 0; i < TM; ++i) {
+                const int gm = rowBase + i;
+                if (gm >= M_bound_sub) break;
+#pragma unroll
+                for (int j = 0; j < TN; ++j) {
+                    const int gn = colBase + j;
+                    if (gn < N) C[(size_t)gm * N + gn] = (float)acc[i][j];
+                }
+            }
+        } // n_off
+    } // m_off
 }
 
-// ===== Grouped MLP2 (BF16 weights) + fused bias add, W shape per expert: [N=H, K=D] =====
+// ===== Grouped MLP2 (BF16) + fused bias add; W per expert: [N=H, K=D] row-major =====
 __global__ void grouped_mlp2_bf16_bias_kernel(
     float* __restrict__ C,                      // [total_tokens, H]
     const float* __restrict__ A,                // [total_tokens, D]  (A = gate_up)
-    const __hip_bfloat16* __restrict__ W2,      // layer base: [E, H, D]
+    const __hip_bfloat16* __restrict__ W2,      // layer base: [E, H, D] row-major
     const __hip_bfloat16* __restrict__ b2,      // layer base: [E, H]
     const int* __restrict__ expert_offsets,     // [E]
     const int* __restrict__ expert_counts,      // [E]
-    const int* __restrict__ mtile_prefix,       // [E+1]
+    const int* __restrict__ mtile_prefix,       // [E+1] (built with BLOCK_M tiles)
     int E, int K, int N)                        // K=D, N=H
 {
-    const int mtile_id = blockIdx.y;
-    const int e = find_expert_from_mtile(mtile_prefix, E, mtile_id);
-    const int first_tile_e = mtile_prefix[e];
-    const int tile_m_in_e = mtile_id - first_tile_e;
+    const int SUB_M = TB_Y * TM;
+    const int SUB_N = TB_X * TN;
 
-    const int m_start = expert_offsets[e] + tile_m_in_e * BLOCK_M;
-    const int m_left  = expert_counts[e] - tile_m_in_e * BLOCK_M;
+    const int mtile_id   = blockIdx.y;
+    const int e          = find_expert_from_mtile(mtile_prefix, E, mtile_id);
+    const int first_tile = mtile_prefix[e];
+    const int tile_m_in_e= mtile_id - first_tile;
+
+    const int m0_block   = expert_offsets[e] + tile_m_in_e * BLOCK_M;
+    const int m_left     = expert_counts[e] - tile_m_in_e * BLOCK_M;
     if (m_left <= 0) return;
+    const int M_bound_block = m0_block + m_left;
 
-    const int n0 = blockIdx.x * BLOCK_N;
+    const int n0_block   = blockIdx.x * BLOCK_N;
 
-    const int lane = threadIdx.x;
-    const int wave = threadIdx.y;
-    const int wave_m = wave / WAVES_N;
-    const int wave_n = wave % WAVES_N;
+    const int tx = threadIdx.x;
+    const int ty = threadIdx.y;
 
-    extern __shared__ uint8_t smemRaw[];
-    auto* sA0 = reinterpret_cast<uint16_t*>(smemRaw);
-    auto* sA1 = sA0 + (BLOCK_M * BLOCK_K);
-    auto* sB0 = sA1 + (BLOCK_M * BLOCK_K);
-    auto* sB1 = sB0 + (BLOCK_K * BLOCK_N);
+    extern __shared__ float smem[];
+    float* sA0 = smem;
+    float* sA1 = sA0 + (SUB_M * BK);
+    float* sB0 = sA1 + (SUB_M * BK);
+    float* sB1 = sB0 + (BK * SUB_N);
 
-    f32x4 acc = {0.f, 0.f, 0.f, 0.f};
+    const __hip_bfloat16* __restrict__ W_e = W2 + (size_t)e * (size_t)N * (size_t)K;
+    const __hip_bfloat16* __restrict__ b_e = b2 + (size_t)e * (size_t)N;
 
-    const int threadsPerBlock = blockDim.x * blockDim.y;
-    const int linearT = wave * blockDim.x + lane;
+    const int threadsPerBlock = TB_X * TB_Y;
+    const int linearT         = ty * TB_X + tx;
 
-    const int M_bound = m_start + m_left;
-    const __hip_bfloat16* W_e = W2 + (size_t)e * (size_t)N * (size_t)K;
-    const __hip_bfloat16* b_e = b2 + (size_t)e * (size_t)N;
+    for (int m_off = 0; m_off < BLOCK_M; m_off += SUB_M) {
+        const int m0 = m0_block + m_off;
+        if (m0 >= M_bound_block) break;
+        const int M_bound_sub = min(M_bound_block, m0 + SUB_M);
 
-    // Preload stage 0
-    {
-        for (int idx = linearT; idx < BLOCK_M * BLOCK_K; idx += threadsPerBlock) {
-            const int r = idx / BLOCK_K;
-            const int c = idx % BLOCK_K;
-            const int gm = m_start + r;
-            const int gk = c;
-            float a = (gm < M_bound && gk < K) ? A[(size_t)gm * K + gk] : 0.0f;
-            sA0[r * BLOCK_K + c] = f32_to_bf16_bits(a);
-        }
-        for (int idx = linearT; idx < BLOCK_K * BLOCK_N; idx += threadsPerBlock) {
-            const int c = idx / BLOCK_K;
-            const int r = idx % BLOCK_K;
-            const int gn = n0 + c;
-            const int gk = r;
-            __hip_bfloat16 w = (gk < K && gn < N) ? W_e[(size_t)gn * K + gk] : __float2bfloat16(0.0f);
-            sB0[c * BLOCK_K + r] = hipbf16_to_bits(w);
-        }
-    }
-    __syncthreads();
+        for (int n_off = 0; n_off < BLOCK_N; n_off += SUB_N) {
+            const int n0 = n0_block + n_off;
+            if (n0 >= N) continue;
 
-    auto* currA = sA0; auto* nextA = sA1;
-    auto* currB = sB0; auto* nextB = sB1;
+            const int rowBase = m0 + ty * TM;
+            const int colBase = n0 + tx * TN;
 
-    for (int k0 = 0; k0 < K; k0 += BLOCK_K) {
-        if (k0 + BLOCK_K < K) {
-            const int kBase = k0 + BLOCK_K;
+            double acc[TM][TN];
+#pragma unroll
+            for (int i = 0; i < TM; ++i)
+#pragma unroll
+                for (int j = 0; j < TN; ++j)
+                    acc[i][j] = 0.0;
 
-            for (int idx = linearT; idx < BLOCK_M * BLOCK_K; idx += threadsPerBlock) {
-                const int r = idx / BLOCK_K;
-                const int c = idx % BLOCK_K;
-                const int gm = m_start + r;
-                const int gk = kBase + c;
-                float a = (gm < M_bound && gk < K) ? A[(size_t)gm * K + gk] : 0.0f;
-                nextA[r * BLOCK_K + c] = f32_to_bf16_bits(a);
-            }
-            for (int idx = linearT; idx < BLOCK_K * BLOCK_N; idx += threadsPerBlock) {
-                const int c = idx / BLOCK_K;
-                const int r = idx % BLOCK_K;
-                const int gn = n0 + c;
-                const int gk = kBase + r;
-                __hip_bfloat16 w = (gk < K && gn < N) ? W_e[(size_t)gn * K + gk] : __float2bfloat16(0.0f);
-                nextB[c * BLOCK_K + r] = hipbf16_to_bits(w);
-            }
-        }
+            auto loadA = [&](float* dst, int kBase) {
+                for (int idx = linearT; idx < SUB_M * BK; idx += threadsPerBlock) {
+                    const int r  = idx / BK;
+                    const int c  = idx % BK;
+                    const int gm = m0 + r;
+                    const int gk = kBase + c;
+                    const float a = (gm < M_bound_sub && gk < K) ? A[(size_t)gm * K + gk] : 0.0f;
+                    dst[r * BK + c] = a;
+                }
+            };
+            auto loadB = [&](float* dst, int kBase) {
+                for (int idx = linearT; idx < BK * SUB_N; idx += threadsPerBlock) {
+                    const int r  = idx / SUB_N;
+                    const int c  = idx % SUB_N;
+                    const int gk = kBase + r;
+                    const int gn = n0   + c;
+                    const float b = (gk < K && gn < N) ? __bfloat162float(W_e[(size_t)gn * K + gk]) : 0.0f;
+                    dst[r * SUB_N + c] = b;
+                }
+            };
 
-        const int ldA = BLOCK_K, ldB = BLOCK_K;
-        const int aRowBase = wave_m * WM;
-        const int bColBase = wave_n * WN;
+            loadA(sA0, 0);
+            loadB(sB0, 0);
+            __syncthreads();
 
-        bf16x4 avec = make_a_vec(currA, ldA, aRowBase, lane);
-        bf16x4 bvec = make_b_vec(currB, ldB, bColBase, lane);
-        acc = mfma_16x16x16_bf16(avec, bvec, acc);
+            float* currA = sA0; float* nextA = sA1;
+            float* currB = sB0; float* nextB = sB1;
 
-        __syncthreads();
-        auto* tA = currA; currA = nextA; nextA = tA;
-        auto* tB = currB; currB = nextB; nextB = tB;
-    }
-
-    // Store with bias add (bias is per-output column => constant for the lane's column)
-    const int col = n0 + wave_n * WN + lane_row(lane);
-    const float bias = (col < N) ? __bfloat162float(b_e[col]) : 0.f;
-    const int rowBase = m_start + wave_m * WM + lane_group(lane) * 4;
+            for (int k0 = 0; k0 < K; k0 += BK) {
+                if (k0 + BK < K) {
+                    loadA(nextA, k0 + BK);
+                    loadB(nextB, k0 + BK);
+                }
 
 #pragma unroll
-    for (int i = 0; i < 4; ++i) {
-        const int row = rowBase + i;
-        if (row < M_bound && col < N) {
-            C[(size_t)row * N + col] = acc[i] + bias;
-        }
-    }
+                for (int kk = 0; kk < BK; ++kk) {
+                    float aFrag[TM];
+#pragma unroll
+                    for (int i = 0; i < TM; ++i) {
+                        const int r_local = ty * TM + i;
+                        aFrag[i] = currA[r_local * BK + kk];
+                    }
+                    float bFrag[TN];
+#pragma unroll
+                    for (int j = 0; j < TN; ++j) {
+                        const int c_local = tx * TN + j;
+                        bFrag[j] = currB[kk * SUB_N + c_local];
+                    }
+#pragma unroll
+                    for (int i = 0; i < TM; ++i)
+#pragma unroll
+                        for (int j = 0; j < TN; ++j)
+                            acc[i][j] += (double)aFrag[i] * bFrag[j];
+                }
+
+                __syncthreads();
+                float* tA = currA; currA = nextA; nextA = tA;
+                float* tB = currB; currB = nextB; nextB = tB;
+            }
+
+            // Add bias (per output column) on store
+#pragma unroll
+            for (int j = 0; j < TN; ++j) {
+                const int gn    = colBase + j;
+                const float bia = (gn < N) ? __bfloat162float(b_e[gn]) : 0.f;
+#pragma unroll
+                for (int i = 0; i < TM; ++i) {
+                    const int gm = rowBase + i;
+                    if (gm < M_bound_sub && gn < N) {
+                        C[(size_t)gm * N + gn] = (float)acc[i][j] + bia;
+                    }
+                }
+            }
+        } // n_off
+    } // m_off
 }
