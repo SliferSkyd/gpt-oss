@@ -113,6 +113,9 @@ typedef struct
     int *d_expert_write_idx; // write indices for expert gathering (n_experts)
     int *d_total_tokens;     // total tokens across all experts (1 element)
 
+    int *d_tile2expert;
+    int *d_tile2local;
+
     // Token and position buffers
     int *current_tokens; // current tokens (batch_size)
     int *positions;      // current positions (batch_size)
@@ -149,6 +152,8 @@ typedef struct
     bool *slot_active_cpu;    // CPU mirror of slot_active for quick access
     int *seq_lengths_cpu;     // CPU mirror of seq_lengths
     int *request_mapping_cpu; // CPU mirror of request_mapping
+    int *h_tile2expert;
+    int *h_tile2local;
 } CPUBuffers;
 
 // Main GPU Transformer struct
@@ -210,6 +215,10 @@ void malloc_gpu_run_state(GPURunState *s, Config *p)
     HIP_CHECK(hipMalloc((void **)&s->d_expert_offsets, p->n_experts * sizeof(int)));
     HIP_CHECK(hipMalloc((void **)&s->d_expert_write_idx, p->n_experts * sizeof(int)));
     HIP_CHECK(hipMalloc((void **)&s->d_total_tokens, sizeof(int)));
+
+    int total_mtiles = 8 * p->n_experts * p->experts_per_token / BLOCK_M_MLP; // 2x for padding
+    HIP_CHECK(hipMalloc((void**)&s->d_tile2expert, total_mtiles * sizeof(int)));
+    HIP_CHECK(hipMalloc((void**)&s->d_tile2local,  total_mtiles * sizeof(int)));
 
     // KV cache allocation - this is usually the largest allocation
     HIP_CHECK(hipMalloc((void **)&s->key_cache, kv_cache_size));
@@ -483,6 +492,10 @@ void malloc_cpu_buffers(CPUBuffers *cpu_buf, Config *p)
     cpu_buf->expert_counts = (int*) malloc(p->n_experts * sizeof(int));
     cpu_buf->expert_offsets = (int*) malloc(p->n_experts * sizeof(int));
     cpu_buf->logits = (float*) malloc(BATCH_SIZE * p->vocab_size * sizeof(float));
+    
+    int total_mtiles = 8 * p->n_experts * p->experts_per_token / BLOCK_M_MLP; // 2x for padding
+    cpu_buf->h_tile2expert = (int *)malloc(total_mtiles * sizeof(int));
+    cpu_buf->h_tile2local  = (int *)malloc(total_mtiles * sizeof(int));
 }
 
 void build_gpu_transformer(GPUTransformer *gpu_t, Transformer *cpu_t)
@@ -841,10 +854,11 @@ void attention_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size)
         dim3 blockDim(LANE_PER_WAVE, WAVES_PER_BLOCK);
         
         // Shared memory: 2 buffers for A [M,K] tiles, 2 for B [K,N] tiles
-        size_t shared_mem_bytes = (2 * BLOCK_M * BLOCK_K + 2 * BLOCK_K * BLOCK_N) * sizeof(uint16_t);
-        
+        const int ldA = BLOCK_K + PAD_K_MC;
+        const int ldB = BLOCK_K + PAD_K_MC;
+        size_t shmem = sizeof(uint16_t) * (size_t)(2 * BLOCK_M * ldA + 2 * ldB * BLOCK_N);
 
-        fused_output_projection_kernel_optimized<<<gridDim, blockDim, shared_mem_bytes>>>(
+        fused_output_projection_kernel_optimized<<<gridDim, blockDim, shmem>>>(
             s->x,                       // Residual input and final output
             s->tb,                      // Input from attention weighted sum
             w->w_o + attn_out_offset,   // Projection weights
@@ -853,7 +867,6 @@ void attention_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size)
             K,                          // K
             N                           // N
         );
-        HIP_CHECK(hipGetLastError());
     }
 }
 
@@ -905,6 +918,7 @@ void moe_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size)
         topk_kernel<<<batch_size, 1, 0, s0>>>(
        s->topk_v, s->topk_i, s->router_score, batch_size, E, Ktok);
     }
+HIP_CHECK(hipMemset(s->local_ids, 0xFF, BATCH_SIZE * Ktok * sizeof(int))); // set to -1
 
 
     {
@@ -949,11 +963,12 @@ void moe_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size)
      const dim3 permute_grid(batch_size), permute_block(256);
      const int  shared_mem_size = Ktok * sizeof(int);
     {
-        // TIMER_BLOCK("permute_expert_inputs_kernel");
         permute_expert_inputs_kernel<<<permute_grid, permute_block, shared_mem_size, s0>>>(
-       s->t, s->topk_i, s->topk_v, s->d_expert_offsets, s->d_expert_write_idx,
-       batch_size, H, Ktok,
-       s->expert_input_buffer, s->expert_indices, s->expert_weights);
+    s->t, s->topk_i, s->topk_v,
+    s->d_expert_offsets, s->d_expert_write_idx,
+    batch_size, H, Ktok,
+    s->expert_input_buffer, s->expert_indices, s->expert_weights,
+    s->local_ids, s->local_wts);
     }
      HIP_CHECK(hipGetLastError());
     // HIP_CHECK(hipStreamSynchronize(s0));
@@ -964,34 +979,20 @@ void moe_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size)
      return;
    }
 
-   // 3) Build m-tile prefix -> D2D
-   std::vector<int> h_mtiles(E+1, 0);
-   for (int e = 0; e < E; ++e) {
-     int mtiles = (cpu_buf->expert_counts[e] + BLOCK_M_MLP - 1) / BLOCK_M_MLP;
-     h_mtiles[e+1] = h_mtiles[e] + mtiles;
-   }
-   const int total_mtiles = h_mtiles[E];
-
-   // Build dense maps: for each global m-tile id -> (expert id, local tile id in that expert)
-std::vector<int> h_tile2expert(total_mtiles);
-std::vector<int> h_tile2local(total_mtiles);
-for (int e = 0; e < E; ++e) {
-    const int first = h_mtiles[e];
-    const int last  = h_mtiles[e+1];
-    for (int m = first; m < last; ++m) {
-        h_tile2expert[m] = e;
-        h_tile2local[m]  = m - first; // local tile index within expert e
+    int cur_tiles = 0;
+    for (int e = 0; e < E; ++e) {
+        int next_tiles = cur_tiles + (cpu_buf->expert_counts[e] + BLOCK_M_MLP - 1) / BLOCK_M_MLP;
+        for (int m = cur_tiles; m < next_tiles; ++m) {
+            cpu_buf->h_tile2expert[m] = e;
+            cpu_buf->h_tile2local[m]  = m - cur_tiles; // local tile index within expert e
+        }
+        cur_tiles = next_tiles;
     }
-}
 
-int *d_tile2expert = nullptr, *d_tile2local = nullptr;
-HIP_CHECK(hipMalloc((void**)&d_tile2expert, total_mtiles * sizeof(int)));
-HIP_CHECK(hipMalloc((void**)&d_tile2local,  total_mtiles * sizeof(int)));
-HIP_CHECK(hipMemcpy(d_tile2expert, h_tile2expert.data(),
-                    total_mtiles * sizeof(int), hipMemcpyHostToDevice));
-HIP_CHECK(hipMemcpy(d_tile2local,  h_tile2local.data(),
-                    total_mtiles * sizeof(int), hipMemcpyHostToDevice));
-
+    HIP_CHECK(hipMemcpy(s->d_tile2expert, cpu_buf->h_tile2expert,
+                        cur_tiles * sizeof(int), hipMemcpyHostToDevice));
+    HIP_CHECK(hipMemcpy(s->d_tile2local,  cpu_buf->h_tile2local,
+                        cur_tiles * sizeof(int), hipMemcpyHostToDevice));
 
   HIP_CHECK(hipMemset(s->e_agg, 0, (size_t)batch_size * H * sizeof(float)));
 
@@ -1001,7 +1002,7 @@ HIP_CHECK(hipMemcpy(d_tile2local,  h_tile2local.data(),
      const size_t layer1_elem_off = (size_t)layer_idx * E * seg1_elems;
      const __hip_bfloat16* W1_layer = w->w_mlp1 + layer1_elem_off;
 
-     dim3 grid((2*D + BLOCK_N_MLP - 1) / BLOCK_N_MLP, total_mtiles);
+     dim3 grid((2*D + BLOCK_N_MLP - 1) / BLOCK_N_MLP, cur_tiles);
      dim3 block(LANE_PER_WAVE, WAVES_PER_BLOCK_MLP);
      size_t shmem = (size_t)(2*BLOCK_M_MLP*BLOCK_K + 2*BLOCK_K*BLOCK_N_MLP) * sizeof(uint16_t);
 
@@ -1010,10 +1011,9 @@ HIP_CHECK(hipMemcpy(d_tile2local,  h_tile2local.data(),
         hipLaunchKernelGGL(grouped_mlp1_bf16_kernel, grid, block, shmem, s0,
     s->mlp1_out, s->expert_input_buffer, W1_layer,
     s->d_expert_offsets, s->d_expert_counts,
-    d_tile2expert, d_tile2local,            // NEW
+    s->d_tile2expert, s->d_tile2local,            // NEW
     E, H, 2*D);
 }
-     HIP_CHECK(hipGetLastError());
    }
 
    // fused bias + SwiGLU
@@ -1027,7 +1027,6 @@ HIP_CHECK(hipMemcpy(d_tile2local,  h_tile2local.data(),
        s->mlp1_out, b1_layer,
        s->d_expert_offsets, s->d_expert_counts, E,
        s->gate_up, D, total_tokens, p->swiglu_limit, 1.702f);
-     HIP_CHECK(hipGetLastError());
    }
 
    // Grouped MLP2 + bias
@@ -1038,27 +1037,25 @@ HIP_CHECK(hipMemcpy(d_tile2local,  h_tile2local.data(),
      const __hip_bfloat16* W2_layer = w->w_mlp2 + layer2_elem_off;
      const __hip_bfloat16* b2_layer = w->b_mlp2 + (size_t)layer_idx * E * H;
 
-     dim3 grid((H + BLOCK_N_MLP - 1) / BLOCK_N_MLP, total_mtiles);
+     dim3 grid((H + BLOCK_N_MLP - 1) / BLOCK_N_MLP, cur_tiles);
      dim3 block(LANE_PER_WAVE, WAVES_PER_BLOCK_MLP);
      size_t shmem = (size_t)(2*BLOCK_M_MLP*BLOCK_K + 2*BLOCK_K*BLOCK_N_MLP) * sizeof(uint16_t);
 
     hipLaunchKernelGGL(grouped_mlp2_bf16_bias_kernel, grid, block, shmem, s0,
     s->expert_output_buffer, s->gate_up, W2_layer, b2_layer,
     s->d_expert_offsets, s->d_expert_counts,
-    d_tile2expert, d_tile2local,            // NEW
+    s->d_tile2expert, s->d_tile2local,            // NEW
     E, D, H);
-     HIP_CHECK(hipGetLastError());
    }
 
    // scatter + residual
-   {
-    // TIMER_BLOCK("scatter + residual");
-     const int elems = total_tokens * H;
-     const dim3 grid((elems + THREADS_PER_BLOCK - 1)/THREADS_PER_BLOCK);
-   scatter_expert_outputs_kernel<<<grid, THREADS_PER_BLOCK, 0, s0>>>(
-       s->e_agg, s->expert_output_buffer, s->expert_indices, s->expert_weights,
-       total_tokens, H);
-     HIP_CHECK(hipGetLastError());
+    {
+    const int threads = 256;
+    dim3 grid(batch_size, (H + threads - 1) / threads);
+    reduce_tokenwise_expert_outputs<<<grid, threads, 0, s0>>>(
+        s->e_agg, s->expert_output_buffer, s->local_ids, s->local_wts,
+        batch_size, H, Ktok);
+    HIP_CHECK(hipGetLastError());
    }
    {
     // TIMER_BLOCK("residual add");
@@ -1066,9 +1063,9 @@ HIP_CHECK(hipMemcpy(d_tile2local,  h_tile2local.data(),
      accumulate_kernel<<<(elems + THREADS_PER_BLOCK - 1)/THREADS_PER_BLOCK,
                          THREADS_PER_BLOCK, 0, s0>>>(
        s->x, s->e_agg, 1.0f, batch_size, H);
-     HIP_CHECK(hipGetLastError());
    }
 
+   // debug(s->x + 1LL * 31 * H, 100);
 }
 
 
@@ -1353,7 +1350,7 @@ long long continuous_batching_inference(Tokenizer *tokenizer,
             HIP_CHECK(hipMemcpy(state->positions,   cpu_buf->positions,         BATCH_SIZE * sizeof(int),  hipMemcpyHostToDevice));
         } // while(true)
     } // omp parallel
-
+    
     int max_steps = gpu_transformers[0]->config.seq_len;
     Config *p = gpu_transformers[0] ? &gpu_transformers[0]->config : nullptr;
 

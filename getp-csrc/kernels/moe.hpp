@@ -105,6 +105,77 @@ __global__ void gather_expert_inputs_kernel(const float *d_t, const int *topk_i,
     }
 }
 
+__global__ void reduce_tokenwise_expert_outputs(
+    float * __restrict__ e_agg,                 // [B, H]  (output)
+    const float * __restrict__ expert_output,   // [sum_tokens, H]
+    const int   * __restrict__ local_ids,       // [B, Ktok]
+    const float * __restrict__ local_wts,       // [B, Ktok]
+    int batch_size, int H, int Ktok)
+{
+    const int b = blockIdx.x; // token
+    int d = threadIdx.x + blockIdx.y * blockDim.x; // hidden dim
+
+    if (b >= batch_size || d >= H) return;
+
+    float acc = 0.f;
+    #pragma unroll
+    for (int k = 0; k < Ktok; ++k) {
+        const int ci = local_ids[b * Ktok + k];   // compact idx for (b,k)
+        if (ci >= 0) {
+            acc += local_wts[b * Ktok + k] * expert_output[(size_t)ci * H + d];
+        }
+    }
+    e_agg[(size_t)b * H + d] = acc;
+}
+
+
+__global__ void permute_expert_inputs_kernel(
+    const float *d_t, const int *topk_i, const float *topk_v,
+    const int *d_expert_offsets, int *d_expert_write_idx,
+    int batch_size, int hidden_dim, int experts_per_token,
+    float *expert_input_buffer, int *expert_indices, float *expert_weights,
+    // NEW: per-token stable mapping
+    int *local_ids, float *local_wts)
+{
+    int token_idx = blockIdx.x;
+    if (token_idx >= batch_size) return;
+
+    extern __shared__ int destination_indices[]; // size: experts_per_token
+
+    // One thread per k handles the index math
+    if (threadIdx.x < experts_per_token) {
+        const int k = threadIdx.x;
+        const int topk_flat_idx = token_idx * experts_per_token + k;
+        const int expert_id = topk_i[topk_flat_idx];
+
+        // Local position inside expert's block (order here does not matter
+        // anymore, we will remember the compact index explicitly)
+        const int local_idx  = atomicAdd(&d_expert_write_idx[expert_id], 1);
+        const int compact_idx = d_expert_offsets[expert_id] + local_idx;
+
+        // Metadata for later scatter
+        expert_indices[compact_idx] = token_idx;
+        expert_weights[compact_idx] = topk_v[topk_flat_idx];
+
+        // NEW: remember the exact compact slot for (token, k)
+        local_ids[topk_flat_idx] = compact_idx;
+        local_wts[topk_flat_idx] = topk_v[topk_flat_idx];
+
+        destination_indices[k] = compact_idx;
+    }
+    __syncthreads();
+
+    // Coalesced copy of hidden vector into each expert slot
+    for (int k = 0; k < experts_per_token; ++k) {
+        const float *src = d_t + (size_t)token_idx * hidden_dim;
+        float *dst = expert_input_buffer + (size_t)destination_indices[k] * hidden_dim;
+        for (int i = threadIdx.x; i < hidden_dim; i += blockDim.x) {
+            dst[i] = src[i];
+        }
+    }
+}
+
+
 // "Scatter" kernel: Adds the expert outputs back to the final aggregation buffer.
 __global__ void scatter_expert_outputs_kernel(float *d_e_agg, const float *expert_output_buffer,
                                               const int *expert_indices, const float *expert_weights,

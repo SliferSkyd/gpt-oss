@@ -1,0 +1,2 @@
+HIP error at ./getp-csrc/getp_run.cpp:731 - invalid argument
+srun: error: MV-DZ-MI250-01: task 0: Exited with exit code 1
