@@ -1,2 +1,2 @@
-HIP error at ./getp-csrc/getp_run.cpp:731 - invalid argument
-srun: error: MV-DZ-MI250-01: task 0: Exited with exit code 1
+srun: job 34131 queued and waiting for resources
+srun: job 34131 has been allocated resources
