@@ -491,6 +491,56 @@ __global__ void bias_swiglu_epilogue_kernel(
     gate_up[(size_t)t * (size_t)D + d] = fmaf(gx, uy, gx);
 }
 
+// Dequantize two MXFP4 elements and pack to one u32 (2×bf16)
+__device__ __forceinline__ uint32_t deq2_pack_bf16_u32(
+    const uint8_t* __restrict__ packed,
+    const uint8_t* __restrict__ scales,
+    size_t idx0, size_t idx1, int K, int N)
+{
+    const float f0 = dequantize_mxfp4_block32(packed, scales, idx0);
+    float f1 = 0.f;
+    if (idx1 < (size_t)K * (size_t)N) {
+        f1 = dequantize_mxfp4_block32(packed, scales, idx1);
+    }
+    return pack2_bf16_bits_f32(f0, f1);
+}
+
+// Load B tile: global (MXFP4) -> LDS (bf16 col-major).
+// Layout in LDS matches your mfma path: [BLOCK_K x BLOCK_N], ldB = BLOCK_K.
+template<int LD_B>
+__device__ inline void copy_B_tile_vec_MLP_MXFP4(
+    uint32_t* __restrict__ dst_u32,           // writes u32 (2×bf16) into LDS
+    const uint8_t* __restrict__ W_packed_e,   // per-expert base (packed nibbles)
+    const uint8_t* __restrict__ S_e8m0_e,     // per-expert base (E8M0 scales per 32)
+    int n0, int N, int K, int kBase,
+    int linearT, int threadsPerBlock)
+{
+    constexpr int BN_ = BLOCK_N_MLP;
+    constexpr int BK_ = BLOCK_K;
+    const int pairsPerCol = BK_ >> 1;           // 2 elems per u32
+    const int totalPairs  = BN_ * pairsPerCol;
+
+    // We store column-major in LDS: column c lives at dst_u32 + (c * LD_B)/2 (u32 indexing)
+    for (int t = linearT; t < totalPairs; t += threadsPerBlock) {
+        const int c  = t / pairsPerCol;         // 0..BN_-1
+        const int p  = t % pairsPerCol;         // 0..pairsPerCol-1
+        const int gn = n0 + c;                  // global N index (column)
+        const int gk = kBase + (p << 1);        // row index in K (two per u32)
+
+        uint32_t out = 0u;
+        if (gn < N && gk < K) {
+            // Flattened row-major index over the per-expert matrix [N x K]:
+            // idx = gn*K + gk  (your CPU side stored [E, N, K] row-major, and packed by that)
+            const size_t idx0 = (size_t)gn * (size_t)K + (size_t)gk;
+            const size_t idx1 = idx0 + 1;   // tail-safe handled inside deq2_pack
+            out = deq2_pack_bf16_u32(W_packed_e, S_e8m0_e, idx0, idx1, K, N);
+        }
+        // write into LDS in column-major: (c * LD_B) / 2 is u32 stride
+        reinterpret_cast<uint32_t*>(dst_u32 + ((size_t)c * LD_B >> 1))[p] = out;
+    }
+}
+
+
 // Vectorized A load: read float2 (64b), convert to 2×bf16 in a single u32
 template<bool Aligned, int LD_A>
 __device__ inline void copy_A_tile_vec_MLP(uint32_t* __restrict__ dst_u32,
@@ -525,76 +575,22 @@ __device__ inline void copy_A_tile_vec_MLP(uint32_t* __restrict__ dst_u32,
     }
 }
 
-// Vectorized W load: read uint4 (128b = 8×bf16) when aligned & K%8==0
-template<bool Use128b, int LD_B>
-__device__ inline void copy_B_tile_vec_MLP(uint32_t* __restrict__ dst_u32,
-                                       const __hip_bfloat16* __restrict__ W_e,
-                                       int n0, int N, int K, int kBase,
-                                       int linearT, int threadsPerBlock) {
-    constexpr int BN_ = BLOCK_N_MLP;
-    constexpr int BK_ = BLOCK_K;
-    const int pairsPerCol = BK_ >> 1;
-    const int totalPairs  = BN_ * pairsPerCol;
-
-    if constexpr (Use128b) {
-        // Each iteration writes 4 u32 (8×bf16) per column chunk
-        const int quadPerCol = BK_ / 8;
-        const int totalQuads = BN_ * quadPerCol;
-        for (int t = linearT; t < totalQuads; t += threadsPerBlock) {
-            const int c   = t / quadPerCol;
-            const int q   = t % quadPerCol;           // which 8-elem chunk
-            const int gn  = n0 + c;
-            const int gk8 = kBase + (q << 3);
-
-            uint4 v = {0,0,0,0};
-            if (gn < N && (gk8 + 7) < K) {
-                const uint4* src = reinterpret_cast<const uint4*>(&W_e[(size_t)gn * K + gk8]);
-                v = *src; // 128b global load
-            } else {
-                // tail safety (rare if K%8==0)
-                __hip_bfloat16 tmp[8] = {};
-                for (int i=0;i<8 && (gk8+i)<K && gn<N;i++) tmp[i] = W_e[(size_t)gn*K + gk8 + i];
-                const uint32_t* p = reinterpret_cast<const uint32_t*>(tmp);
-                v = make_uint4(p[0],p[1],p[2],p[3]);
-            }
-            // col-major in LDS: base = &dst_u32[c*LD_B]; 8 elems = 4 u32, contiguous along K
-            uint32_t* col = reinterpret_cast<uint32_t*>(dst_u32 + ((size_t)c * LD_B >> 1));
-            const int off = q << 2;
-            col[off + 0] = v.x;
-            col[off + 1] = v.y;
-            col[off + 2] = v.z;
-            col[off + 3] = v.w;
-        }
-    } else {
-        for (int t = linearT; t < totalPairs; t += threadsPerBlock) {
-            const int c  = t / pairsPerCol;
-            const int p  = t % pairsPerCol;
-            const int gn = n0 + c;
-            const int gk = kBase + (p << 1);
-            uint32_t val = 0u;
-            if (gn < N && gk < K) {
-                const size_t base = (size_t)gn * K + gk;
-                if (gk + 1 < K) val = *reinterpret_cast<const uint32_t*>(&W_e[base]);
-                else            val = uint32_t(hipbf16_to_bits(W_e[base]));
-            }
-            reinterpret_cast<uint32_t*>(dst_u32 + ((size_t)c * LD_B >> 1))[p] = val;
-        }
-    }
-}
-
 #ifndef PAD_K_MLP
 #define PAD_K_MLP 0   // try 2 or 8 if you see LDS conflicts
 #endif
 static_assert((BLOCK_K % 2) == 0, "BLOCK_K must be even (packs 2×bf16).");
 static_assert((PAD_K_MLP % 2) == 0, "PAD_K_MLP must be even (u32 pair addressing).");
 
-__global__ void grouped_mlp1_bf16_kernel(
-    float* __restrict__ C, const float* __restrict__ A,
-    const __hip_bfloat16* __restrict__ W1,
-    const int* __restrict__ expert_offsets, const int* __restrict__ expert_counts,
-    const int* __restrict__ tile2expert,
-    const int* __restrict__ tile2local,
-    int /*E*/, int K, int N)
+__global__ void grouped_mlp1_mxfp4_kernel(
+    float* __restrict__ C,                 // [sum_tokens, 2D]
+    const float* __restrict__ A,           // [sum_tokens, H]  (float), row-major
+    const uint8_t* __restrict__ W1_packed_layer, // [E, ceil((2D*H)/2)] bytes (layer slice)
+    const uint8_t* __restrict__ S1_e8m0_layer,   // [E, ceil((2D*H)/32)] bytes (layer slice)
+    const int* __restrict__ expert_offsets,      // [E]
+    const int* __restrict__ expert_counts,       // [E]
+    const int* __restrict__ tile2expert,         // [num_mtiles]
+    const int* __restrict__ tile2local,          // [num_mtiles]
+    int /*E*/, int K /*=H*/, int N /*=2D*/)
 {
     const int mtile_id = blockIdx.y;
     const int e        = tile2expert[mtile_id];
@@ -603,6 +599,7 @@ __global__ void grouped_mlp1_bf16_kernel(
     const int m_start  = expert_offsets[e] + tile_m * BLOCK_M_MLP;
     const int m_left   = expert_counts[e]  - tile_m * BLOCK_M_MLP;
     if (m_left <= 0) return;
+
     const int n0 = blockIdx.x * BLOCK_N_MLP;
 
     const int lane   = threadIdx.x;
@@ -630,18 +627,23 @@ __global__ void grouped_mlp1_bf16_kernel(
     const int linearT         = wave * blockDim.x + lane;
 
     const int M_bound = m_start + m_left;
-    const __hip_bfloat16* __restrict__ W_e = W1 + (size_t)e * (size_t)N * (size_t)K;
 
-    // Alignment guards
-    const bool alignedA = (((uintptr_t)A & 0x7)==0) && ((K & 1)==0);      // 8B & K even
-    const bool use128bW = (((uintptr_t)W_e & 0xF)==0) && ((K & 7)==0);    // 16B & K%8==0
+    // Per-expert bases in the MXFP4 blobs (compute from K,N)
+    const size_t seg_elems        = (size_t)N * (size_t)K;
+    const size_t seg_packed_bytes = (seg_elems + 1) / 2;
+    const size_t seg_blocks       = (seg_elems + 31) / 32;
 
-    // Preload kBase=0
+    const uint8_t* __restrict__ W_e_packed = W1_packed_layer + (size_t)e * seg_packed_bytes;
+    const uint8_t* __restrict__ S_e8m0     = S1_e8m0_layer   + (size_t)e * seg_blocks;
+
+    // A-alignment (float2)
+    const bool alignedA = (((uintptr_t)A & 0x7)==0) && ((K & 1)==0);
+
+    // Preload kBase=0 into LDS
     if (alignedA) copy_A_tile_vec_MLP<true,  /*LD_A=*/ldA>(sA0_u32, A, m_start, M_bound, K, 0, linearT, threadsPerBlock);
     else          copy_A_tile_vec_MLP<false, /*LD_A=*/ldA>(sA0_u32, A, m_start, M_bound, K, 0, linearT, threadsPerBlock);
 
-    if (use128bW) copy_B_tile_vec_MLP<true,  /*LD_B=*/ldB>(sB0_u32, W_e, n0, N, K, 0, linearT, threadsPerBlock);
-    else          copy_B_tile_vec_MLP<false, /*LD_B=*/ldB>(sB0_u32, W_e, n0, N, K, 0, linearT, threadsPerBlock);
+    copy_B_tile_vec_MLP_MXFP4</*LD_B=*/ldB>(sB0_u32, W_e_packed, S_e8m0, n0, N, K, 0, linearT, threadsPerBlock);
 
     __syncthreads();
 
@@ -664,8 +666,7 @@ __global__ void grouped_mlp1_bf16_kernel(
             if (alignedA) copy_A_tile_vec_MLP<true,  ldA>(nextA32, A, m_start, M_bound, K, kNext, linearT, threadsPerBlock);
             else          copy_A_tile_vec_MLP<false, ldA>(nextA32, A, m_start, M_bound, K, kNext, linearT, threadsPerBlock);
 
-            if (use128bW) copy_B_tile_vec_MLP<true,  ldB>(nextB32, W_e, n0, N, K, kNext, linearT, threadsPerBlock);
-            else          copy_B_tile_vec_MLP<false, ldB>(nextB32, W_e, n0, N, K, kNext, linearT, threadsPerBlock);
+            copy_B_tile_vec_MLP_MXFP4</*LD_B=*/ldB>(nextB32, W_e_packed, S_e8m0, n0, N, K, kNext, linearT, threadsPerBlock);
         }
 
         #pragma unroll
@@ -684,12 +685,10 @@ __global__ void grouped_mlp1_bf16_kernel(
     }
 
     if (has_tail) {
-        // use Kmain here (not kNext!)
         if (alignedA) copy_A_tile_vec_MLP<true,  ldA>(nextA32, A, m_start, M_bound, K, Kmain, linearT, threadsPerBlock);
         else          copy_A_tile_vec_MLP<false, ldA>(nextA32, A, m_start, M_bound, K, Kmain, linearT, threadsPerBlock);
 
-        if (use128bW) copy_B_tile_vec_MLP<true,  ldB>(nextB32, W_e, n0, N, K, Kmain, linearT, threadsPerBlock);
-        else          copy_B_tile_vec_MLP<false, ldB>(nextB32, W_e, n0, N, K, Kmain, linearT, threadsPerBlock);
+        copy_B_tile_vec_MLP_MXFP4</*LD_B=*/ldB>(nextB32, W_e_packed, S_e8m0, n0, N, K, Kmain, linearT, threadsPerBlock);
 
         __syncthreads();
         #pragma unroll
@@ -712,19 +711,15 @@ __global__ void grouped_mlp1_bf16_kernel(
     }
 }
 
-#ifndef PAD_K_MLP
-#define PAD_K_MLP 0
-#endif
-static_assert((BLOCK_K % 2) == 0, "BLOCK_K must be even (packs 2×bf16).");
-static_assert((PAD_K_MLP % 2) == 0, "PAD_K_MLP must be even (u32 pair addressing).");
-
-__global__ void grouped_mlp2_bf16_bias_kernel(
-    float* __restrict__ C, const float* __restrict__ A,
-    const __hip_bfloat16* __restrict__ W2, const __hip_bfloat16* __restrict__ b2,
+__global__ void grouped_mlp2_mxfp4_bias_kernel(
+    float* __restrict__ C,                   // [sum_tokens, H]
+    const float* __restrict__ A,             // [sum_tokens, D]  (float), row-major
+    const uint8_t* __restrict__ W2_packed_layer, // [E, ceil((H*D)/2)] bytes
+    const uint8_t* __restrict__ S2_e8m0_layer,   // [E, ceil((H*D)/32)] bytes
+    const __hip_bfloat16* __restrict__ b2,       // [E, H] bf16
     const int* __restrict__ expert_offsets, const int* __restrict__ expert_counts,
-    const int* __restrict__ tile2expert,
-    const int* __restrict__ tile2local,
-    int /*E*/, int K, int N)
+    const int* __restrict__ tile2expert,     const int* __restrict__ tile2local,
+    int /*E*/, int K /*=D*/, int N /*=H*/)
 {
     const int mtile_id = blockIdx.y;
     const int e        = tile2expert[mtile_id];
@@ -733,6 +728,7 @@ __global__ void grouped_mlp2_bf16_bias_kernel(
     const int m_start  = expert_offsets[e] + tile_m * BLOCK_M_MLP;
     const int m_left   = expert_counts[e]  - tile_m * BLOCK_M_MLP;
     if (m_left <= 0) return;
+
     const int n0 = blockIdx.x * BLOCK_N_MLP;
 
     const int lane   = threadIdx.x;
@@ -760,19 +756,23 @@ __global__ void grouped_mlp2_bf16_bias_kernel(
     const int linearT         = wave * blockDim.x + lane;
 
     const int M_bound = m_start + m_left;
-    const __hip_bfloat16* __restrict__ W_e = W2 + (size_t)e * (size_t)N * (size_t)K;
+
+    // Per-expert bases in the MXFP4 blobs
+    const size_t seg_elems        = (size_t)N * (size_t)K;
+    const size_t seg_packed_bytes = (seg_elems + 1) / 2;
+    const size_t seg_blocks       = (seg_elems + 31) / 32;
+
+    const uint8_t* __restrict__ W_e_packed = W2_packed_layer + (size_t)e * seg_packed_bytes;
+    const uint8_t* __restrict__ S_e8m0     = S2_e8m0_layer   + (size_t)e * seg_blocks;
     const __hip_bfloat16* __restrict__ b_e = b2 + (size_t)e * (size_t)N;
 
-    // Alignment guards
     const bool alignedA = (((uintptr_t)A & 0x7)==0) && ((K & 1)==0);
-    const bool use128bW = (((uintptr_t)W_e & 0xF)==0) && ((K & 7)==0);
 
     // Preload kBase=0
     if (alignedA) copy_A_tile_vec_MLP<true,  /*LD_A=*/ldA>(sA0_u32, A, m_start, M_bound, K, 0, linearT, threadsPerBlock);
     else          copy_A_tile_vec_MLP<false, /*LD_A=*/ldA>(sA0_u32, A, m_start, M_bound, K, 0, linearT, threadsPerBlock);
 
-    if (use128bW) copy_B_tile_vec_MLP<true,  /*LD_B=*/ldB>(sB0_u32, W_e, n0, N, K, 0, linearT, threadsPerBlock);
-    else          copy_B_tile_vec_MLP<false, /*LD_B=*/ldB>(sB0_u32, W_e, n0, N, K, 0, linearT, threadsPerBlock);
+    copy_B_tile_vec_MLP_MXFP4</*LD_B=*/ldB>(sB0_u32, W_e_packed, S_e8m0, n0, N, K, 0, linearT, threadsPerBlock);
 
     __syncthreads();
 
@@ -795,8 +795,7 @@ __global__ void grouped_mlp2_bf16_bias_kernel(
             if (alignedA) copy_A_tile_vec_MLP<true,  ldA>(nextA32, A, m_start, M_bound, K, kNext, linearT, threadsPerBlock);
             else          copy_A_tile_vec_MLP<false, ldA>(nextA32, A, m_start, M_bound, K, kNext, linearT, threadsPerBlock);
 
-            if (use128bW) copy_B_tile_vec_MLP<true,  ldB>(nextB32, W_e, n0, N, K, kNext, linearT, threadsPerBlock);
-            else          copy_B_tile_vec_MLP<false, ldB>(nextB32, W_e, n0, N, K, kNext, linearT, threadsPerBlock);
+            copy_B_tile_vec_MLP_MXFP4</*LD_B=*/ldB>(nextB32, W_e_packed, S_e8m0, n0, N, K, kNext, linearT, threadsPerBlock);
         }
 
         #pragma unroll
@@ -819,8 +818,7 @@ __global__ void grouped_mlp2_bf16_bias_kernel(
         if (alignedA) copy_A_tile_vec_MLP<true,  ldA>(nextA32, A, m_start, M_bound, K, Kmain, linearT, threadsPerBlock);
         else          copy_A_tile_vec_MLP<false, ldA>(nextA32, A, m_start, M_bound, K, Kmain, linearT, threadsPerBlock);
 
-        if (use128bW) copy_B_tile_vec_MLP<true,  ldB>(nextB32, W_e, n0, N, K, Kmain, linearT, threadsPerBlock);
-        else          copy_B_tile_vec_MLP<false, ldB>(nextB32, W_e, n0, N, K, Kmain, linearT, threadsPerBlock);
+        copy_B_tile_vec_MLP_MXFP4</*LD_B=*/ldB>(nextB32, W_e_packed, S_e8m0, n0, N, K, Kmain, linearT, threadsPerBlock);
 
         __syncthreads();
         #pragma unroll
@@ -832,6 +830,7 @@ __global__ void grouped_mlp2_bf16_bias_kernel(
         __syncthreads();
     }
 
+    // bias add on store
     const int col  = n0 + wave_n * WN + lane_row(lane);
     const float bias = (col < N) ? __bfloat162float(b_e[col]) : 0.0f;
     const int rowBase = m_start + wave_m * WM + lane_group(lane) * 4;

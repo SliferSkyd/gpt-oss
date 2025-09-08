@@ -1,0 +1,4 @@
+CMD: rocminfo
+[37mROCk module version 6.8.5 is loaded[0m
+[31mUnable to open /dev/kfd read-write: Invalid argument[0m
+[31mFailed to get user name to check for video group membership[0m
