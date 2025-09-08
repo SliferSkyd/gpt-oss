@@ -29,7 +29,7 @@
 #include <numeric>
 #include <queue>
 #include <vector>
-
+#include "memory/paged_attention.hpp"
 
 #ifndef GETP_RUN
 #define GETP_RUN
@@ -84,10 +84,6 @@ typedef struct
     float *v;    // value buffer (batch_size, n_kv_heads * head_dim)
     float *att;  // attention scores (batch_size, n_attn_heads, seq_len)
     float *mask; // attention mask (seq_len, seq_len)
-
-    // KV cache - now using BF16 for 50% memory reduction
-    float *key_cache;   // (batch_size, n_layers, seq_len, kv_dim)
-    float *value_cache; // (batch_size, n_layers, seq_len, kv_dim)
 
     // RoPE buffers
     float *cos_vals; // (head_dim/2, seq_len)
@@ -164,6 +160,7 @@ typedef struct
     GPUTransformerWeights weights; // GPU weights
     GPURunState state;             // GPU run state buffers
     CPUBuffers cpu_buffers;        // CPU buffers for host operations
+    PagedAttentionManager **paged_managers;   // Manager for paged KV cache
 } GPUTransformer;
 
 // Global variables for direct access in batched_generate_gpu
@@ -221,10 +218,6 @@ void malloc_gpu_run_state(GPURunState *s, Config *p)
     HIP_CHECK(hipMalloc((void**)&s->d_tile2expert, total_mtiles * sizeof(int)));
     HIP_CHECK(hipMalloc((void**)&s->d_tile2local,  total_mtiles * sizeof(int)));
 
-    // KV cache allocation - this is usually the largest allocation
-    HIP_CHECK(hipMalloc((void **)&s->key_cache, kv_cache_size));
-    HIP_CHECK(hipMalloc((void **)&s->value_cache, kv_cache_size));
-
     HIP_CHECK(hipMalloc((void **)&s->att, BATCH_SIZE * p->n_attn_heads * MAX_SEQ_LEN * sizeof(float)));
     HIP_CHECK(hipMalloc((void **)&s->logits, BATCH_SIZE * p->vocab_size * sizeof(float)));
 
@@ -262,8 +255,6 @@ void malloc_gpu_run_state(GPURunState *s, Config *p)
     HIP_CHECK(hipMemset(s->q, 0, BATCH_SIZE * p->n_attn_heads * p->head_dim * sizeof(float)));
     HIP_CHECK(hipMemset(s->k, 0, BATCH_SIZE * kv_dim * sizeof(float)));
     HIP_CHECK(hipMemset(s->v, 0, BATCH_SIZE * kv_dim * sizeof(float)));
-    HIP_CHECK(hipMemset(s->key_cache, 0, kv_cache_size));
-    HIP_CHECK(hipMemset(s->value_cache, 0, kv_cache_size));
     HIP_CHECK(hipMemset(s->att, 0, BATCH_SIZE * p->n_attn_heads * MAX_SEQ_LEN * sizeof(float)));
     HIP_CHECK(hipMemset(s->logits, 0, BATCH_SIZE * p->vocab_size * sizeof(float)));
 
@@ -545,6 +536,12 @@ void build_gpu_transformer(GPUTransformer *gpu_t, Transformer *cpu_t)
 
     // Copy weights to GPU
     copy_weights_to_gpu(cpu_t, &gpu_t->weights);
+
+    int kv_dim = gpu_t->config.head_dim * gpu_t->config.n_kv_heads;
+    gpu_t->paged_managers = new PagedAttentionManager*[gpu_t->config.n_layers];
+    for (int i = 0; i < gpu_t->config.n_layers; i++) {
+        gpu_t->paged_managers[i] = new PagedAttentionManager(kv_dim);
+    }
 }
 
 void warm_up(Transformer *transformer, Tokenizer *tokenizer)
@@ -644,10 +641,6 @@ void free_gpu_run_state(GPURunState *s)
         HIP_CHECK(hipFree(s->att));
     if (s->mask)
         HIP_CHECK(hipFree(s->mask));
-    if (s->key_cache)
-        HIP_CHECK(hipFree(s->key_cache));
-    if (s->value_cache)
-        HIP_CHECK(hipFree(s->value_cache));
     if (s->cos_vals)
         HIP_CHECK(hipFree(s->cos_vals));
     if (s->sin_vals)
@@ -787,8 +780,18 @@ void attention_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size,
     float *v_mb   = s->v   + (size_t)row_offset * KV;
     int   *pos_mb = s->positions + row_offset;
 
-    float *key_cache_mb   = s->key_cache   + (size_t)row_offset * kv_slice;
-    float *value_cache_mb = s->value_cache + (size_t)row_offset * kv_slice;
+    int *pos_host = gpu_t->cpu_buffers.positions + row_offset;  // host mirror you already maintain
+    for (int i = 0; i < batch_size; ++i) {
+        const int seq_id = row_offset + i;   // physical slot [0..BATCH_SIZE)
+        const int pos    = pos_host[i];      // host position for this micro-batch row
+        if (pos % PAGE_SIZE == 0) {
+            gpu_t->paged_managers[layer_idx]->extend_new_block(seq_id, pos);
+            if ((p->sliding_window > 0) && ((layer_idx & 1) == 0)) {
+                gpu_t->paged_managers[layer_idx]->free_past_blocks(seq_id, pos, p->sliding_window);
+            }
+        }
+    }
+    gpu_t->paged_managers[layer_idx]->sync_to_device();
 
     // 1) RMSNorm
     {
@@ -824,33 +827,39 @@ void attention_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size,
     }
     // 5) KV cache update
     {
+        float **d_block_table = gpu_t->paged_managers[layer_idx]->get_device_block_table();
         dim3 grid(batch_size, (KV + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK);
         dim3 block(1, THREADS_PER_BLOCK);
-        update_kv_cache_kernel<<<grid, block, 0, sAttn>>>(
-            key_cache_mb, value_cache_mb, k_mb, v_mb, pos_mb,
-            batch_size, p->n_layers, layer_idx, MAX_SEQ_LEN, KV);
+        hipLaunchKernelGGL(paged_update_kv_cache_kernel_fp32, grid, block, 0, sAttn,
+            d_block_table, k_mb, v_mb, pos_mb, batch_size, KV);
         HIP_CHECK(hipGetLastError());
     }
+
     // 6) fused attention
     {
         const bool apply_window = (p->sliding_window > 0) && ((layer_idx & 1) == 0);
         constexpr int HOST_WARPSIZE = 64;
+
         dim3 grid(batch_size, NA);
         dim3 block(256);
         const int warps = (block.x + HOST_WARPSIZE - 1) / HOST_WARPSIZE;
         const size_t att_cap = apply_window ? (SW_WINDOW + 1) : MAX_SEQ_LEN;
         const size_t shmem = (att_cap + (size_t)warps * Hd + warps) * sizeof(float);
-        assert_smem_or_die(shmem, "fused_attention_kernel");
+        assert_smem_or_die(shmem, "fused_attention_kernel_paged");
 
-        hipLaunchKernelGGL(fused_attention_kernel,
+        float **d_block_table = gpu_t->paged_managers[layer_idx]->get_device_block_table();
+
+        hipLaunchKernelGGL(fused_attention_kernel_paged,
             grid, block, shmem, sAttn,
-            tb_mb, q_mb, key_cache_mb, value_cache_mb,
+            tb_mb, q_mb, d_block_table,
             w->attn_sinks + (size_t)layer_idx * NA,
-            s->mask, pos_mb, batch_size,
-            NA, NK, Hd, MAX_SEQ_LEN, p->n_layers, layer_idx,
+            s->mask, pos_mb,
+            batch_size, NA, NK, Hd,
+            KV, MAX_SEQ_LEN,
             p->sliding_window > 0);
         HIP_CHECK(hipGetLastError());
     }
+
     // 7) fused output projection
     {
         const int K = Hd * NA;
@@ -1197,7 +1206,7 @@ int *forward_batch_gpu(GPUTransformer *gpu_t, int *tokens, int batch_size)
 // Replace previous clear_kv_cache_for_slot_kernel + wrapper with this version.
 // It uses hipMemset per layer to zero the entire [max_seq_len x kv_dim] slice
 // for the specified physical slot. No device kernels, no grid limits.
-
+/*
 static inline void clear_kv_cache_for_slot(GPURunState* s, const Config* p, int slot)
 {
     // Guard: invalid slot -> nothing to do
@@ -1227,7 +1236,7 @@ static inline void clear_kv_cache_for_slot(GPURunState* s, const Config* p, int 
         HIP_CHECK(hipMemset(v_ptr, 0, bytes_per_layer_slot));
     }
 }
-
+*/
 
 long long continuous_batching_inference(Tokenizer *tokenizer,
                                         Sampler *sampler, Requests *requests)
@@ -1365,7 +1374,7 @@ long long continuous_batching_inference(Tokenizer *tokenizer,
                     // Try to reuse this physical slot for a new request
                     if (cpu_buf->next_request_idx < end_request) {
                         // *** Deterministic reset of KV for this slot (fixes bug #2) ***
-                        clear_kv_cache_for_slot(&gpu_t->state, &gpu_t->config, slot);
+                        // clear_kv_cache_for_slot(&gpu_t->state, &gpu_t->config, slot);
 
                         // Prepare next request
                         req_idx = cpu_buf->next_request_idx++;

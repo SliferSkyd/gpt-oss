@@ -1,6 +1,7 @@
 #include <hip/hip_runtime.h>
 #include <hip/hip_bf16.h>
 #include "../config.hpp"
+#include "../memory/paged_attention.hpp"
 #include "matmul.hpp"
 
 // --- MODIFIED FUSED ATTENTION KERNEL (2-D mapping: lanes x warps) ---
@@ -504,4 +505,201 @@ void fused_output_projection_kernel_optimized(
     const bool interior = (m0 + BLOCK_M) <= M && (n0 + BLOCK_N) <= N;
     if (interior) store_and_fuse_tile<true >(C, bias, acc, M, N, m0, n0, wave_m, wave_n, lane);
     else          store_and_fuse_tile<false>(C, bias, acc, M, N, m0, n0, wave_m, wave_n, lane);
+}
+
+// NEW: KV cache update kernel with BF16 quantization
+__global__ void update_kv_cache_kernel(float *key_cache, float *value_cache,
+                                       const float *k, const float *v,
+                                       const int *positions, int batch_size,
+                                       int n_layers, int layer_idx, int seq_len,
+                                       int kv_dim)
+{
+    size_t batch_idx = blockIdx.x;
+    size_t dim_idx = 1LL * blockIdx.y * blockDim.y + threadIdx.y;
+
+    if (batch_idx >= batch_size || dim_idx >= kv_dim)
+        return;
+
+    int pos = positions[batch_idx];
+    if (pos >= seq_len)
+        return; // Safety check
+
+    // Update key cache - convert FP32 to BF16 for memory efficiency
+    size_t k_cache_idx = batch_idx * n_layers * seq_len * kv_dim +
+                      layer_idx * seq_len * kv_dim + pos * kv_dim + dim_idx;
+    key_cache[k_cache_idx] = (k[1LL*batch_idx * kv_dim + dim_idx]);
+
+    // Update value cache - convert FP32 to BF16 for memory efficiency
+    size_t v_cache_idx = batch_idx * n_layers * seq_len * kv_dim +
+                      layer_idx * seq_len * kv_dim + pos * kv_dim + dim_idx;
+    value_cache[v_cache_idx] = (v[1LL*batch_idx * kv_dim + dim_idx]);
+}
+
+// Paged KV cache update (FP32). Writes one token row into the current page.
+// Layout per page: [PAGE_SIZE, kv_dim] for K, then [PAGE_SIZE, kv_dim] for V.
+__global__ void paged_update_kv_cache_kernel_fp32(
+    float **block_table,          // [batch * PAGES_PER_SEQ], device pointers to pages
+    const float *k,               // [batch, kv_dim]
+    const float *v,               // [batch, kv_dim]
+    const int   *positions,       // [batch]
+    int batch_size,
+    int kv_dim)
+{
+    const int b      = blockIdx.x;
+    const int d_idx  = blockIdx.y * blockDim.y + threadIdx.y;
+
+    if (b >= batch_size || d_idx >= kv_dim) return;
+
+    const int pos       = positions[b];
+    const int page_idx  = pos / PAGE_SIZE;
+    const int page_off  = pos % PAGE_SIZE;
+
+    // Resolve page base for this (batch slot, page)
+    float *page_base = block_table[b * PAGES_PER_SEQ + page_idx];
+    if (page_base == nullptr) return; // nothing to write (page not allocated yet)
+
+    // Row bases inside the page
+    float *k_row = page_base + 1LL * page_off * kv_dim;
+    float *v_row = page_base + 1LL * PAGE_SIZE * kv_dim + 1LL * page_off * kv_dim;
+
+    // Source rows from current minibatch K/V
+    const float *k_src = k + 1LL * b * kv_dim;
+    const float *v_src = v + 1LL * b * kv_dim;
+
+    k_row[d_idx] = k_src[d_idx];
+    v_row[d_idx] = v_src[d_idx];
+}
+
+// Fused attention using paged KV cache (FP32).
+// Page layout: [K: PAGE_SIZE*kv_dim floats][V: PAGE_SIZE*kv_dim floats]
+__global__ void fused_attention_kernel_paged(
+    float * __restrict__ output,               // [batch, n_heads, head_dim]
+    const float * __restrict__ q,              // [batch, n_heads * head_dim]
+    float * const * __restrict__ block_table,  // [batch * PAGES_PER_SEQ] -> page ptrs
+    const __hip_bfloat16 * __restrict__ sinks, // [n_heads] (layer-offset applied by host)
+    const float * __restrict__ mask,           // [seq_len, seq_len]
+    const int * __restrict__ positions,        // [batch]
+    int batch_size, int n_heads, int n_kv_heads, int head_dim,
+    int kv_dim, int seq_len,
+    bool use_sliding_window)
+{
+    extern __shared__ float s_sh[];
+
+    const int b   = blockIdx.x;
+    const int h   = blockIdx.y;
+    const int tid = threadIdx.x;
+
+    if (b >= batch_size || h >= n_heads) return;
+
+    // Wave bookkeeping
+    const int WARP  = warpSize;                       // 64 on AMD
+    const int WARPS = (blockDim.x + WARP - 1) / WARP;
+    const int lane  = tid & (WARP - 1);
+    const int wid   = tid >> (__ffs(WARP) - 1);
+
+    // Shapes / mapping
+    const int pos        = positions[b];
+    const int gqa_ratio  = n_heads / n_kv_heads;
+    const int kv_h       = h / gqa_ratio;
+
+    const float *q_head  = q + 1LL * b * n_heads * head_dim + 1LL * h * head_dim;
+    float *out_head      = output + 1LL * b * n_heads * head_dim + 1LL * h * head_dim;
+
+    // Sliding window setup
+    const bool apply_window = use_sliding_window && ((/*layer parity handled at call site*/true));
+    const int  win_start    = apply_window ? max(0, pos - (SW_WINDOW - 1)) : 0;
+    const int  win_core_len = pos - win_start + 1;                // tokens before (optional) sink
+    const int  att_cap      = apply_window ? (SW_WINDOW + 1) : seq_len;
+
+    float *s_att      = s_sh;                          // [att_cap]
+    float *s_partials = s_att + att_cap;               // [WARPS * head_dim]
+    float *s_reduce   = s_partials + WARPS * head_dim; // [WARPS]
+    const float inv_sqrt_d = rsqrtf((float)head_dim);
+
+    // One lane per head-dim element (fast path when head_dim == warpSize)
+    const float q_lane = (lane < head_dim) ? q_head[lane] : 0.0f;
+
+    // ---- Pass 1: compute attention scores into s_att[0..win_core_len-1]
+    for (int w = wid; w < win_core_len; w += WARPS) {
+        const int t        = win_start + w;
+        const int page_idx = t / PAGE_SIZE;
+        const int page_off = t % PAGE_SIZE;
+
+        float *page = block_table[b * PAGES_PER_SEQ + page_idx];
+        float acc = -INFINITY; // default if page missing
+
+        if (page != nullptr) {
+            // K row for this token + kv head
+            const float *k_vec = page + 1LL * page_off * kv_dim + 1LL * kv_h * head_dim;
+
+            float prod = 0.f;
+            if (lane < head_dim) prod = q_lane * k_vec[lane];
+            const float dot = warpReduceSum(prod);
+
+            if (lane == 0) {
+                acc = dot * inv_sqrt_d;
+                if (apply_window) acc += mask[1LL * pos * seq_len + t];
+                s_att[w] = acc;
+            }
+        }
+        if (page == nullptr && lane == 0) {
+            s_att[w] = acc; // -INF
+        }
+    }
+    __syncthreads();
+
+    // Append sink (if any)
+    int softmax_len = win_core_len;
+    if (pos + 1 < seq_len) {
+        if (tid == 0) s_att[softmax_len] = __bfloat162float(sinks[h]);
+        softmax_len += 1;
+    }
+    __syncthreads();
+
+    // ---- Softmax
+    float tmax = -INFINITY;
+    for (int i = tid; i < softmax_len; i += blockDim.x) tmax = fmaxf(tmax, s_att[i]);
+    const float max_val = blockReduceMax(tmax, s_reduce);
+
+    float tsum = 0.f;
+    for (int i = tid; i < softmax_len; i += blockDim.x) {
+        float v = expf(s_att[i] - max_val);
+        s_att[i] = v;
+        tsum += v;
+    }
+    const float sum_val = blockReduceSum(tsum, s_reduce);
+    const float inv_sum = 1.f / (sum_val + 1e-9f);
+
+    for (int i = tid; i < softmax_len; i += blockDim.x) s_att[i] *= inv_sum;
+    __syncthreads();
+
+    // ---- Pass 2: V-weighted sum over the core window (exclude optional sink)
+    if (lane < head_dim) {
+        float partial = 0.f;
+        for (int w = wid; w < win_core_len; w += WARPS) {
+            const int t        = win_start + w;
+            const int page_idx = t / PAGE_SIZE;
+            const int page_off = t % PAGE_SIZE;
+
+            float *page = block_table[b * PAGES_PER_SEQ + page_idx];
+            if (page == nullptr) continue;
+
+            const float *v_vec = page
+                + 1LL * PAGE_SIZE * kv_dim
+                + 1LL * page_off * kv_dim
+                + 1LL * kv_h * head_dim;
+
+            partial += s_att[w] * v_vec[lane];
+        }
+        s_partials[wid * head_dim + lane] = partial;
+    }
+    __syncthreads();
+
+    // Cross-warp reduce (one lane per dim)
+    if (wid == 0 && lane < head_dim) {
+        float acc = 0.f;
+        #pragma unroll
+        for (int w = 0; w < WARPS; ++w) acc += s_partials[w * head_dim + lane];
+        out_head[lane] = acc;
+    }
 }

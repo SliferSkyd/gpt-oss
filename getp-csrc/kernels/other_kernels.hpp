@@ -41,36 +41,6 @@ __global__ void add_bias_kernel(float *output, const float *bias, int batch_size
     }
 }
 
-
-// NEW: KV cache update kernel with BF16 quantization
-__global__ void update_kv_cache_kernel(float *key_cache, float *value_cache,
-                                       const float *k, const float *v,
-                                       const int *positions, int batch_size,
-                                       int n_layers, int layer_idx, int seq_len,
-                                       int kv_dim)
-{
-    size_t batch_idx = blockIdx.x;
-    size_t dim_idx = 1LL * blockIdx.y * blockDim.y + threadIdx.y;
-
-    if (batch_idx >= batch_size || dim_idx >= kv_dim)
-        return;
-
-    int pos = positions[batch_idx];
-    if (pos >= seq_len)
-        return; // Safety check
-
-    // Update key cache - convert FP32 to BF16 for memory efficiency
-    size_t k_cache_idx = batch_idx * n_layers * seq_len * kv_dim +
-                      layer_idx * seq_len * kv_dim + pos * kv_dim + dim_idx;
-    key_cache[k_cache_idx] = (k[1LL*batch_idx * kv_dim + dim_idx]);
-
-    // Update value cache - convert FP32 to BF16 for memory efficiency
-    size_t v_cache_idx = batch_idx * n_layers * seq_len * kv_dim +
-                      layer_idx * seq_len * kv_dim + pos * kv_dim + dim_idx;
-    value_cache[v_cache_idx] = (v[1LL*batch_idx * kv_dim + dim_idx]);
-}
-
-
 __global__ void copy_embeddings_kernel(float *output, const float *embeddings,
                                        const int *tokens, int batch_size, int hidden_dim)
 {

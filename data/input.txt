@@ -1,4 +1,4 @@
-1024
+256
 Hello
 Hello world
 Write a short haiku about the ocean.
