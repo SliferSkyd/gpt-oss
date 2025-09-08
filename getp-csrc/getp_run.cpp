@@ -856,7 +856,7 @@ void attention_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size,
             s->mask, pos_mb,
             batch_size, NA, NK, Hd,
             KV, MAX_SEQ_LEN,
-            p->sliding_window > 0);
+            apply_window);
         HIP_CHECK(hipGetLastError());
     }
 
