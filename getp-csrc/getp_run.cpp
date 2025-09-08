@@ -1071,7 +1071,7 @@ void moe_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size,
 
 // ------------------------------ Pipelined forward (layer overlap) -------------------------
 #ifndef MICRO_BATCH_SIZE
-#define MICRO_BATCH_SIZE 128
+#define MICRO_BATCH_SIZE 256
 #endif
 
 int *forward_batch_gpu(GPUTransformer *gpu_t, int *tokens, int batch_size)

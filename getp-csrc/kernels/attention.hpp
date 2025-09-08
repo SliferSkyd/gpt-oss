@@ -633,7 +633,7 @@ __global__ void fused_attention_kernel_paged(
             const float *k_vec = page + 1LL * page_off * kv_dim + 1LL * kv_h * head_dim;
 
             float prod = 0.f;
-            if (lane < head_dim) prod = q_lane * k_vec[lane];
+            if (lane < head_dim) prod = (double)q_lane * k_vec[lane];
             const float dot = warpReduceSum(prod);
 
             if (lane == 0) {
@@ -689,7 +689,7 @@ __global__ void fused_attention_kernel_paged(
                 + 1LL * page_off * kv_dim
                 + 1LL * kv_h * head_dim;
 
-            partial += s_att[w] * v_vec[lane];
+            partial += (double)s_att[w] * v_vec[lane];
         }
         s_partials[wid * head_dim + lane] = partial;
     }
