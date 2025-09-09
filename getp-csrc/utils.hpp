@@ -324,3 +324,88 @@ void compute_cos_sin_getp(int pos, float base, int head_dim, float scaling_facto
     }
     free(inv_freq);
 }
+
+
+
+#ifdef THREAD_DEBUG
+// Force a sync so the value we read was just produced by the prior kernel/launch.
+#define DBG_SYNC() HIP_CHECK(hipStreamSynchronize(0))
+
+// Print 1 float from device pointer p[0]
+#define DBG_PRINT_FLOAT(tag, p)                                     \
+    do                                                              \
+    {                                                               \
+        float _hv = NAN;                                            \
+        HIP_CHECK(hipMemcpy(&_hv, (const void *)(p), sizeof(float), \
+                            hipMemcpyDeviceToHost));                \
+        int _dev = -1;                                              \
+        hipGetDevice(&_dev);                                        \
+        printf("[DBG][dev=%d] %s = %.9g\n", _dev, (tag), _hv);      \
+        fflush(stdout);                                             \
+    } while (0)
+
+// Print 1 int from device pointer p[0]
+#define DBG_PRINT_INT(tag, p)                                     \
+    do                                                            \
+    {                                                             \
+        int _hv = -777777;                                        \
+        HIP_CHECK(hipMemcpy(&_hv, (const void *)(p), sizeof(int), \
+                            hipMemcpyDeviceToHost));              \
+        int _dev = -1;                                            \
+        hipGetDevice(&_dev);                                      \
+        printf("[DBG][dev=%d] %s = %d\n", _dev, (tag), _hv);      \
+        fflush(stdout);                                           \
+    } while (0)
+
+// Print 1 float from device pointer with offset (elements)
+#define DBG_PRINT_FLOAT_AT(tag, p, off)                              \
+    do                                                               \
+    {                                                                \
+        float _hv = NAN;                                             \
+        const float *_ptr = (const float *)(p) + (size_t)(off);      \
+        HIP_CHECK(hipMemcpy(&_hv, (const void *)_ptr, sizeof(float), \
+                            hipMemcpyDeviceToHost));                 \
+        int _dev = -1;                                               \
+        hipGetDevice(&_dev);                                         \
+        printf("[DBG][dev=%d] %s@%lld = %.9g\n", _dev, (tag),        \
+               (long long)(off), _hv);                               \
+        fflush(stdout);                                              \
+    } while (0)
+
+// Print 1 int from device pointer with offset (elements)
+#define DBG_PRINT_INT_AT(tag, p, off)                              \
+    do                                                             \
+    {                                                              \
+        int _hv = -777777;                                         \
+        const int *_ptr = (const int *)(p) + (size_t)(off);        \
+        HIP_CHECK(hipMemcpy(&_hv, (const void *)_ptr, sizeof(int), \
+                            hipMemcpyDeviceToHost));               \
+        int _dev = -1;                                             \
+        hipGetDevice(&_dev);                                       \
+        printf("[DBG][dev=%d] %s@%lld = %d\n", _dev, (tag),        \
+               (long long)(off), _hv);                             \
+        fflush(stdout);                                            \
+    } while (0)
+
+#else
+#define DBG_SYNC() \
+    do             \
+    {              \
+    } while (0)
+#define DBG_PRINT_FLOAT(tag, p) \
+    do                          \
+    {                           \
+    } while (0)
+#define DBG_PRINT_INT(tag, p) \
+    do                        \
+    {                         \
+    } while (0)
+#define DBG_PRINT_FLOAT_AT(tag, p, off) \
+    do                                  \
+    {                                   \
+    } while (0)
+#define DBG_PRINT_INT_AT(tag, p, off) \
+    do                                \
+    {                                 \
+    } while (0)
+#endif

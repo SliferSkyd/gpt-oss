@@ -1633,3 +1633,266 @@ void grouped_mlp2_mxfp4_bias_mfma_kernel(
 }
 
 
+
+
+__global__ void pack_remote_tokens_kernel(
+    const float *__restrict__ d_t,    // [B, H]
+    const int *__restrict__ topk_i,   // [B, k] global ids
+    const float *__restrict__ topk_v, // [B, k]
+    int B, int H, int k,
+    int peer_base, int peer_n,
+    int max_rows,                       // sức chứa B*k
+    int *__restrict__ d_send_token_ids, // [max_rows]
+    int *__restrict__ d_send_topk_i,    // [max_rows] (peer-local id)
+    float *__restrict__ d_send_topk_v,  // [max_rows]
+    float *__restrict__ d_send_hidden,  // [max_rows, H]
+    int *__restrict__ d_send_count)     // [1], zero trước
+{
+    const int b = blockIdx.x;
+    if (b >= B)
+        return;
+
+    __shared__ int sh_do;
+    __shared__ int sh_slot;
+    __shared__ int sh_peer_local;
+
+    for (int j = 0; j < k; ++j)
+    {
+        if (threadIdx.x == 0)
+        {
+            sh_do = 0;
+            const int e_global = topk_i[(size_t)b * k + j];
+            if (e_global >= peer_base && e_global < peer_base + peer_n)
+            {
+                const int peer_local = e_global - peer_base;
+
+                int slot = atomicAdd(d_send_count, 1);
+                // chặn overflow phòng hờ
+                if (slot < max_rows)
+                {
+                    sh_do = 1;
+                    sh_slot = slot;
+                    sh_peer_local = peer_local;
+
+                    d_send_token_ids[slot] = b;
+                    d_send_topk_i[slot] = peer_local;
+                    d_send_topk_v[slot] = topk_v[(size_t)b * k + j];
+                }
+                else
+                {
+                    // rollback nếu vượt sức chứa
+                    atomicSub(d_send_count, 1);
+                }
+            }
+        }
+        __syncthreads();
+
+        if (!sh_do)
+            continue;
+
+        // copy 1 hàng H-dim
+        const size_t rowDst = (size_t)sh_slot * (size_t)H;
+        const size_t rowSrc = (size_t)b * (size_t)H;
+
+        // (tuỳ chọn) vector hoá khi thỏa điều kiện
+        const bool can_vec = ((H & 3) == 0) &&
+                             ((((uintptr_t)(d_send_hidden + rowDst)) & 0xF) == 0) &&
+                             ((((uintptr_t)(d_t + rowSrc)) & 0xF) == 0);
+        if (can_vec)
+        {
+            const int H4 = H >> 2;
+            const float4 *__restrict__ src4 =
+                reinterpret_cast<const float4 *>(d_t + rowSrc);
+            float4 *__restrict__ dst4 =
+                reinterpret_cast<float4 *>(d_send_hidden + rowDst);
+            for (int i = threadIdx.x; i < H4; i += blockDim.x)
+                dst4[i] = src4[i];
+        }
+        else
+        {
+            for (int h = threadIdx.x; h < H; h += blockDim.x)
+                d_send_hidden[rowDst + (size_t)h] = d_t[rowSrc + (size_t)h];
+        }
+        __syncthreads();
+    }
+}
+
+__global__ void permute_subset_local_kernel(
+    const float *__restrict__ d_t,    // [B, H]
+    const int *__restrict__ topk_i,   // [B, k] global expert ids
+    const float *__restrict__ topk_v, // [B, k]
+    int B, int H, int k,
+    int local_base, int local_n,
+    const int *__restrict__ d_local_offsets, // [local_n]
+    const int *__restrict__ d_local_counts,  // [local_n]
+    int *__restrict__ d_local_write_idx,     // [local_n]
+    float *__restrict__ out_hidden,          // [sum_local, H]
+    int *__restrict__ out_indices,           // [sum_local]
+    float *__restrict__ out_weights)         // [sum_local]
+{
+    const int b = blockIdx.x;
+    if (b >= B)
+        return;
+
+    __shared__ int sh_do;  // 0/1: có ghi lần này không
+    __shared__ int sh_dst; // dòng đích trong buffer compact
+
+    // Mỗi block xử lý 1 token b; lặp qua k expert đã chọn
+    for (int j = 0; j < k; ++j)
+    {
+        // Mặc định không làm gì
+        if (threadIdx.x == 0)
+            sh_do = 0;
+        __syncthreads();
+
+        const int e_global = topk_i[(size_t)b * k + j];
+        // Kiểm tra local
+        const bool is_local =
+            (e_global >= local_base) && (e_global < local_base + local_n);
+        const int e_local = e_global - local_base;
+
+        // Chỉ lane 0 giữ chỗ & tính dst
+        if (threadIdx.x == 0 && is_local)
+        {
+            // Giữ chỗ một lần duy nhất
+            int write = atomicAdd(&d_local_write_idx[e_local], 1);
+            const int cap = d_local_counts[e_local];
+            if (write >= 0 && write < cap)
+            {
+                const int base = d_local_offsets[e_local];
+                sh_dst = base + write;
+                sh_do = 1;
+
+                // Ghi metadata (index, weight) một lần
+                out_indices[sh_dst] = b;
+                out_weights[sh_dst] = topk_v[(size_t)b * k + j];
+            }
+            else
+            {
+                // Rollback nếu vượt capacity
+                if (write >= cap)
+                    atomicSub(&d_local_write_idx[e_local], 1);
+                sh_do = 0;
+            }
+        }
+        __syncthreads(); // Tất cả thread cùng thấy sh_do & sh_dst
+
+        if (sh_do)
+        {
+            // Copy hàng H-dim: mọi thread cùng hợp tác
+            const size_t rowDst = (size_t)sh_dst * (size_t)H;
+            const size_t rowSrc = (size_t)b * (size_t)H;
+
+            // (Tuỳ chọn) vector hoá nếu thỏa điều kiện
+            const bool can_vec = ((H & 3) == 0) &&
+                                 ((((uintptr_t)(out_hidden + rowDst)) & 0xF) == 0) &&
+                                 ((((uintptr_t)(d_t + rowSrc)) & 0xF) == 0);
+            if (can_vec)
+            {
+                const int H4 = H >> 2;
+                const float4 *__restrict__ src4 =
+                    reinterpret_cast<const float4 *>(d_t + rowSrc);
+                float4 *__restrict__ dst4 =
+                    reinterpret_cast<float4 *>(out_hidden + rowDst);
+                for (int h4 = threadIdx.x; h4 < H4; h4 += blockDim.x)
+                {
+                    dst4[h4] = src4[h4];
+                }
+            }
+            else
+            {
+                for (int h = threadIdx.x; h < H; h += blockDim.x)
+                {
+                    out_hidden[rowDst + (size_t)h] = d_t[rowSrc + (size_t)h];
+                }
+            }
+        }
+        __syncthreads(); // Kết thúc vòng lặp j, đồng bộ block
+    }
+}
+
+__global__ void permute_received_to_local_kernel(
+    const float *__restrict__ recv_hidden,  // [R, H]
+    const int *__restrict__ recv_topk_i,    // [R] local expert ids (0..local_n-1)
+    const float *__restrict__ recv_topk_v,  // [R]
+    const int *__restrict__ recv_token_ids, // [R] origin token ids
+    int R, int H,
+    int local_n,
+    const int *__restrict__ d_offsets, // [local_n]
+    const int *__restrict__ d_counts,  // [local_n]
+    int *__restrict__ d_write_idx,     // [local_n] (zeroed before)
+    float *__restrict__ out_hidden,    // [sum_recv, H]
+    int *__restrict__ out_indices,     // [sum_recv]
+    float *__restrict__ out_weights)   // [sum_recv]
+{
+    const int r = blockIdx.x;
+    if (r >= R)
+        return;
+
+    __shared__ int sh_do;  // 0/1: có ghi hay không
+    __shared__ int sh_dst; // dòng đích trong compact buffer
+
+    if (threadIdx.x == 0)
+    {
+        sh_do = 0; // default
+        int e_local = recv_topk_i[r];
+
+        // Validate local id
+        if ((unsigned)e_local < (unsigned)local_n)
+        {
+            // Reserve slot exactly ONCE
+            int write = atomicAdd(&d_write_idx[e_local], 1);
+            const int cap = d_counts[e_local];
+
+            if (write >= 0 && write < cap)
+            {
+                const int base = d_offsets[e_local];
+                sh_dst = base + write;
+                sh_do = 1;
+
+                // metadata: ghi một lần
+                out_indices[sh_dst] = recv_token_ids[r];
+                out_weights[sh_dst] = recv_topk_v[r];
+            }
+            else
+            {
+                // rollback nếu vượt capacity
+                if (write >= cap)
+                    atomicSub(&d_write_idx[e_local], 1);
+                sh_do = 0;
+            }
+        }
+    }
+    __syncthreads();
+
+    if (!sh_do)
+        return;
+
+    // Copy hàng H-dim: cả block cùng copy
+    const size_t rowDst = (size_t)sh_dst * (size_t)H;
+    const size_t rowSrc = (size_t)r * (size_t)H;
+
+    const bool can_vec = ((H & 3) == 0) &&
+                         ((((uintptr_t)(out_hidden + rowDst)) & 0xF) == 0) &&
+                         ((((uintptr_t)(recv_hidden + rowSrc)) & 0xF) == 0);
+
+    if (can_vec)
+    {
+        const int H4 = H >> 2;
+        const float4 *__restrict__ src4 =
+            reinterpret_cast<const float4 *>(recv_hidden + rowSrc);
+        float4 *__restrict__ dst4 =
+            reinterpret_cast<float4 *>(out_hidden + rowDst);
+        for (int i = threadIdx.x; i < H4; i += blockDim.x)
+        {
+            dst4[i] = src4[i];
+        }
+    }
+    else
+    {
+        for (int h = threadIdx.x; h < H; h += blockDim.x)
+        {
+            out_hidden[rowDst + (size_t)h] = recv_hidden[rowSrc + (size_t)h];
+        }
+    }
+}

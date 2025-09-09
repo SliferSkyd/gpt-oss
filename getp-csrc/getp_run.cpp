@@ -37,100 +37,6 @@
 int num_gpus = 1;
 
 // ================= GPUTransformerWeights ===================
-// (replace the old definition with this one)
-
-#ifdef THREAD_DEBUG
-// Force a sync so the value we read was just produced by the prior kernel/launch.
-#define DBG_SYNC() HIP_CHECK(hipStreamSynchronize(0))
-
-// Print 1 float from device pointer p[0]
-#define DBG_PRINT_FLOAT(tag, p)                                     \
-    do                                                              \
-    {                                                               \
-        float _hv = NAN;                                            \
-        HIP_CHECK(hipMemcpy(&_hv, (const void *)(p), sizeof(float), \
-                            hipMemcpyDeviceToHost));                \
-        int _dev = -1;                                              \
-        hipGetDevice(&_dev);                                        \
-        printf("[DBG][dev=%d] %s = %.9g\n", _dev, (tag), _hv);      \
-        fflush(stdout);                                             \
-    } while (0)
-
-// Print 1 int from device pointer p[0]
-#define DBG_PRINT_INT(tag, p)                                     \
-    do                                                            \
-    {                                                             \
-        int _hv = -777777;                                        \
-        HIP_CHECK(hipMemcpy(&_hv, (const void *)(p), sizeof(int), \
-                            hipMemcpyDeviceToHost));              \
-        int _dev = -1;                                            \
-        hipGetDevice(&_dev);                                      \
-        printf("[DBG][dev=%d] %s = %d\n", _dev, (tag), _hv);      \
-        fflush(stdout);                                           \
-    } while (0)
-
-// Print 1 float from device pointer with offset (elements)
-#define DBG_PRINT_FLOAT_AT(tag, p, off)                              \
-    do                                                               \
-    {                                                                \
-        float _hv = NAN;                                             \
-        const float *_ptr = (const float *)(p) + (size_t)(off);      \
-        HIP_CHECK(hipMemcpy(&_hv, (const void *)_ptr, sizeof(float), \
-                            hipMemcpyDeviceToHost));                 \
-        int _dev = -1;                                               \
-        hipGetDevice(&_dev);                                         \
-        printf("[DBG][dev=%d] %s@%lld = %.9g\n", _dev, (tag),        \
-               (long long)(off), _hv);                               \
-        fflush(stdout);                                              \
-    } while (0)
-
-// Print 1 int from device pointer with offset (elements)
-#define DBG_PRINT_INT_AT(tag, p, off)                              \
-    do                                                             \
-    {                                                              \
-        int _hv = -777777;                                         \
-        const int *_ptr = (const int *)(p) + (size_t)(off);        \
-        HIP_CHECK(hipMemcpy(&_hv, (const void *)_ptr, sizeof(int), \
-                            hipMemcpyDeviceToHost));               \
-        int _dev = -1;                                             \
-        hipGetDevice(&_dev);                                       \
-        printf("[DBG][dev=%d] %s@%lld = %d\n", _dev, (tag),        \
-               (long long)(off), _hv);                             \
-        fflush(stdout);                                            \
-    } while (0)
-
-#else
-#define DBG_SYNC() \
-    do             \
-    {              \
-    } while (0)
-#define DBG_PRINT_FLOAT(tag, p) \
-    do                          \
-    {                           \
-    } while (0)
-#define DBG_PRINT_INT(tag, p) \
-    do                        \
-    {                         \
-    } while (0)
-#define DBG_PRINT_FLOAT_AT(tag, p, off) \
-    do                                  \
-    {                                   \
-    } while (0)
-#define DBG_PRINT_INT_AT(tag, p, off) \
-    do                                \
-    {                                 \
-    } while (0)
-#endif
-
-
-// ================= GPUTransformerWeights ===================
-// (replace the old definition with this one)
-
-// ---- pairing helpers (global experts are split in half across device pairs) ----
-static inline int local_base_for(int dev, int n_experts) { return (dev % 2 == 0) ? 0 : (n_experts / 2); }
-static inline int peer_base_for(int dev, int n_experts) { return (dev % 2 == 0) ? (n_experts / 2) : 0; }
-static inline int local_count_for(int /*dev*/, int n_experts) { return n_experts / 2; } // assume even split
-
 typedef struct
 {
     // Embedding
@@ -1358,7 +1264,6 @@ void attention_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size)
     int attn_bias_offset = layer_idx * hidden_dim;
 
     {
-        // TIMER_BLOCK("fused_output_projection_kernel_f32mfma");
 
         int M = batch_size;
         int N = hidden_dim;
@@ -1386,13 +1291,6 @@ void attention_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size)
     }
 }
 
-// static inline int local_base_for(int dev, int n_experts) {
-//     // Pairing is (0-1), (2-3), ... -> even holds first half, odd holds second half
-//     return (dev % 2 == 0) ? 0 : (n_experts / 2);
-// }
-// static inline int peer_base_for(int dev, int n_experts) {
-//     return (dev % 2 == 0) ? (n_experts / 2) : 0;
-// }
 static inline bool is_local_expert(int expert_id, int local_base, int local_n)
 {
     return (expert_id >= local_base) && (expert_id < local_base + local_n);
@@ -1401,308 +1299,6 @@ static inline int to_local_id(int expert_id, int local_base)
 {
     return expert_id - local_base; // 0..local_n_experts-1
 }
-__global__ void pack_remote_tokens_kernel(
-    const float *__restrict__ d_t,    // [B, H]
-    const int *__restrict__ topk_i,   // [B, k] global ids
-    const float *__restrict__ topk_v, // [B, k]
-    int B, int H, int k,
-    int peer_base, int peer_n,
-    int max_rows,                       // sức chứa B*k
-    int *__restrict__ d_send_token_ids, // [max_rows]
-    int *__restrict__ d_send_topk_i,    // [max_rows] (peer-local id)
-    float *__restrict__ d_send_topk_v,  // [max_rows]
-    float *__restrict__ d_send_hidden,  // [max_rows, H]
-    int *__restrict__ d_send_count)     // [1], zero trước
-{
-    const int b = blockIdx.x;
-    if (b >= B)
-        return;
-
-    __shared__ int sh_do;
-    __shared__ int sh_slot;
-    __shared__ int sh_peer_local;
-
-    for (int j = 0; j < k; ++j)
-    {
-        if (threadIdx.x == 0)
-        {
-            sh_do = 0;
-            const int e_global = topk_i[(size_t)b * k + j];
-            if (e_global >= peer_base && e_global < peer_base + peer_n)
-            {
-                const int peer_local = e_global - peer_base;
-
-                int slot = atomicAdd(d_send_count, 1);
-                // chặn overflow phòng hờ
-                if (slot < max_rows)
-                {
-                    sh_do = 1;
-                    sh_slot = slot;
-                    sh_peer_local = peer_local;
-
-                    d_send_token_ids[slot] = b;
-                    d_send_topk_i[slot] = peer_local;
-                    d_send_topk_v[slot] = topk_v[(size_t)b * k + j];
-                }
-                else
-                {
-                    // rollback nếu vượt sức chứa
-                    atomicSub(d_send_count, 1);
-                }
-            }
-        }
-        __syncthreads();
-
-        if (!sh_do)
-            continue;
-
-        // copy 1 hàng H-dim
-        const size_t rowDst = (size_t)sh_slot * (size_t)H;
-        const size_t rowSrc = (size_t)b * (size_t)H;
-
-        // (tuỳ chọn) vector hoá khi thỏa điều kiện
-        const bool can_vec = ((H & 3) == 0) &&
-                             ((((uintptr_t)(d_send_hidden + rowDst)) & 0xF) == 0) &&
-                             ((((uintptr_t)(d_t + rowSrc)) & 0xF) == 0);
-        if (can_vec)
-        {
-            const int H4 = H >> 2;
-            const float4 *__restrict__ src4 =
-                reinterpret_cast<const float4 *>(d_t + rowSrc);
-            float4 *__restrict__ dst4 =
-                reinterpret_cast<float4 *>(d_send_hidden + rowDst);
-            for (int i = threadIdx.x; i < H4; i += blockDim.x)
-                dst4[i] = src4[i];
-        }
-        else
-        {
-            for (int h = threadIdx.x; h < H; h += blockDim.x)
-                d_send_hidden[rowDst + (size_t)h] = d_t[rowSrc + (size_t)h];
-        }
-        __syncthreads();
-    }
-}
-
-__global__ void permute_subset_local_kernel(
-    const float *__restrict__ d_t,    // [B, H]
-    const int *__restrict__ topk_i,   // [B, k] global expert ids
-    const float *__restrict__ topk_v, // [B, k]
-    int B, int H, int k,
-    int local_base, int local_n,
-    const int *__restrict__ d_local_offsets, // [local_n]
-    const int *__restrict__ d_local_counts,  // [local_n]
-    int *__restrict__ d_local_write_idx,     // [local_n]
-    float *__restrict__ out_hidden,          // [sum_local, H]
-    int *__restrict__ out_indices,           // [sum_local]
-    float *__restrict__ out_weights)         // [sum_local]
-{
-    const int b = blockIdx.x;
-    if (b >= B)
-        return;
-
-    __shared__ int sh_do;  // 0/1: có ghi lần này không
-    __shared__ int sh_dst; // dòng đích trong buffer compact
-
-    // Mỗi block xử lý 1 token b; lặp qua k expert đã chọn
-    for (int j = 0; j < k; ++j)
-    {
-        // Mặc định không làm gì
-        if (threadIdx.x == 0)
-            sh_do = 0;
-        __syncthreads();
-
-        const int e_global = topk_i[(size_t)b * k + j];
-        // Kiểm tra local
-        const bool is_local =
-            (e_global >= local_base) && (e_global < local_base + local_n);
-        const int e_local = e_global - local_base;
-
-        // Chỉ lane 0 giữ chỗ & tính dst
-        if (threadIdx.x == 0 && is_local)
-        {
-            // Giữ chỗ một lần duy nhất
-            int write = atomicAdd(&d_local_write_idx[e_local], 1);
-            const int cap = d_local_counts[e_local];
-            if (write >= 0 && write < cap)
-            {
-                const int base = d_local_offsets[e_local];
-                sh_dst = base + write;
-                sh_do = 1;
-
-                // Ghi metadata (index, weight) một lần
-                out_indices[sh_dst] = b;
-                out_weights[sh_dst] = topk_v[(size_t)b * k + j];
-            }
-            else
-            {
-                // Rollback nếu vượt capacity
-                if (write >= cap)
-                    atomicSub(&d_local_write_idx[e_local], 1);
-                sh_do = 0;
-            }
-        }
-        __syncthreads(); // Tất cả thread cùng thấy sh_do & sh_dst
-
-        if (sh_do)
-        {
-            // Copy hàng H-dim: mọi thread cùng hợp tác
-            const size_t rowDst = (size_t)sh_dst * (size_t)H;
-            const size_t rowSrc = (size_t)b * (size_t)H;
-
-            // (Tuỳ chọn) vector hoá nếu thỏa điều kiện
-            const bool can_vec = ((H & 3) == 0) &&
-                                 ((((uintptr_t)(out_hidden + rowDst)) & 0xF) == 0) &&
-                                 ((((uintptr_t)(d_t + rowSrc)) & 0xF) == 0);
-            if (can_vec)
-            {
-                const int H4 = H >> 2;
-                const float4 *__restrict__ src4 =
-                    reinterpret_cast<const float4 *>(d_t + rowSrc);
-                float4 *__restrict__ dst4 =
-                    reinterpret_cast<float4 *>(out_hidden + rowDst);
-                for (int h4 = threadIdx.x; h4 < H4; h4 += blockDim.x)
-                {
-                    dst4[h4] = src4[h4];
-                }
-            }
-            else
-            {
-                for (int h = threadIdx.x; h < H; h += blockDim.x)
-                {
-                    out_hidden[rowDst + (size_t)h] = d_t[rowSrc + (size_t)h];
-                }
-            }
-        }
-        __syncthreads(); // Kết thúc vòng lặp j, đồng bộ block
-    }
-}
-
-__global__ void permute_received_to_local_kernel(
-    const float *__restrict__ recv_hidden,  // [R, H]
-    const int *__restrict__ recv_topk_i,    // [R] local expert ids (0..local_n-1)
-    const float *__restrict__ recv_topk_v,  // [R]
-    const int *__restrict__ recv_token_ids, // [R] origin token ids
-    int R, int H,
-    int local_n,
-    const int *__restrict__ d_offsets, // [local_n]
-    const int *__restrict__ d_counts,  // [local_n]
-    int *__restrict__ d_write_idx,     // [local_n] (zeroed before)
-    float *__restrict__ out_hidden,    // [sum_recv, H]
-    int *__restrict__ out_indices,     // [sum_recv]
-    float *__restrict__ out_weights)   // [sum_recv]
-{
-    const int r = blockIdx.x;
-    if (r >= R)
-        return;
-
-    __shared__ int sh_do;  // 0/1: có ghi hay không
-    __shared__ int sh_dst; // dòng đích trong compact buffer
-
-    if (threadIdx.x == 0)
-    {
-        sh_do = 0; // default
-        int e_local = recv_topk_i[r];
-
-        // Validate local id
-        if ((unsigned)e_local < (unsigned)local_n)
-        {
-            // Reserve slot exactly ONCE
-            int write = atomicAdd(&d_write_idx[e_local], 1);
-            const int cap = d_counts[e_local];
-
-            if (write >= 0 && write < cap)
-            {
-                const int base = d_offsets[e_local];
-                sh_dst = base + write;
-                sh_do = 1;
-
-                // metadata: ghi một lần
-                out_indices[sh_dst] = recv_token_ids[r];
-                out_weights[sh_dst] = recv_topk_v[r];
-            }
-            else
-            {
-                // rollback nếu vượt capacity
-                if (write >= cap)
-                    atomicSub(&d_write_idx[e_local], 1);
-                sh_do = 0;
-            }
-        }
-    }
-    __syncthreads();
-
-    if (!sh_do)
-        return;
-
-    // Copy hàng H-dim: cả block cùng copy
-    const size_t rowDst = (size_t)sh_dst * (size_t)H;
-    const size_t rowSrc = (size_t)r * (size_t)H;
-
-    const bool can_vec = ((H & 3) == 0) &&
-                         ((((uintptr_t)(out_hidden + rowDst)) & 0xF) == 0) &&
-                         ((((uintptr_t)(recv_hidden + rowSrc)) & 0xF) == 0);
-
-    if (can_vec)
-    {
-        const int H4 = H >> 2;
-        const float4 *__restrict__ src4 =
-            reinterpret_cast<const float4 *>(recv_hidden + rowSrc);
-        float4 *__restrict__ dst4 =
-            reinterpret_cast<float4 *>(out_hidden + rowDst);
-        for (int i = threadIdx.x; i < H4; i += blockDim.x)
-        {
-            dst4[i] = src4[i];
-        }
-    }
-    else
-    {
-        for (int h = threadIdx.x; h < H; h += blockDim.x)
-        {
-            out_hidden[rowDst + (size_t)h] = recv_hidden[rowSrc + (size_t)h];
-        }
-    }
-}
-
-#ifndef MOE_DEBUG_PRINTS
-#define MOE_DEBUG_PRINTS 1
-#endif
-
-#if MOE_DEBUG_PRINTS
-static inline void dbg_print_first_f32(const char *tag, const float *dptr,
-                                       size_t n, hipStream_t s, int dev)
-{
-    if (!dptr || n == 0)
-    {
-        printf("[GPU %d] %s EMPTY\n", dev, tag);
-        fflush(stdout);
-        return;
-    }
-    float h = 0.f;
-    HIP_CHECK(hipMemcpyAsync(&h, dptr, sizeof(float), hipMemcpyDeviceToHost, s));
-    HIP_CHECK(hipStreamSynchronize(s));
-    printf("[GPU %d] %s[0]=%f\n", dev, tag, h);
-    fflush(stdout);
-}
-static inline void dbg_print_first_i32(const char *tag, const int *dptr,
-                                       size_t n, hipStream_t s, int dev)
-{
-    if (!dptr || n == 0)
-    {
-        printf("[GPU %d] %s EMPTY\n", dev, tag);
-        fflush(stdout);
-        return;
-    }
-    int h = 0;
-    HIP_CHECK(hipMemcpyAsync(&h, dptr, sizeof(int), hipMemcpyDeviceToHost, s));
-    HIP_CHECK(hipStreamSynchronize(s));
-    printf("[GPU %d] %s[0]=%d\n", dev, tag, h);
-    fflush(stdout);
-}
-#else
-#define dbg_print_first_f32(...) ((void)0)
-#define dbg_print_first_i32(...) ((void)0)
-#endif
-
 
 void moe_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size)
 {
@@ -1720,62 +1316,35 @@ void moe_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size)
     const int peer = s->peer_device_id;
     const int local_base = (dev % 2 == 0) ? 0 : (E / 2);
     const int peer_base = (dev % 2 == 0) ? (E / 2) : 0;
-
-    // printf("[DBG][dev=%d] MoE layer %d: B=%d, H=%d, D=%d, E=%d, k=%d, Le=%d, local_base=%d, peer_base=%d\n",
-    //        dev, layer_idx, batch_size, H, D, E, k, Le, local_base, peer_base);
-
     HIP_CHECK(hipDeviceSynchronize());
 
     hipStream_t c = s->sScatter ? s->sScatter : 0;
     hipStream_t s0 = 0; // default stream
-    hipStream_t g = 0; 
-
+    hipStream_t g = 0;
 
     // ===== 1) FFN RMSNorm + Router =====
-     {
+    {
         dim3 norm_grid(batch_size), norm_block(THREADS_PER_BLOCK);
         rmsnorm_kernel<<<norm_grid, norm_block, 0, s0>>>(
             s->t, s->x, w->rms_ffn_w + (size_t)layer_idx * H, batch_size, H);
         HIP_CHECK(hipGetLastError());
-// #ifdef THREAD_DEBUG
-//         DBG_SYNC();
-//         DBG_PRINT_FLOAT("[OLD] after rmsnorm s->t[0]", s->t);
-// #endif
 
         matmul_mc_k4(s->router_score, s->t,
                      w->w_router + (size_t)layer_idx * H * E,
                      batch_size, H, E, s0);
-// #ifdef THREAD_DEBUG
-//         DBG_SYNC();
-//         DBG_PRINT_FLOAT("[OLD] after router matmul s->router_score[0]", s->router_score);
-// #endif
 
         const int elems = batch_size * E;
         add_bias_kernel<<<(elems + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK,
                           THREADS_PER_BLOCK, 0, s0>>>(
             s->router_score, w->b_router + (size_t)layer_idx * E, batch_size, E);
         HIP_CHECK(hipGetLastError());
-// #ifdef THREAD_DEBUG
-//         DBG_SYNC();
-//         DBG_PRINT_FLOAT("[OLD] after add_bias s->router_score[0]", s->router_score);
-// #endif
 
         topk_kernel<<<batch_size, 1, 0, s0>>>(
             s->topk_v, s->topk_i, s->router_score, batch_size, E, k);
         HIP_CHECK(hipGetLastError());
-// #ifdef THREAD_DEBUG
-//         DBG_SYNC();
-//         DBG_PRINT_INT("[OLD] after topk s->topk_i[0]", s->topk_i);
-//         DBG_PRINT_FLOAT("[OLD] after topk s->topk_v[0] (pre-softmax)", s->topk_v);
-// #endif
-
         softmax_kernel<<<batch_size, THREADS_PER_BLOCK, 0, s0>>>(
             s->topk_v, batch_size, k);
         HIP_CHECK(hipGetLastError());
-// #ifdef THREAD_DEBUG
-//         DBG_SYNC();
-//         DBG_PRINT_FLOAT("[OLD] after softmax s->topk_v[0]", s->topk_v);
-// #endif
 
         HIP_CHECK(hipStreamSynchronize(s0));
     }
@@ -1788,10 +1357,6 @@ void moe_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size)
         count_tokens_per_expert_kernel<<<count_grid, THREADS_PER_BLOCK, 0, s0>>>(
             s->topk_i, s->d_expert_counts, batch_size, k);
         HIP_CHECK(hipGetLastError());
-// #ifdef THREAD_DEBUG
-//         DBG_SYNC();
-//         DBG_PRINT_INT("[OLD] after count_tokens_per_expert d_expert_counts[0]", s->d_expert_counts);
-// #endif
         HIP_CHECK(hipMemcpyAsync(cpu->expert_counts, s->d_expert_counts,
                                  E * sizeof(int), hipMemcpyDeviceToHost, g));
         HIP_CHECK(hipStreamSynchronize(g));
@@ -1813,9 +1378,6 @@ void moe_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size)
                                  Le * sizeof(int), hipMemcpyHostToDevice, g));
         HIP_CHECK(hipMemsetAsync(s->d_local_expert_write_idx, 0, Le * sizeof(int), g));
         HIP_CHECK(hipStreamSynchronize(g));
-        // THREAD_DEBUG("local_counts(D2H->D)", cpu->local_counts, (size_t)Le, g, dev);
-        // THREAD_DEBUG("local_offsets(H2D->D)", cpu->local_offsets, (size_t)Le, g, dev);
-        // THREAD_DEBUG("local_write_idx(zeroed)", s->d_local_expert_write_idx, (size_t)Le, g, dev);
     }
 
     if (total_all == 0)
@@ -1837,9 +1399,6 @@ void moe_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size)
         HIP_CHECK(hipGetLastError());
     }
     HIP_CHECK(hipStreamSynchronize(g));
-    // DBG_PRINT_FLOAT("[NEW] after permute s->expert_input_buffer[0]", s->expert_input_buffer);
-    // DBG_PRINT_INT("[NEW] after permute s->expert_indices[0]", s->expert_indices);
-    // DBG_PRINT_FLOAT("[NEW] after permute s->expert_weights[0]", s->expert_weights);
 
     // ===== 4) Pack REMOTE rows -> P2P send =====
     int h_send = 0;
@@ -1862,13 +1421,6 @@ void moe_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size)
 
         HIP_CHECK(hipMemcpy(&h_send, s->d_send_count, sizeof(int), hipMemcpyDeviceToHost));
         cpu->peer_send_count = h_send;
-
-        // if (h_send > 0)
-        // {
-        //     THREAD_DEBUG("send_hidden[0]", s->d_send_hidden, (size_t)h_send * H, g, dev);
-        //     THREAD_DEBUG("send_topk_i[0]", s->d_send_topk_i, (size_t)h_send, g, dev);
-        //     THREAD_DEBUG("send_topk_v[0]", s->d_send_topk_v, (size_t)h_send, g, dev);
-        // }
 
         if (h_send > 0 && peer >= 0)
         {
@@ -1909,8 +1461,6 @@ void moe_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size)
                 s->d_recv_topk_i, s->d_peer_expert_counts, h_recv, 1);
             HIP_CHECK(hipGetLastError());
             HIP_CHECK(hipStreamSynchronize(g));
-            // DBG_PRINT_INT("[NEW] after count_tokens_per_expert peer_expert_counts[0]", s->d_peer_expert_counts);
-
             HIP_CHECK(hipMemcpyAsync(cpu->peer_counts, s->d_peer_expert_counts,
                                      Le * sizeof(int), hipMemcpyDeviceToHost, g));
             HIP_CHECK(hipStreamSynchronize(g));
@@ -1936,10 +1486,6 @@ void moe_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size)
             HIP_CHECK(hipGetLastError());
         }
         HIP_CHECK(hipStreamSynchronize(g));
-
-        // DBG_PRINT_FLOAT("[NEW] after permute peer_expert_input_buffer[0]", s->peer_expert_input_buffer);
-        // DBG_PRINT_FLOAT("[NEW] after permute peer_expert_weights[0]", s->peer_expert_weights);
-        // DBG_PRINT_INT("[NEW] after permute peer_expert_indices[0]", s->peer_expert_indices);
     }
 
     // ===== 7) m-tile prefix (LOCAL Le experts only) =====
@@ -1956,9 +1502,6 @@ void moe_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size)
     HIP_CHECK(hipMalloc((void **)&d_mtile_prefix_local, (Le + 1) * sizeof(int)));
     HIP_CHECK(hipMemcpy(d_mtile_prefix_local, h_mtiles_local.data(),
                         (Le + 1) * sizeof(int), hipMemcpyHostToDevice));
-
-    // THREAD_DEBUG("mtile_prefix_local[last]", d_mtile_prefix_local + Le, 1, c, dev);
-    // DBG_PRINT_FLOAT("[NEW] after mtile_prefix_local[last]", d_mtile_prefix_local + Le);
 
     // ===== 8) Grouped MLPs for LOCAL rows (Le experts) =====
     if (local_total > 0)
@@ -2003,11 +1546,6 @@ void moe_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size)
                                /*alpha_silu*/ 1.702f);
             HIP_CHECK(hipGetLastError());
             HIP_CHECK(hipStreamSynchronize(c));
-            // #ifdef THREAD_DEBUG
-            //         // DBG_PRINT_FLOAT("[NEW] after MLP1 GU_local[0]", GU_local);
-            //         DBG_PRINT_FLOAT("[NEW] after MLP1 s->gate_up[0]", s->gate_up);
-            //         DBG_PRINT_FLOAT("[NEW] after MLP1 s->expert_output_buffer[0]", s->expert_output_buffer);
-            // #endif
         }
 
         // --- MLP2 (MXFP4) -> expert_output_buffer (LOCAL rows) ---
@@ -2047,11 +1585,6 @@ void moe_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size)
                                /*N=H*/ H);
             HIP_CHECK(hipGetLastError());
             HIP_CHECK(hipStreamSynchronize(c));
-            // #ifdef THREAD_DEBUG
-            //         // DBG_PRINT_FLOAT("[NEW] after MLP2 C_local[0]", C_local);
-            //         DBG_PRINT_FLOAT("[NEW] after MLP2 s->expert_output_buffer[0]", s->expert_output_buffer);
-            //         DBG_PRINT_FLOAT("[NEW] after MLP2 s->e_agg(before scatter)[0]", s->e_agg);
-            // #endif
         }
     }
 
@@ -2066,9 +1599,6 @@ void moe_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size)
             s->e_agg, s->expert_output_buffer, s->expert_indices, s->expert_weights, local_total, H);
         HIP_CHECK(hipGetLastError());
         HIP_CHECK(hipStreamSynchronize(c));
-        // THREAD_DEBUG("e_agg(after local scatter)", s->e_agg, (size_t)batch_size * H, c, dev);
-        // DBG_PRINT_FLOAT("[NEW] after local scatter s->e_agg[0]", s->e_agg);
-        // DBG_PRINT_FLOAT("[NEW] after local scatter s->expert_output_buffer[0]", s->expert_output_buffer);
     }
 
     // ===== 10) Grouped MLPs for PEER-received rows on this GPU (Le experts) =====
@@ -2130,9 +1660,6 @@ void moe_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size)
                                /*alpha_silu*/ 1.702f);
             HIP_CHECK(hipGetLastError());
             HIP_CHECK(hipStreamSynchronize(c));
-            // DBG_PRINT_FLOAT("[NEW] after MLP1 s->gate_up[0]", s->gate_up);
-            // DBG_PRINT_FLOAT("[NEW] after MLP1 s->peer_expert_input_buffer[0]", s->peer_expert_input_buffer);
-            // DBG_PRINT_FLOAT("[NEW] after MLP1 s->peer_expert_output_buffer[0]", s->peer_expert_output_buffer);
         }
 
         // --- MLP2 for peer rows -> peer_expert_output_buffer ---
@@ -2172,10 +1699,6 @@ void moe_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size)
                                /*N=H*/ H);
             HIP_CHECK(hipGetLastError());
             HIP_CHECK(hipStreamSynchronize(c));
-                    // DBG_PRINT_FLOAT("[NEW] after MLP2 s->peer_expert_output_buffer[0]", s->peer_expert_output_buffer);
-                    // DBG_PRINT_FLOAT("[NEW] after MLP2 s->e_agg(before peer scatter)[0]", s->e_agg);
-                    // DBG_PRINT_FLOAT("[NEW] after MLP2 s->gate_up[0]", s->gate_up);
-
         }
 
         HIP_CHECK(hipFree(d_mtile_prefix_peer));
@@ -2202,8 +1725,6 @@ void moe_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size)
             &cpu->peer_recv_count, dev,
             sizeof(int), c));
         HIP_CHECK(hipStreamSynchronize(c));
-        // (Not a kernel, but helpful)
-        // printf("[DBG][dev=%d] [NEW] sent_back_rows=%d\n", dev, cpu->peer_recv_count);        
         fflush(stdout);
     }
 
@@ -2221,7 +1742,6 @@ void moe_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size)
             s->e_agg, s->d_recv_hidden, s->d_recv_token_ids, s->d_recv_topk_v, h_back, H);
         HIP_CHECK(hipGetLastError());
         HIP_CHECK(hipStreamSynchronize(c));
-        // DBG_PRINT_FLOAT("[NEW] after peer scatter s->e_agg[0]", s->e_agg);
     }
 
     // ===== 14) Residual add =====
@@ -2232,11 +1752,7 @@ void moe_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size)
             s->x, s->e_agg, 1.0f, batch_size, H);
         HIP_CHECK(hipGetLastError());
         HIP_CHECK(hipStreamSynchronize(c));
-        // #ifdef THREAD_DEBUG
-        //         DBG_PRINT_FLOAT("[NEW] after residual add s->x[0]", s->x);
-        // #endif
     }
-
 }
 
 __global__ void fill_const_i32_kernel(int *__restrict__ out, int value, int N)
@@ -2604,26 +2120,4 @@ long long inference(Transformer *transformer, Tokenizer *tokenizer,
     // Use continuous batching for better throughput
     return continuous_batching_inference(tokenizer, sampler, requests);
 }
-
-/*
- * REFACTORING NOTES:
- *
- * This file has been partially refactored to group global variables into structs
- * similar to the CPU version in run.cpp. The main changes include:
- *
- * 1. Created GPUTransformerWeights struct to hold all GPU weight pointers
- * 2. Created GPURunState struct to hold all GPU activation buffers
- * 3. Created CPUBuffers struct to hold CPU-side buffers
- * 4. Created GPUTransformer struct to tie everything together
- * 5. Added proper allocation and deallocation functions for each struct
- *
- * TODO: The actual kernel calls throughout the file still reference the old
- * global variables (like d_x, d_t, etc.). These need to be updated to use
- * the struct members (e.g., gpu_state->x, gpu_state->t, etc.) and the
- * functions need to be updated to accept the struct parameters.
- *
- * This refactoring provides better memory management, cleaner code organization,
- * and follows the same pattern as the CPU implementation.
- */
-
 #endif // GETP_RUN
