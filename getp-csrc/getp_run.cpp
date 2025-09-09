@@ -187,11 +187,21 @@ void malloc_gpu_run_state(GPURunState *s, Config *p)
     size_t batch_hidden = BATCH_SIZE * p->hidden_dim * sizeof(float);
     size_t batch_qkv = BATCH_SIZE * p->head_dim * (p->n_attn_heads + 2 * p->n_kv_heads) * sizeof(float);
     // BF16 KV cache - 50% memory reduction compared to FP32
-    size_t kv_cache_size = BATCH_SIZE * p->n_layers * MAX_SEQ_LEN * kv_dim * sizeof(float);
 
-    printf("Allocating GPU memory: batch_size=%d, hidden_dim=%d, seq_len=%d\n",
-           BATCH_SIZE, p->hidden_dim, MAX_SEQ_LEN);
-    printf("KV cache size per batch (BF16): %zu MB (50%% reduction from FP32)\n", kv_cache_size / (1024 * 1024));
+    // per-layer capacities: even layers use SW_WINDOW (if sliding enabled), odd are full
+    const int n_even = (p->n_layers + 1) / 2;
+    const int n_odd  = p->n_layers - n_even;
+    const int even_cap = (p->sliding_window > 0 ? SW_WINDOW : MAX_SEQ_LEN);
+
+    // total "positions" per layer-stack
+    const size_t layers_capacity =
+        (size_t)n_even * (size_t)even_cap + (size_t)n_odd * (size_t)MAX_SEQ_LEN;
+
+    size_t kv_cache_size = (size_t)BATCH_SIZE * layers_capacity * (size_t)kv_dim * sizeof(float);
+
+    printf("KV cache (fp32) total capacity: layers_capacity=%zu positions/layer-stack\n",
+        layers_capacity);
+    printf("KV cache size per batch: %zu MB\n", kv_cache_size / (1024 * 1024));
 
     // Allocate GPU memory with error checking
     HIP_CHECK(hipMalloc((void **)&s->x, batch_hidden));
@@ -775,7 +785,24 @@ void attention_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size,
     const int KV = Hd * NK;
     const int QKV = Hd * (NA + 2 * NK);
 
-    const size_t kv_slice = (size_t)p->n_layers * (size_t)MAX_SEQ_LEN * (size_t)KV;
+    // --- NEW: per-layer capacities & offsets ---
+    const int even_cap = (p->sliding_window > 0 ? SW_WINDOW : MAX_SEQ_LEN);
+
+    // sum of capacities across all layers (this is per-batch stride, in "KV vectors")
+    size_t layers_capacity = 0;
+    for (int L = 0; L < p->n_layers; ++L) {
+        const bool evenL = ((L & 1) == 0);
+        layers_capacity += (size_t)(evenL ? even_cap : MAX_SEQ_LEN);
+    }
+    const size_t kv_slice = layers_capacity * (size_t)KV;   // per-batch stride in *elements*
+
+    // offset (in KV vectors) to this layer within the slot's stack
+    size_t layer_pos_offset = 0;
+    for (int L = 0; L < layer_idx; ++L) {
+        const bool evenL = ((L & 1) == 0);
+        layer_pos_offset += (size_t)(evenL ? even_cap : MAX_SEQ_LEN);
+    }
+    const size_t layer_elem_offset = layer_pos_offset * (size_t)KV;
 
     // micro-batch slices
     float *x_mb   = s->x   + (size_t)row_offset * H;
@@ -828,8 +855,10 @@ void attention_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size,
         dim3 block(1, THREADS_PER_BLOCK);
         update_kv_cache_kernel<<<grid, block, 0, sAttn>>>(
             key_cache_mb, value_cache_mb, k_mb, v_mb, pos_mb,
-            batch_size, p->n_layers, layer_idx, MAX_SEQ_LEN, KV);
-        HIP_CHECK(hipGetLastError());
+            batch_size, p->n_layers, layer_idx, MAX_SEQ_LEN, KV,
+            /* batch_kv_stride = */ kv_slice,
+            /* layer_kv_offset = */ layer_elem_offset);
+
     }
     // 6) fused attention
     {
@@ -848,7 +877,10 @@ void attention_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size,
             w->attn_sinks + (size_t)layer_idx * NA,
             s->mask, pos_mb, batch_size,
             NA, NK, Hd, MAX_SEQ_LEN, p->n_layers, layer_idx,
-            p->sliding_window > 0);
+            p->sliding_window > 0,
+            /* batch_kv_stride = */ kv_slice,
+            /* layer_kv_offset = */ layer_elem_offset);
+
         HIP_CHECK(hipGetLastError());
     }
     // 7) fused output projection
@@ -1200,31 +1232,37 @@ int *forward_batch_gpu(GPUTransformer *gpu_t, int *tokens, int batch_size)
 
 static inline void clear_kv_cache_for_slot(GPURunState* s, const Config* p, int slot)
 {
-    // Guard: invalid slot -> nothing to do
     if (slot < 0 || slot >= BATCH_SIZE) return;
 
     const int kv_dim = p->head_dim * p->n_kv_heads;
-
-    // We assume key/value cache elements are 4-byte floats. If your KV cache
-    // is stored as bf16/half in this build, change elem_bytes to 2.
     const size_t elem_bytes = sizeof(float);
 
-    const size_t bytes_per_pos        = (size_t)kv_dim * elem_bytes;
-    const size_t bytes_per_layer_slot = (size_t)MAX_SEQ_LEN * bytes_per_pos;
+    const int even_cap = (p->sliding_window > 0 ? SW_WINDOW : MAX_SEQ_LEN);
 
-    for (int layer = 0; layer < p->n_layers; ++layer) {
-        // Base element index for (layer, slot, pos=0, d=0)
-        const size_t base_elem =
-            (((size_t)layer * (size_t)BATCH_SIZE + (size_t)slot) *
-              (size_t)MAX_SEQ_LEN) * (size_t)kv_dim;
+    // total per-slot capacity (in "positions")
+    size_t layers_capacity = 0;
+    for (int L = 0; L < p->n_layers; ++L) {
+        const bool evenL = ((L & 1) == 0);
+        layers_capacity += (size_t)(evenL ? even_cap : MAX_SEQ_LEN);
+    }
+    const size_t slot_base_elems = (size_t)slot * layers_capacity * (size_t)kv_dim;
 
-        // Compute byte pointers
-        void* k_ptr = (void*)((char*)s->key_cache   + base_elem * elem_bytes);
-        void* v_ptr = (void*)((char*)s->value_cache + base_elem * elem_bytes);
+    // walk layers and zero their actual slices
+    size_t layer_pos_offset = 0;
+    for (int L = 0; L < p->n_layers; ++L) {
+        const bool evenL = ((L & 1) == 0);
+        const size_t capL = (size_t)(evenL ? even_cap : MAX_SEQ_LEN);
 
-        // Zero the contiguous [MAX_SEQ_LEN * kv_dim] region for this (layer,slot)
-        HIP_CHECK(hipMemset(k_ptr, 0, bytes_per_layer_slot));
-        HIP_CHECK(hipMemset(v_ptr, 0, bytes_per_layer_slot));
+        const size_t layer_base_elems = slot_base_elems + layer_pos_offset * (size_t)kv_dim;
+        const size_t bytes_this_layer = capL * (size_t)kv_dim * elem_bytes;
+
+        void* k_ptr = (void*)((char*)s->key_cache   + layer_base_elems * elem_bytes);
+        void* v_ptr = (void*)((char*)s->value_cache + layer_base_elems * elem_bytes);
+
+        HIP_CHECK(hipMemset(k_ptr, 0, bytes_this_layer));
+        HIP_CHECK(hipMemset(v_ptr, 0, bytes_this_layer));
+
+        layer_pos_offset += capL;
     }
 }
 

@@ -58,7 +58,7 @@ __global__ void fused_attention_kernel(
     const int * __restrict__ positions,              // [batch]
     int batch_size, int n_heads, int n_kv_heads, int head_dim,
     int seq_len, int n_layers, int layer_idx,
-    bool use_sliding_window)
+    bool use_sliding_window, size_t batch_kv_stride, size_t layer_kv_offset)
 {
     extern __shared__ float s_sh[];  // layout later
 
@@ -81,10 +81,8 @@ __global__ void fused_attention_kernel(
     const int kv_dim     = head_dim * n_kv_heads;
 
     const float *q_head = q + 1LL * b * n_heads * head_dim + 1LL * h * head_dim;
-    const float *k_base =
-        key_cache + 1LL * b * n_layers * seq_len * kv_dim + 1LL * layer_idx * seq_len * kv_dim;
-    const float *v_base =
-        value_cache + 1LL * b * n_layers * seq_len * kv_dim + 1LL * layer_idx * seq_len * kv_dim;
+    const float *k_base = key_cache   + (size_t)b * batch_kv_stride + layer_kv_offset;
+    const float *v_base = value_cache + (size_t)b * batch_kv_stride + layer_kv_offset;
     float *out_head =
         output + 1LL * b * n_heads * head_dim + 1LL * h * head_dim;
 
@@ -106,7 +104,7 @@ __global__ void fused_attention_kernel(
     // ---- Pass 1: compute attention scores into s_att[0..win_core_len-1] (all warps participate)
     for (int w = wid; w < win_core_len; w += WARPS) {
         const int t = win_start + w;
-        const float *k_vec = k_base + 1LL * t * kv_dim + 1LL * kv_h * head_dim;
+        const float *k_vec = k_base + 1LL * ((layer_idx & 1) ? t : t % SW_WINDOW) * kv_dim + 1LL * kv_h * head_dim;
 
         float prod = 0.f;
         if (lane < head_dim) {
@@ -154,7 +152,7 @@ __global__ void fused_attention_kernel(
         float partial = 0.f;
         for (int w = wid; w < win_core_len; w += WARPS) {
             const int t = win_start + w;
-            const float *v_vec = v_base + 1LL * t * kv_dim + 1LL * kv_h * head_dim;
+            const float *v_vec = v_base + 1LL * ((layer_idx & 1) ? t : t % SW_WINDOW) * kv_dim + 1LL * kv_h * head_dim;
             partial += (double)s_att[w] * (v_vec[lane]);
         }
         s_partials[wid * head_dim + lane] = partial;
@@ -171,179 +169,31 @@ __global__ void fused_attention_kernel(
 }
 
 
-__global__ void fused_rmsnorm_qkv_rope_kvcache_kernel(
-    // Outputs
-    float *__restrict__ q_out,
-    float *__restrict__ k_out,
-    float *__restrict__ v_out,
-    __hip_bfloat16 *__restrict__ key_cache,
-    __hip_bfloat16 *__restrict__ value_cache,
-    // Inputs
-    const float *__restrict__ x_in,
-    const __hip_bfloat16 *__restrict__ rms_w,
-    const __hip_bfloat16 *__restrict__ w_qkv,
-    const __hip_bfloat16 *__restrict__ b_qkv,
-    const float *__restrict__ cos_vals,
-    const float *__restrict__ sin_vals,
-    const int *__restrict__ positions,
-    // Config
-    int hidden_dim,
-    int qkv_dim,
-    int q_dim,
-    int k_dim,
-    int v_dim,
-    int head_dim,
-    int n_attn_heads,
-    int n_kv_heads,
-    int n_layers,
-    int layer_idx,
-    int seq_len)
+// NEW: KV cache update kernel with BF16 quantization
+__global__ void update_kv_cache_kernel(float *key_cache, float *value_cache,
+                                       const float *k, const float *v,
+                                       const int *positions, int batch_size,
+                                       int n_layers, int layer_idx, int seq_len,
+                                       int kv_dim, size_t batch_kv_stride, size_t layer_kv_offset)
 {
-    // Each thread block processes one item in the batch
-    int batch_idx = blockIdx.x;
-    // Each thread calculates one output dimension (for Q, K, or V)
-    int out_dim_idx = threadIdx.x;
+    size_t batch_idx = blockIdx.x;
+    size_t dim_idx = 1LL * blockIdx.y * blockDim.y + threadIdx.y;
 
-    // Shared memory for RMSNorm and holding the input vector `x`
-    extern __shared__ float s_mem[];
-    float *s_x = s_mem;                    // size: hidden_dim
-    float *s_rms_sum = &s_mem[hidden_dim]; // size: 1 (or blockDim.x for reduction)
+    if (batch_idx >= batch_size || dim_idx >= kv_dim)
+        return;
 
-    // --- 1. Load input `x` to shared memory and start RMSNorm ---
-    const float *x = x_in + batch_idx * hidden_dim;
+    int pos = positions[batch_idx];
+    if (pos >= seq_len)
+        return; // Safety check
 
-    // Parallel load into shared memory
-    for (int i = out_dim_idx; i < hidden_dim; i += blockDim.x)
-    {
-        s_x[i] = x[i];
-    }
+    const size_t base = (size_t)batch_idx * batch_kv_stride + layer_kv_offset;
+    const int row = ((layer_idx & 1) ? pos : (pos % SW_WINDOW));
+    const size_t cache_idx = base + (size_t)row * (size_t)kv_dim + (size_t)dim_idx;
 
-    // Calculate sum of squares for RMSNorm in parallel
-    float ss = 0.0f;
-    for (int i = out_dim_idx; i < hidden_dim; i += blockDim.x)
-    {
-        ss += s_x[i] * s_x[i];
-    }
-
-    // Reduction for sum of squares
-    // Note: Using a single shared memory location for simplicity. For larger blocks,
-    // a parallel reduction tree in shared memory would be more efficient.
-    if (threadIdx.x == 0)
-        s_rms_sum[0] = 0.0f;
-    __syncthreads();
-    atomicAdd(s_rms_sum, ss);
-    __syncthreads();
-
-    // Finalize RMSNorm scaling factor
-    if (threadIdx.x == 0)
-    {
-        float mean_ss = s_rms_sum[0] / hidden_dim;
-        s_rms_sum[0] = 1.0f / sqrtf(mean_ss + 1e-5f);
-    }
-    __syncthreads();
-    float rms_scale = s_rms_sum[0];
-
-    // --- 2. Matmul, Bias, RoPE, and KV Cache Update ---
-    // Each thread computes one element of the QKV output vector
-    for (int i = out_dim_idx; i < qkv_dim; i += blockDim.x)
-    {
-        float val = 0.0f;
-        // Perform dot product (Matmul)
-        for (int j = 0; j < hidden_dim; ++j)
-        {
-            // Apply RMSNorm on the fly
-            float normalized_x = __bfloat162float(rms_w[j]) * (s_x[j] * rms_scale);
-            val += normalized_x * __bfloat162float(w_qkv[i * hidden_dim + j]);
-        }
-
-        // Add bias
-        val += __bfloat162float(b_qkv[i]);
-
-        // --- Split, Apply RoPE, and Write to Output ---
-        int pos = positions[batch_idx];
-
-        if (i < q_dim)
-        { // This is a Q dimension
-            int head_idx = i / head_dim;
-            int h_dim_idx = i % head_dim;
-            int half = head_dim / 2;
-
-            if (h_dim_idx < half)
-            {
-                float q1 = val;
-                // Fetch the corresponding q2 value for RoPE
-                // This requires a temporary buffer or a more complex indexing scheme.
-                // For simplicity here, we assume a way to get q2. A real implementation
-                // might re-compute or use shared memory.
-                // This part is complex to fuse perfectly without restructuring data.
-                // We'll apply RoPE after a sync, reading from an intermediate register stage.
-                // Let's calculate the other pair part.
-                int i2 = i + half;
-                float val2 = 0.0f;
-                for (int j = 0; j < hidden_dim; ++j)
-                {
-                    float normalized_x = __bfloat162float(rms_w[j]) * (s_x[j] * rms_scale);
-                    val2 += normalized_x * __bfloat162float(w_qkv[i2 * hidden_dim + j]);
-                }
-                val2 += __bfloat162float(b_qkv[i2]);
-
-                float c = cos_vals[pos * half + h_dim_idx];
-                float s = sin_vals[pos * half + h_dim_idx];
-
-                q_out[batch_idx * q_dim + i] = q1 * c - val2 * s;
-                q_out[batch_idx * q_dim + i2] = val2 * c + q1 * s;
-            }
-        }
-        else if (i < q_dim + k_dim)
-        { // This is a K dimension
-            int k_idx = i - q_dim;
-            int head_idx = k_idx / head_dim;
-            int h_dim_idx = k_idx % head_dim;
-            int half = head_dim / 2;
-
-            if (h_dim_idx < half)
-            {
-                float k1 = val;
-                int i2 = i + half;
-                float val2 = 0.0f;
-                for (int j = 0; j < hidden_dim; ++j)
-                {
-                    float normalized_x = __bfloat162float(rms_w[j]) * (s_x[j] * rms_scale);
-                    val2 += normalized_x * __bfloat162float(w_qkv[i2 * hidden_dim + j]);
-                }
-                val2 += __bfloat162float(b_qkv[i2]);
-
-                float c = cos_vals[pos * half + h_dim_idx];
-                float s = sin_vals[pos * half + h_dim_idx];
-
-                float final_k1 = k1 * c - val2 * s;
-                float final_k2 = val2 * c + k1 * s;
-
-                // Write to k_out
-                k_out[batch_idx * k_dim + k_idx] = final_k1;
-                k_out[batch_idx * k_dim + k_idx + half] = final_k2;
-
-                // Write to key_cache
-                size_t k_cache_idx1 = (size_t)batch_idx * n_layers * seq_len * k_dim +
-                                      (size_t)layer_idx * seq_len * k_dim + (size_t)pos * k_dim + k_idx;
-                size_t k_cache_idx2 = k_cache_idx1 + half;
-                key_cache[k_cache_idx1] = __float2bfloat16(final_k1);
-                key_cache[k_cache_idx2] = __float2bfloat16(final_k2);
-            }
-        }
-        else
-        { // This is a V dimension
-            int v_idx = i - q_dim - k_dim;
-            // Write to v_out
-            v_out[batch_idx * v_dim + v_idx] = val;
-
-            // Write to value_cache
-            size_t v_cache_idx = (size_t)batch_idx * n_layers * seq_len * v_dim +
-                                 (size_t)layer_idx * seq_len * v_dim + (size_t)pos * v_dim + v_idx;
-            value_cache[v_cache_idx] = __float2bfloat16(val);
-        }
-    }
+    key_cache[cache_idx]   = k[1LL*batch_idx * kv_dim + dim_idx];
+    value_cache[cache_idx] = v[1LL*batch_idx * kv_dim + dim_idx];
 }
+
 
 // Stores the accumulator tile back to global memory and performs the fusion steps.
 template<bool Interior>
