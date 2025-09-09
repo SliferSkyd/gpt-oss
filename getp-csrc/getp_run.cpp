@@ -29,6 +29,15 @@
 #include <numeric>
 #include <queue>
 #include <vector>
+#include <chrono>
+
+#include <chrono>
+
+long long get_time_msec() {
+    auto now = std::chrono::high_resolution_clock::now();
+    auto duration = now.time_since_epoch();
+    return std::chrono::duration_cast<std::chrono::milliseconds>(duration).count();
+}
 #define THREAD_DEBUG
 
 #ifndef GETP_RUN
@@ -414,118 +423,140 @@ static inline uint8_t enc_fp4_e2m1_nearest(float x)
     return best;
 }
 
-// Stream FP32 -> MXFP4 (E2M1 packed nibbles + E8M0 scales) directly into GPU arrays.
-// - src_elems: total number of scalars
-// - dst_packed_dev: size = ceil(src_elems/2) bytes
-// - dst_scales_dev: size = ceil(src_elems/32) bytes
 static void streaming_quantize_copy_mxfp4_cpu_to_gpu(
-    const float *__restrict__ src,
+    const float* __restrict__ src,
     size_t src_elems,
-    uint8_t *__restrict__ dst_packed_dev,
-    uint8_t *__restrict__ dst_scales_dev,
-    hipStream_t stream)
+    uint8_t* __restrict__ dst_packed_dev,
+    uint8_t* __restrict__ dst_scales_dev,
+    hipStream_t /*unused_stream_ok*/)
 {
-    const size_t BLOCK = 32;
-    const size_t total_blocks = (src_elems + (BLOCK - 1)) / BLOCK;
+    if (src_elems == 0) return;
 
-    // Choose a safe chunk in blocks so we always stay aligned and small in memory.
-    // ~16k blocks -> 512k elems -> packed ~256KB, scales 16KB per chunk.
-    const size_t CHUNK_BLOCKS = 16384;
+    // Work in 32-sized blocks
+    const size_t TOTAL_BLOCKS = (src_elems + 31) / 32;
 
-    std::vector<uint8_t> h_packed;
-    std::vector<uint8_t> h_scales;
+    // Query free VRAM just to be polite, but keep small caps to avoid OOM/paging.
+    size_t free_b = 0, total_b = 0;
+    (void)hipMemGetInfo(&free_b, &total_b);
 
-    size_t elem_global_off = 0;
-    size_t byte_global_off = 0;
+    // ---- Tunables (MI250X-friendly) ----
+    // 128–256 MiB chunks usually win on big models + 2 GPUs.
+    const size_t CAP_HOST_STAGE_BYTES = (size_t)(256ULL << 20); // 256 MiB
+    const size_t CAP_DEV_STAGE_BYTES  = (size_t)(256ULL << 20); // 256 MiB
+    // Stay well below free to leave headroom for other allocations
+    const size_t DEV_LIMIT = (free_b > (size_t)(2ULL << 30)) ? (size_t)(free_b / 6) : (size_t)(128ULL << 20);
+    const size_t STAGE_BYTES = std::min({CAP_HOST_STAGE_BYTES, CAP_DEV_STAGE_BYTES, DEV_LIMIT});
 
-    for (size_t b0 = 0; b0 < total_blocks; b0 += CHUNK_BLOCKS)
+    // Compute block count per chunk
+    const size_t BYTES_PER_BLOCK = 32 * sizeof(float);
+    size_t chunk_blocks = STAGE_BYTES / BYTES_PER_BLOCK;
+    if (chunk_blocks == 0) chunk_blocks = 16384; // 2 MB minimum
+    if (chunk_blocks > TOTAL_BLOCKS) chunk_blocks = TOTAL_BLOCKS;
+    const size_t chunk_elems  = chunk_blocks * 32;
+    const size_t chunk_bytes  = chunk_elems * sizeof(float);
+
+    // ---- Streams & events ----
+    hipStream_t copy_stream, compute_stream;
+    HIP_CHECK(hipStreamCreateWithFlags(&copy_stream,    hipStreamNonBlocking));
+    HIP_CHECK(hipStreamCreateWithFlags(&compute_stream, hipStreamNonBlocking));
+
+    hipEvent_t copy_done[2], compute_done[2];
+    HIP_CHECK(hipEventCreateWithFlags(&copy_done[0],    hipEventDisableTiming));
+    HIP_CHECK(hipEventCreateWithFlags(&copy_done[1],    hipEventDisableTiming));
+    HIP_CHECK(hipEventCreateWithFlags(&compute_done[0], hipEventDisableTiming));
+    HIP_CHECK(hipEventCreateWithFlags(&compute_done[1], hipEventDisableTiming));
+
+    // ---- Host pinned staging (double buffer) ----
+    void*  h_stage_raw[2] = {nullptr, nullptr};
+    float* h_stage[2]     = {nullptr, nullptr};
+    HIP_CHECK(hipHostMalloc(&h_stage_raw[0], chunk_bytes, hipHostMallocPortable));
+    HIP_CHECK(hipHostMalloc(&h_stage_raw[1], chunk_bytes, hipHostMallocPortable));
+    h_stage[0] = reinterpret_cast<float*>(h_stage_raw[0]);
+    h_stage[1] = reinterpret_cast<float*>(h_stage_raw[1]);
+
+    // ---- Device staging (double buffer) ----
+    float* d_stage[2] = {nullptr, nullptr};
+    HIP_CHECK(hipMalloc((void**)&d_stage[0], chunk_bytes));
+    HIP_CHECK(hipMalloc((void**)&d_stage[1], chunk_bytes));
+
+    // Kernel launch config
+    constexpr int BLOCK_THREADS = 256;
+    constexpr int LANES = 32;
+    const int WPB = BLOCK_THREADS / LANES;
+    const size_t shmem_bytes = (size_t)WPB * (32 * sizeof(float) + 32 * sizeof(uint8_t)) + WPB * sizeof(int);
+
+    size_t blocks_done = 0;
+    int ping = 0;
+
+    // Preload first chunk to pinned host buffer (sync memcpy on host memory bus)
     {
-        const size_t b1 = std::min(b0 + CHUNK_BLOCKS, total_blocks);
-        const size_t blocks_in_chunk = (b1 - b0);
-        const size_t elems_in_chunk = blocks_in_chunk * BLOCK;
-        const size_t bytes_in_chunk = (elems_in_chunk + 1) / 2;
+        const size_t elem_off = 0;
+        const size_t this_elems = std::min(chunk_elems, src_elems - elem_off);
+        memcpy(h_stage[ping], src + elem_off, this_elems * sizeof(float));
+    }
 
-        h_packed.assign(bytes_in_chunk, 0);
-        h_scales.resize(blocks_in_chunk);
+    while (blocks_done < TOTAL_BLOCKS)
+    {
+        const size_t elem_off   = blocks_done * 32;
+        const size_t this_elems = std::min(chunk_elems, src_elems - elem_off);
+        const size_t this_blocks= (this_elems + 31) / 32;
+        const size_t this_bytes = this_elems * sizeof(float);
 
-        // Quantize this chunk
-        for (size_t bi = 0; bi < blocks_in_chunk; ++bi)
-        {
-            const size_t blk_id = b0 + bi;
-            const size_t begin = blk_id * BLOCK;
-            const size_t end = std::min(begin + BLOCK, src_elems);
+        // Start H2D for current ping buffer
+        HIP_CHECK(hipMemcpyAsync(d_stage[ping], h_stage[ping], this_bytes,
+                                 hipMemcpyHostToDevice, copy_stream));
+        HIP_CHECK(hipEventRecord(copy_done[ping], copy_stream));
 
-            // 1) maxabs over block
-            float maxabs = 0.f;
-            for (size_t i = begin; i < end; ++i)
-            {
-                float v = std::fabs(src[i]);
-                if (v > maxabs)
-                    maxabs = v;
-            }
-            uint8_t e8 = 0;
-            float X = 1.0f;
-            if (maxabs > 0.f)
-            {
-                int e = ilogbf(maxabs);             // exponent of maxabs
-                int e_max_pow2_fp4 = 2;             // largest pow2 in FP4(E2M1) is 2^2
-                int exp_scale = e - e_max_pow2_fp4; // X = 2^{exp_scale}
-                e8 = encode_e8m0_from_exp_host(exp_scale);
-                X = std::ldexp(1.0f, exp_scale);
-            }
-            else
-            {
-                e8 = encode_e8m0_from_exp_host(0);
-                X = 1.0f; // unused
-            }
-            h_scales[bi] = e8;
-
-            // 2) pack two nibbles per byte
-            const size_t byte_base = (bi * BLOCK) / 2;
-            for (size_t i = begin; i < end; i += 2)
-            {
-                uint8_t p0 = enc_fp4_e2m1_nearest(src[i] / X);
-                uint8_t p1 = 0;
-                if (i + 1 < end)
-                    p1 = enc_fp4_e2m1_nearest(src[i + 1] / X);
-                h_packed[byte_base + ((i - begin) >> 1)] = (uint8_t)((p1 << 4) | (p0 & 0xF));
-            }
-            // if tail (<32), the remaining packed bytes of this block are already zero
+        // While copy ping is in flight, prepare the NEXT chunk into the other host buffer (pong)
+        const int pong = ping ^ 1;
+        const size_t next_elem_off = elem_off + this_elems;
+        if (next_elem_off < src_elems) {
+            const size_t next_elems = std::min(chunk_elems, src_elems - next_elem_off);
+            // CPU memcpy to pinned host buffer (overlaps with SDMA H2D + prior compute)
+            memcpy(h_stage[pong], src + next_elem_off, next_elems * sizeof(float));
         }
 
-        // 3) memcpy chunk to GPU at correct offsets
-        // scales offset in bytes = block index
-        HIP_CHECK(hipMemcpyAsync(dst_scales_dev + b0,
-                                 h_scales.data(),
-                                 blocks_in_chunk * sizeof(uint8_t),
-                                 hipMemcpyHostToDevice, stream));
+        // Compute on ping after its H2D is done
+        HIP_CHECK(hipStreamWaitEvent(compute_stream, copy_done[ping], 0));
 
-        // packed offset in bytes = (b0*32)/2 = b0*16
-        const size_t byte_chunk_off = (b0 * BLOCK) >> 1;
-        HIP_CHECK(hipMemcpyAsync(dst_packed_dev + byte_chunk_off,
-                                 h_packed.data(),
-                                 bytes_in_chunk,
-                                 hipMemcpyHostToDevice, stream));
+        dim3 grid((unsigned)((this_blocks + WPB - 1) / WPB));
+        dim3 block(BLOCK_THREADS);
+
+        const size_t global_block0 = blocks_done;
+
+        hipLaunchKernelGGL((quantize_pack_mxfp4_block32_kernel<BLOCK_THREADS>),
+            grid, block, shmem_bytes, compute_stream,
+            d_stage[ping],
+            this_blocks,
+            global_block0,
+            dst_packed_dev,
+            dst_scales_dev,
+            src_elems);
+        HIP_CHECK(hipGetLastError());
+        HIP_CHECK(hipEventRecord(compute_done[ping], compute_stream));
+
+        // Flip buffers for next loop
+        blocks_done += this_blocks;
+        ping ^= 1;
+
+        // Ensure we don't overwrite buffers still in use (rare with two buffers, but safe)
+        HIP_CHECK(hipEventSynchronize(compute_done[ping]));
     }
 
-    HIP_CHECK(hipStreamSynchronize(stream));
+    HIP_CHECK(hipStreamSynchronize(copy_stream));
+    HIP_CHECK(hipStreamSynchronize(compute_stream));
 
-    // ---- one-line debug to compare orig vs dequantized from packed/scales ----
-    {
-        // Read back first scale byte and first packed byte (cheap)
-        uint8_t first_scale = 0, first_byte = 0;
-        HIP_CHECK(hipMemcpy(&first_scale, dst_scales_dev, 1, hipMemcpyDeviceToHost));
-        HIP_CHECK(hipMemcpy(&first_byte, dst_packed_dev, 1, hipMemcpyDeviceToHost));
-
-        const int exp_unbiased = (int)first_scale - 127;
-        const float X = std::ldexp(1.0f, exp_unbiased);
-        const uint8_t nib0 = (first_byte & 0x0F);
-        const float deq0 = MXFP4_LUT_CPU[nib0] * X;
-
-        const float orig0 = (src_elems > 0) ? src[0] : 0.0f;
-        // debug_print("[MXFP4 DBG] w[0] orig=%g deq=%g diff=%g (exp=%d nib=%u)\n",
-        //        orig0, deq0, (deq0 - orig0), exp_unbiased, (unsigned)nib0);
-    }
+    // Cleanup
+    HIP_CHECK(hipFree(d_stage[0]));
+    HIP_CHECK(hipFree(d_stage[1]));
+    HIP_CHECK(hipHostFree(h_stage_raw[0]));
+    HIP_CHECK(hipHostFree(h_stage_raw[1]));
+    HIP_CHECK(hipEventDestroy(copy_done[0]));
+    HIP_CHECK(hipEventDestroy(copy_done[1]));
+    HIP_CHECK(hipEventDestroy(compute_done[0]));
+    HIP_CHECK(hipEventDestroy(compute_done[1]));
+    HIP_CHECK(hipStreamDestroy(copy_stream));
+    HIP_CHECK(hipStreamDestroy(compute_stream));
 }
 
 void malloc_gpu_weights(GPUTransformerWeights *w, Config *p)
