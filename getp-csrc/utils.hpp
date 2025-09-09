@@ -6,6 +6,22 @@
 #include <sstream>
 #include <vector>
 #include <mutex>
+
+#include <iostream>
+
+#include <string>
+#include <cstdarg>
+
+void debug_print(const char* format, ...) {
+    static std::mutex print_mutex;
+    std::lock_guard<std::mutex> lock(print_mutex);
+    
+    va_list args;
+    va_start(args, format);
+    vprintf(format, args);
+    va_end(args);
+    fflush(stdout);
+}
 // HIP error checking macro
 #define HIP_CHECK(call)                                                                                 \
     do                                                                                                  \
