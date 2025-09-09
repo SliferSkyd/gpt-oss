@@ -40,6 +40,25 @@ __global__ void add_bias_kernel(float *output, const float *bias, int batch_size
         output[idx] += bias_fp32;
     }
 }
+__global__ void scale_bf16_kernel(__hip_bfloat16 *dst, const __hip_bfloat16 *src,
+                                  float s, size_t n)
+{
+  size_t i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= n) return;
+  float v = __bfloat162float(src[i]);
+  v *= s;
+  dst[i] = __float2bfloat16(v);
+}
+
+
+// Elementwise add for int arrays: dst[i] += src[i]
+__global__ void add_int_arrays_kernel(int* __restrict__ dst,
+                                      const int* __restrict__ src,
+                                      int n)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) dst[i] += src[i];
+}
 
 __global__ void copy_embeddings_kernel(float *output, const float *embeddings,
                                        const int *tokens, int batch_size, int hidden_dim)
@@ -113,4 +132,3 @@ __global__ void clear_kv_cache_for_slot_kernel(
         value_cache[base + d] = 0.0f;
     }
 }
-

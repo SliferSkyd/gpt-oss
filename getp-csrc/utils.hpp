@@ -17,6 +17,17 @@
             exit(EXIT_FAILURE);                                                                         \
         }                                                                                               \
     } while (0)
+    
+std::mutex debug_mutex;
+// Variadic macro hỗ trợ format như printf
+#define THREAD_DEBUG(fmt, ...) do { \
+    HIP_CHECK(hipDeviceSynchronize()); \
+    std::lock_guard<std::mutex> lock(debug_mutex); \
+    std::printf("[Thread %lu] " fmt, \
+                (unsigned long)(omp_get_thread_num()), \
+                ##__VA_ARGS__); \
+    std::fflush(stdout); \
+} while(0)
 
 // Float to bfloat16 conversion functions using library function
 void convert_float_array_to_bfloat16(const float *src, __hip_bfloat16 *dst, size_t count)
@@ -27,16 +38,19 @@ void convert_float_array_to_bfloat16(const float *src, __hip_bfloat16 *dst, size
     }
 }
 
-void debug(float *d_val, int size = 1)
+std::string debug(float *d_val, int size = 1)
 {
     float *h_val = (float *)malloc(size * sizeof(float));
     HIP_CHECK(hipDeviceSynchronize());
     HIP_CHECK(hipMemcpy(h_val, d_val, size * sizeof(float), hipMemcpyDeviceToHost));
+    std::stringstream ss;
+
     for (int i = 0; i < size; i++)
     {
-        fprintf(stderr, "Debug value %d: %f\n", i, h_val[i]);
+        ss << std::fixed << std::setprecision(6) << h_val[i] << " ";
     }
     free(h_val);
+    return ss.str();
 }
 
 //------------------------------------------------------------------------------//

@@ -133,7 +133,7 @@ __global__ void permute_expert_inputs_kernel(
     const float *d_t, const int *topk_i, const float *topk_v,
     const int *d_expert_offsets, int *d_expert_write_idx,
     int batch_size, int hidden_dim, int experts_per_token,
-    float *expert_input_buffer, int *expert_indices, float *expert_weights,
+    float *expert_input_buffer,
     // NEW: per-token stable mapping
     int *local_ids, float *local_wts)
 {
@@ -153,10 +153,6 @@ __global__ void permute_expert_inputs_kernel(
         const int local_idx  = atomicAdd(&d_expert_write_idx[expert_id], 1);
         const int compact_idx = d_expert_offsets[expert_id] + local_idx;
 
-        // Metadata for later scatter
-        expert_indices[compact_idx] = token_idx;
-        expert_weights[compact_idx] = topk_v[topk_flat_idx];
-
         // NEW: remember the exact compact slot for (token, k)
         local_ids[topk_flat_idx] = compact_idx;
         local_wts[topk_flat_idx] = topk_v[topk_flat_idx];
@@ -172,6 +168,95 @@ __global__ void permute_expert_inputs_kernel(
         for (int i = threadIdx.x; i < hidden_dim; i += blockDim.x) {
             dst[i] = src[i];
         }
+    }
+}
+
+__global__ void route_and_pack_fused_kernel(
+    const float*  __restrict__ x,              // [B, H]
+    int B, int H,
+    const int*    __restrict__ topk_i,         // [B, K]
+    const float*  __restrict__ topk_v,         // [B, K]
+    int K,
+    const int*    __restrict__ expert_offsets, // [E] (exclusive prefix)
+    int E,
+    int*          __restrict__ local_ids,      // [B, K] (out)
+    float*        __restrict__ local_wts,      // [B, K] (out)
+    float*        __restrict__ expert_in)      // [sum_tokens, H] (out)
+{
+    const int e = blockIdx.x;
+    if (e >= E) return;
+
+    const int T = blockDim.x;     // threads per block
+    const int tid = threadIdx.x;
+
+    extern __shared__ int smem[];
+    int* flags   = smem;          // [T]
+    int* excl    = flags + T;     // [T]  (inclusive scan buffer)
+    int* kidx    = excl  + T;     // [T]  (which k matched e, or -1)
+    int* toklist = kidx  + T;     // [T]  (selected token indices in this chunk)
+    int* cmplist = toklist + T;   // [T]  (their compact indices)
+
+    int carry = 0;                // how many tokens for expert e packed so far
+
+    // Process tokens in tiles of T to support B > T
+    for (int base = 0; base < B; base += T) {
+
+        // ---- 1) Flag tokens in this chunk and remember which k matched ----
+        int t_global = base + tid;
+        int f = 0, kk = -1;
+        if (t_global < B) {
+            const int off = t_global * K;
+            #pragma unroll
+            for (int i = 0; i < K; ++i) {
+                if (topk_i[off + i] == e) { f = 1; kk = i; break; }
+            }
+        }
+        flags[tid] = f;
+        kidx[tid]  = kk;
+        __syncthreads();
+
+        // ---- 2) Inclusive scan on flags (Hillis–Steele in-place) ----
+        excl[tid] = flags[tid];
+        __syncthreads();
+        for (int ofs = 1; ofs < T; ofs <<= 1) {
+            int v = (tid >= ofs) ? excl[tid - ofs] : 0;
+            __syncthreads();
+            excl[tid] += v;
+            __syncthreads();
+        }
+        const int rank_local   = (tid == 0) ? 0 : excl[tid - 1];   // exclusive rank within this chunk
+        const int chunk_total  = excl[T - 1];                      // total selected in this chunk
+
+        // ---- 3) For selected tokens: compute compact_idx, store lists, fill ids/wts ----
+        if (flags[tid]) {
+            const int compact_idx = expert_offsets[e] + carry + rank_local;
+            const int lid = t_global * K + kidx[tid];
+
+            // per-(b,k) mapping; exactly one expert block writes each entry
+            local_ids[lid] = compact_idx;
+            local_wts[lid] = topk_v[lid];
+
+            toklist[rank_local] = t_global;
+            cmplist[rank_local] = compact_idx;
+        }
+        __syncthreads();
+
+        // ---- 4) Cooperative copy of all rows selected in this chunk ----
+        // Every thread helps copy each row (good coalescing: i strides by T)
+        for (int j = 0; j < chunk_total; ++j) {
+            const int tkn = toklist[j];
+            const int cmp = cmplist[j];
+            const float* __restrict__ src = x + (size_t)tkn * H;
+            float*       __restrict__ dst = expert_in + (size_t)cmp * H;
+            for (int i = tid; i < H; i += T) {
+                dst[i] = src[i];
+            }
+        }
+        __syncthreads();
+
+        // ---- 5) Advance global carry for this expert ----
+        if (tid == 0) carry += chunk_total;
+        __syncthreads();
     }
 }
 
@@ -276,81 +361,6 @@ __global__ void count_tokens_per_expert_kernel(const int *topk_i, int *d_expert_
         int expert_id = topk_i[token_idx * experts_per_token + k];
         // This atomic is low-contention because updates are spread across n_experts counters
         atomicAdd(&d_expert_counts[expert_id], 1);
-    }
-}
-
-/**
- * @brief Stage 2: Gathers/permutes expert inputs into a compact buffer using a
- * block-per-token strategy for coalesced memory access.
- *
- * This kernel is the high-performance replacement for the original gather_expert_inputs_kernel.
- * It uses a full thread block to process each token, allowing the `hidden_dim` vector
- * to be copied in a fully parallel and coalesced manner.
- *
- * @param d_t The source hidden states (batch_size, hidden_dim).
- * @param topk_i The top-k expert indices for each token.
- * @param topk_v The top-k expert weights for each token.
- * @param d_expert_offsets The starting index for each expert in the compact buffer.
- * @param d_expert_write_idx A temporary counter for each expert to get a local index.
- * @param batch_size Total number of tokens.
- * @param hidden_dim Dimension of the hidden state.
- * @param experts_per_token The 'k' in top-k.
- * @param expert_input_buffer Destination compact buffer for hidden states.
- * @param expert_indices Destination buffer for original token indices for scattering.
- * @param expert_weights Destination buffer for router weights for scattering.
- */
-__global__ void permute_expert_inputs_kernel(const float *d_t, const int *topk_i, const float *topk_v,
-                                             const int *d_expert_offsets, int *d_expert_write_idx,
-                                             int batch_size, int hidden_dim, int experts_per_token,
-                                             float *expert_input_buffer, int *expert_indices, float *expert_weights)
-{
-    // Each BLOCK processes one token to enable parallel copying
-    int token_idx = blockIdx.x;
-    if (token_idx >= batch_size)
-    {
-        return;
-    }
-
-    // Use shared memory to communicate the calculated destination index to all threads in the block.
-    // Allocate enough space for all experts_per_token entries
-    extern __shared__ int destination_indices[];
-
-    // The first few threads handle the logic for each of the token's expert choices
-    if (threadIdx.x < experts_per_token)
-    {
-        int k = threadIdx.x;
-        int topk_flat_idx = token_idx * experts_per_token + k;
-        int expert_id = topk_i[topk_flat_idx];
-
-        // Atomically get the local write position within this expert's designated data block
-        int local_idx = atomicAdd(&d_expert_write_idx[expert_id], 1);
-
-        // Calculate the final destination index in the large compact buffer
-        int compact_idx = d_expert_offsets[expert_id] + local_idx;
-
-        // Store metadata needed for the later scatter step
-        expert_indices[compact_idx] = token_idx;
-        expert_weights[compact_idx] = topk_v[topk_flat_idx];
-
-        // Share the destination index with all threads in this block
-        destination_indices[k] = compact_idx;
-    }
-
-    // Synchronize to ensure destination_indices is visible to all threads in the block
-    __syncthreads();
-
-    // Now, all threads in the block cooperate to copy the hidden state for each expert choice.
-    // This loop ensures we handle all `experts_per_token` assignments for the current token.
-    for (int k = 0; k < experts_per_token; ++k)
-    {
-        const float *src = d_t + token_idx * hidden_dim;
-        float *dst = expert_input_buffer + destination_indices[k] * hidden_dim;
-
-        // This is the coalesced copy: each thread copies a different element of the hidden_dim vector
-        for (int i = threadIdx.x; i < hidden_dim; i += blockDim.x)
-        {
-            dst[i] = src[i];
-        }
     }
 }
 
