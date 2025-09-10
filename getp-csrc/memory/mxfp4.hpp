@@ -147,3 +147,82 @@ __global__ void quantize_pack_mxfp4_block32_kernel(
         dst_packed[byte_global] = (uint8_t)((hi << 4) | (lo & 0xF));
     }
 }
+
+
+template<int BLOCK_THREADS>
+__global__ void quantize_pack_mxfp4_from_hostmapped_rows_kernel(
+    const float* __restrict__ src_host_mapped, // device-visible pointer to HOST memory
+    size_t D,                                   // row pitch in elems (D)
+    size_t rows,                                // total rows = E * H
+    size_t row_len,                             // Kloc
+    uint8_t* __restrict__ dst_packed,           // final device: n/2 bytes
+    uint8_t* __restrict__ dst_scales,           // final device: n/32 bytes
+    size_t total_elems                           // rows * row_len
+){
+    constexpr int LANES = 32;
+    static_assert(BLOCK_THREADS % LANES == 0, "BLOCK_THREADS must be multiple of 32");
+    const int WPB = BLOCK_THREADS / LANES;
+
+    extern __shared__ __align__(16) unsigned char mxfp4_smem[];
+    float*   svals = reinterpret_cast<float*>(mxfp4_smem);
+    uint8_t* snibs = reinterpret_cast<uint8_t*>(svals + WPB * LANES);
+    int*     sexps = reinterpret_cast<int*>(snibs + WPB * LANES);
+
+    const int tid        = threadIdx.x;
+    const int warp_local = tid / LANES;
+    const int lane       = tid & (LANES - 1);
+
+    const size_t warp_id      = (size_t)blockIdx.x * (size_t)WPB + (size_t)warp_local; // 1 warp == 32 outputs
+    const size_t elem_block_0 = warp_id * (size_t)LANES; // first output index in this 32-pack
+
+    if (elem_block_0 >= total_elems) return;
+
+    // Load each lane's element from host-mapped memory (mostly contiguous; stride only at row boundary)
+    const size_t idx = elem_block_0 + (size_t)lane;
+    float v = 0.0f;
+    if (idx < total_elems) {
+        const size_t row = idx / row_len;          // 0..rows-1
+        const size_t col = idx - row * row_len;    // 0..row_len-1
+        v = src_host_mapped[row * D + col];
+    }
+
+    // Block-of-32 reduction in shared (wavefront=64 safe)
+    svals[warp_local * LANES + lane] = fabsf(v);
+    __syncthreads();
+
+    if (lane == 0) {
+        float maxabs = 0.f;
+        #pragma unroll
+        for (int i = 0; i < LANES; ++i) {
+            float a = svals[warp_local * LANES + i];
+            if (a > maxabs) maxabs = a;
+        }
+        int exp_scale = 0;
+        if (maxabs > 0.f) {
+            int e; frexpf(maxabs, &e);             // maxabs = m * 2^e, 0.5<=m<1
+            exp_scale = (e - 1) - 2;               // E2M1 largest pow2 is 2^2
+        }
+        sexps[warp_local] = exp_scale;
+        dst_scales[elem_block_0 >> 5] = encode_e8m0_from_exp_dev(exp_scale);
+    }
+    __syncthreads();
+
+    const int   exp_scale = sexps[warp_local];
+    const float X         = ldexpf(1.0f, exp_scale);
+
+    // Quantize each lane and stash nibble
+    uint8_t nib = 0;
+    if (idx < total_elems) {
+        nib = enc_fp4_e2m1_nearest_dev(v / X);
+    }
+    snibs[warp_local * LANES + lane] = nib;
+    __syncthreads();
+
+    // Pack two nibbles per byte (even lanes write)
+    if ((lane & 1) == 0) {
+        const uint8_t lo = snibs[warp_local * LANES + lane];
+        const uint8_t hi = (idx + 1 < total_elems) ? snibs[warp_local * LANES + lane + 1] : 0;
+        const size_t byte_index = (elem_block_0 + (size_t)lane) >> 1;
+        dst_packed[byte_index] = (uint8_t)((hi << 4) | (lo & 0xF));
+    }
+}

@@ -31,6 +31,14 @@
 #include <vector>
 #include "nccl.hpp" // <— NCCL/RCCL-free TP collectives/helpers
 
+#include <chrono>
+
+long long get_time_msec() {
+    auto now = std::chrono::high_resolution_clock::now();
+    auto duration = now.time_since_epoch();
+    return std::chrono::duration_cast<std::chrono::milliseconds>(duration).count();
+}
+
 #ifndef GETP_RUN
 #define GETP_RUN
 
@@ -533,6 +541,7 @@ static void streaming_quantize_copy_mxfp4_cpu_to_gpu(
 
     while (blocks_done < TOTAL_BLOCKS)
     {
+        double start_time = get_time_msec();
         const size_t elem_off   = blocks_done * 32;
         const size_t this_elems = std::min(chunk_elems, src_elems - elem_off);
         const size_t this_blocks= (this_elems + 31) / 32;
@@ -577,6 +586,15 @@ static void streaming_quantize_copy_mxfp4_cpu_to_gpu(
 
         // Ensure we don't overwrite buffers still in use (rare with two buffers, but safe)
         HIP_CHECK(hipEventSynchronize(compute_done[ping]));
+
+        double end_time = get_time_msec();
+        // Print time for this chunk (mostly H2D + kernel) and effective GB/s
+        double dt = end_time - start_time;
+        double gb = (double)this_bytes / (1024.0 * 1024.0 * 1024.0);
+        printf("[streaming quantize] chunk %5zu blocks, %6.2f ms, %5.2f GB/s\n",
+               this_blocks, dt, gb / (dt * 0.001));
+        
+        fflush(stdout);
     }
 
     HIP_CHECK(hipStreamSynchronize(copy_stream));
@@ -595,307 +613,494 @@ static void streaming_quantize_copy_mxfp4_cpu_to_gpu(
     HIP_CHECK(hipStreamDestroy(compute_stream));
 }
 
+// Packs `rows` segments from pageable host into pinned tiles, each segment has
+// length `row_len` (floats) and starts every `row_stride` floats.
+// Then H2D to device staging and launches the MXFP4 quantizer per tile.
+//
+// Dest arrays are the *final* device buffers (packed nibbles & e8m0 scales).
+static void streaming_quantize_copy_mxfp4_cpu_to_gpu_strided(
+    const float* __restrict__ src_base, // host (pageable is OK)
+    size_t rows,                        // number of gathered segments
+    size_t row_stride,                  // distance (in floats) between starts
+    size_t row_len,                     // length (in floats) of each segment
+    uint8_t* __restrict__ dst_packed_dev,   // device final
+    uint8_t* __restrict__ dst_scales_dev,   // device final
+    hipStream_t /*unused_stream_ok*/ = nullptr)
+{
+    if (rows == 0 || row_len == 0) return;
+
+    const size_t shard_elems = rows * row_len;
+
+    // --- Heuristics for tile size ---
+    size_t free_b = 0, total_b = 0;
+    (void)hipMemGetInfo(&free_b, &total_b);
+
+    const size_t CAP_HOST_STAGE_BYTES = (size_t)(512ULL << 20); // 512 MiB
+    const size_t CAP_DEV_STAGE_BYTES  = (size_t)(512ULL << 20);
+    const size_t DEV_LIMIT            = (free_b > (size_t)(4ULL << 30)) ? (size_t)(free_b / 4)
+                                   : (size_t)(256ULL << 20);
+    const size_t STAGE_BYTES = std::min({CAP_HOST_STAGE_BYTES, CAP_DEV_STAGE_BYTES, DEV_LIMIT});
+
+    const size_t BYTES_PER_ROW = row_len * sizeof(float);
+    size_t tile_rows = STAGE_BYTES / BYTES_PER_ROW;
+    if (tile_rows == 0) tile_rows = 2048 / std::max<size_t>(row_len, 1); // small minimum
+    if (tile_rows > rows) tile_rows = rows;
+
+    const size_t tile_elems = tile_rows * row_len;
+    const size_t tile_bytes = tile_elems * sizeof(float);
+
+    // Streams & events
+    hipStream_t s_copy, s_comp;
+    HIP_CHECK(hipStreamCreateWithFlags(&s_copy, hipStreamNonBlocking));
+    HIP_CHECK(hipStreamCreateWithFlags(&s_comp, hipStreamNonBlocking));
+    hipEvent_t e_copy[2], e_comp[2];
+    HIP_CHECK(hipEventCreateWithFlags(&e_copy[0], hipEventDisableTiming));
+    HIP_CHECK(hipEventCreateWithFlags(&e_copy[1], hipEventDisableTiming));
+    HIP_CHECK(hipEventCreateWithFlags(&e_comp[0], hipEventDisableTiming));
+    HIP_CHECK(hipEventCreateWithFlags(&e_comp[1], hipEventDisableTiming));
+
+    // Host pinned & device staging (double buffer)
+    void*  h_stage_raw[2] = {nullptr, nullptr};
+    float* h_stage[2]     = {nullptr, nullptr};
+    HIP_CHECK(hipHostMalloc(&h_stage_raw[0], tile_bytes, hipHostMallocPortable));
+    HIP_CHECK(hipHostMalloc(&h_stage_raw[1], tile_bytes, hipHostMallocPortable));
+    h_stage[0] = reinterpret_cast<float*>(h_stage_raw[0]);
+    h_stage[1] = reinterpret_cast<float*>(h_stage_raw[1]);
+
+    float* d_stage[2] = {nullptr, nullptr};
+    HIP_CHECK(hipMalloc((void**)&d_stage[0], tile_bytes));
+    HIP_CHECK(hipMalloc((void**)&d_stage[1], tile_bytes));
+
+    // Quant kernel config (logical 32-lane warps)
+    constexpr int BLOCK_THREADS = 512; // higher occupancy on CDNA/MI-series
+    constexpr int LANES = 32;
+    const int WPB = BLOCK_THREADS / LANES;
+    const size_t shmem_bytes =
+        (size_t)WPB * (32 * sizeof(float) + 32 * sizeof(uint8_t)) + WPB * sizeof(int);
+
+    size_t rows_done = 0;
+    size_t blocks_done = 0; // in 32-elem blocks within this shard
+    int ping = 0;
+
+    auto pack_rows_to_pinned = [&](float* dst, const float* base, size_t start_row, size_t n_rows) {
+        const float* src = base + start_row * row_stride;
+        for (size_t r = 0; r < n_rows; ++r) {
+            memcpy(dst + r * row_len, src + r * row_stride, row_len * sizeof(float));
+        }
+    };
+
+    // Prepack first tile
+    pack_rows_to_pinned(h_stage[ping], src_base, /*start_row=*/0, /*n_rows=*/std::min(tile_rows, rows));
+
+    while (rows_done < rows) {
+        const size_t this_rows   = std::min(tile_rows, rows - rows_done);
+        const size_t this_elems  = this_rows * row_len;
+        const size_t this_bytes  = this_elems * sizeof(float);
+        const size_t this_blocks = (this_elems + 31) / 32;
+
+        // H2D
+        HIP_CHECK(hipMemcpyAsync(d_stage[ping], h_stage[ping], this_bytes,
+                                 hipMemcpyHostToDevice, s_copy));
+        HIP_CHECK(hipEventRecord(e_copy[ping], s_copy));
+
+        // Prepare next tile in host while copy+compute overlap
+        const int pong = ping ^ 1;
+        const size_t next_rows_off = rows_done + this_rows;
+        if (next_rows_off < rows) {
+            const size_t next_rows = std::min(tile_rows, rows - next_rows_off);
+            pack_rows_to_pinned(h_stage[pong], src_base, next_rows_off, next_rows);
+        }
+
+        // Compute after H2D
+        HIP_CHECK(hipStreamWaitEvent(s_comp, e_copy[ping], 0));
+        dim3 grid((unsigned)((this_blocks + WPB - 1) / WPB));
+        dim3 block(BLOCK_THREADS);
+
+        const size_t global_block0 = blocks_done; // offset within THIS shard
+
+        hipLaunchKernelGGL((quantize_pack_mxfp4_block32_kernel<BLOCK_THREADS>),
+            grid, block, shmem_bytes, s_comp,
+            d_stage[ping],
+            this_blocks,
+            global_block0,
+            dst_packed_dev,
+            dst_scales_dev,
+            shard_elems);
+        HIP_CHECK(hipGetLastError());
+        HIP_CHECK(hipEventRecord(e_comp[ping], s_comp));
+
+        rows_done   += this_rows;
+        blocks_done += this_blocks;
+        ping ^= 1;
+
+        // Ensure we don't overwrite buffers still in use
+        HIP_CHECK(hipEventSynchronize(e_comp[ping]));
+    }
+
+    HIP_CHECK(hipStreamSynchronize(s_copy));
+    HIP_CHECK(hipStreamSynchronize(s_comp));
+
+    // Cleanup
+    HIP_CHECK(hipFree(d_stage[0]));
+    HIP_CHECK(hipFree(d_stage[1]));
+    HIP_CHECK(hipHostFree(h_stage_raw[0]));
+    HIP_CHECK(hipHostFree(h_stage_raw[1]));
+    HIP_CHECK(hipEventDestroy(e_copy[0]));
+    HIP_CHECK(hipEventDestroy(e_copy[1]));
+    HIP_CHECK(hipEventDestroy(e_comp[0]));
+    HIP_CHECK(hipEventDestroy(e_comp[1]));
+    HIP_CHECK(hipStreamDestroy(s_copy));
+    HIP_CHECK(hipStreamDestroy(s_comp));
+}
+
+static void mxfp4_copy_quantize_host2d_tiled(
+    const float* __restrict__ src_base_host,
+    size_t width_elems,            // contiguous elems per row to copy
+    size_t height_rows,            // number of rows (tiled on Y)
+    size_t src_pitch_elems,        // distance between starts of rows in source (in elems)
+    uint8_t* __restrict__ dst_packed_dev,   // final device packed buffer (layer-base)
+    uint8_t* __restrict__ dst_scales_dev,   // final device scales buffer (layer-base)
+    size_t   shard_total_elems)              // total elems in this layer's shard
+{
+    if (width_elems == 0 || height_rows == 0) return;
+
+    size_t free_b = 0, total_b = 0;
+    (void)hipMemGetInfo(&free_b, &total_b);
+
+    // ~512 MiB tiles by default (back off a bit if VRAM is tight)
+    const size_t CAP_TILE_BYTES = (size_t)(512ULL << 20);
+    const size_t DEV_LIMIT      = (free_b > (size_t)(4ULL << 30)) ? (size_t)(free_b / 4)
+                                                                  : (size_t)(256ULL << 20);
+    const size_t STAGE_BYTES    = std::min(CAP_TILE_BYTES, DEV_LIMIT);
+
+    const size_t width_bytes = width_elems * sizeof(float);
+    size_t tile_rows = STAGE_BYTES / width_bytes;
+    if (tile_rows == 0) tile_rows = 1;
+    if (tile_rows > height_rows) tile_rows = height_rows;
+
+    const size_t tile_bytes = tile_rows * width_bytes;
+
+    // Streams / events
+    hipStream_t s_copy, s_comp;
+    HIP_CHECK(hipStreamCreateWithFlags(&s_copy, hipStreamNonBlocking));
+    HIP_CHECK(hipStreamCreateWithFlags(&s_comp, hipStreamNonBlocking));
+    hipEvent_t e_copy[2], e_comp[2];
+    HIP_CHECK(hipEventCreateWithFlags(&e_copy[0], hipEventDisableTiming));
+    HIP_CHECK(hipEventCreateWithFlags(&e_copy[1], hipEventDisableTiming));
+    HIP_CHECK(hipEventCreateWithFlags(&e_comp[0], hipEventDisableTiming));
+    HIP_CHECK(hipEventCreateWithFlags(&e_comp[1], hipEventDisableTiming));
+
+    // Device staging (double buffer)
+    float* d_stage[2] = {nullptr, nullptr};
+    HIP_CHECK(hipMalloc((void**)&d_stage[0], tile_bytes));
+    HIP_CHECK(hipMalloc((void**)&d_stage[1], tile_bytes));
+
+    // Kernel config (small shmem, high occupancy)
+    constexpr int BLOCK_THREADS = 1024; // multiple of 32
+    constexpr int LANES = 32;
+    const int WPB = BLOCK_THREADS / LANES;
+    const size_t shmem_bytes =
+        (size_t)WPB * (32 * sizeof(float) + 32 * sizeof(uint8_t)) + WPB * sizeof(int);
+
+    size_t rows_done   = 0;
+    size_t elems_done  = 0; // offset inside this layer shard
+    int ping = 0;
+
+    while (rows_done < height_rows) {
+        const size_t this_rows  = std::min(tile_rows, height_rows - rows_done);
+        const size_t this_elems = this_rows * width_elems;
+        const size_t this_bytes = this_elems * sizeof(float);
+        const size_t this_blocks= (this_elems + 31) / 32;
+
+        // 2D H2D: host -> device staging
+        const char* src_ptr = reinterpret_cast<const char*>(src_base_host + rows_done * src_pitch_elems);
+        HIP_CHECK(hipMemcpy2DAsync(
+            /*dst=*/ d_stage[ping], /*dpitch=*/ width_bytes,
+            /*src=*/ src_ptr,       /*spitch=*/ src_pitch_elems * sizeof(float),
+            /*width=*/ width_bytes, /*height=*/ this_rows,
+            hipMemcpyHostToDevice, s_copy));
+        HIP_CHECK(hipEventRecord(e_copy[ping], s_copy));
+
+        // Compute after copy
+        HIP_CHECK(hipStreamWaitEvent(s_comp, e_copy[ping], 0));
+        const size_t global_block0 = elems_done / 32;
+
+        dim3 grid((unsigned)((this_blocks + WPB - 1) / WPB));
+        dim3 block(BLOCK_THREADS);
+
+        hipLaunchKernelGGL((quantize_pack_mxfp4_block32_kernel<BLOCK_THREADS>),
+            grid, block, shmem_bytes, s_comp,
+            d_stage[ping],
+            this_blocks,            // chunk_blocks
+            global_block0,          // global block offset within this layer shard
+            dst_packed_dev,         // final packed base for this layer
+            dst_scales_dev,         // final scales base for this layer
+            shard_total_elems);     // used for tail-safe loads
+        HIP_CHECK(hipGetLastError());
+        HIP_CHECK(hipEventRecord(e_comp[ping], s_comp));
+
+        rows_done  += this_rows;
+        elems_done += this_elems;
+        ping ^= 1;
+
+        // Make sure we don't overwrite buffers still in use
+        HIP_CHECK(hipEventSynchronize(e_comp[ping]));
+    }
+
+    HIP_CHECK(hipStreamSynchronize(s_copy));
+    HIP_CHECK(hipStreamSynchronize(s_comp));
+
+    HIP_CHECK(hipFree(d_stage[0]));
+    HIP_CHECK(hipFree(d_stage[1]));
+    HIP_CHECK(hipEventDestroy(e_copy[0]));
+    HIP_CHECK(hipEventDestroy(e_copy[1]));
+    HIP_CHECK(hipEventDestroy(e_comp[0]));
+    HIP_CHECK(hipEventDestroy(e_comp[1]));
+    HIP_CHECK(hipStreamDestroy(s_copy));
+    HIP_CHECK(hipStreamDestroy(s_comp));
+}
+
+
 
 void copy_weights_to_gpu(Transformer *transformer, GPUTransformerWeights *gpu_weights)
 {
     Config *p = &transformer->config;
     TransformerWeights *w = &transformer->weights;
-    const float invTP = 1.0f / (float)TENSOR_PARALLEL_SIZE;
+    const int TP = TENSOR_PARALLEL_SIZE;
+    const float invTP = 1.0f / (float)TP;
 
-    // Initialize LUT constant memory on device (for any device-side use)
+    // LUT for device decodes (keep resident)
     init_mxfp4_lut_on_device();
 
-    // Embeddings
+    // ===== Embeddings =====
     {
         size_t embedding_size = (size_t)p->vocab_size * p->hidden_dim;
         HIP_CHECK(hipMemcpy(gpu_weights->token_embedding_table, w->token_embedding_table,
                             embedding_size * sizeof(float), hipMemcpyHostToDevice));
     }
 
-    // Norms
+    // ===== Norms (BF16) =====
     {
-        size_t rms_attn_size = p->n_layers * p->hidden_dim;
-        __hip_bfloat16 *h_rms_attn_bf16 = (__hip_bfloat16 *)malloc(rms_attn_size * sizeof(__hip_bfloat16));
-        convert_float_array_to_bfloat16(w->rms_attn_w, h_rms_attn_bf16, rms_attn_size);
-        HIP_CHECK(hipMemcpy(gpu_weights->rms_attn_w, h_rms_attn_bf16, rms_attn_size * sizeof(__hip_bfloat16), hipMemcpyHostToDevice));
-        free(h_rms_attn_bf16);
+        size_t n = (size_t)p->n_layers * p->hidden_dim;
+        __hip_bfloat16 *tmp = (__hip_bfloat16 *)malloc(n * sizeof(__hip_bfloat16));
+        convert_float_array_to_bfloat16(w->rms_attn_w, tmp, n);
+        HIP_CHECK(hipMemcpy(gpu_weights->rms_attn_w, tmp, n * sizeof(__hip_bfloat16), hipMemcpyHostToDevice));
+        convert_float_array_to_bfloat16(w->rms_ffn_w, tmp, n);
+        HIP_CHECK(hipMemcpy(gpu_weights->rms_ffn_w, tmp, n * sizeof(__hip_bfloat16), hipMemcpyHostToDevice));
+        free(tmp);
 
-        size_t rms_ffn_size = p->n_layers * p->hidden_dim;
-        __hip_bfloat16 *h_rms_ffn_bf16 = (__hip_bfloat16 *)malloc(rms_ffn_size * sizeof(__hip_bfloat16));
-        convert_float_array_to_bfloat16(w->rms_ffn_w, h_rms_ffn_bf16, rms_ffn_size);
-        HIP_CHECK(hipMemcpy(gpu_weights->rms_ffn_w, h_rms_ffn_bf16, rms_ffn_size * sizeof(__hip_bfloat16), hipMemcpyHostToDevice));
-        free(h_rms_ffn_bf16);
-
-        size_t rms_out_size = p->hidden_dim;
-        __hip_bfloat16 *h_rms_out_bf16 = (__hip_bfloat16 *)malloc(rms_out_size * sizeof(__hip_bfloat16));
-        convert_float_array_to_bfloat16(w->rms_out_w, h_rms_out_bf16, rms_out_size);
-        HIP_CHECK(hipMemcpy(gpu_weights->rms_out_w, h_rms_out_bf16, rms_out_size * sizeof(__hip_bfloat16), hipMemcpyHostToDevice));
-        free(h_rms_out_bf16);
+        __hip_bfloat16 *tmp_out = (__hip_bfloat16 *)malloc(p->hidden_dim * sizeof(__hip_bfloat16));
+        convert_float_array_to_bfloat16(w->rms_out_w, tmp_out, p->hidden_dim);
+        HIP_CHECK(hipMemcpy(gpu_weights->rms_out_w, tmp_out, p->hidden_dim * sizeof(__hip_bfloat16), hipMemcpyHostToDevice));
+        free(tmp_out);
     }
 
-    // Attention weights
+    // ===== Attention (BF16) =====
     {
-        size_t qkv_size = p->n_layers * p->hidden_dim * (p->n_attn_heads + 2 * p->n_kv_heads) * p->head_dim;
-        __hip_bfloat16 *h_w_qkv_bf16 = (__hip_bfloat16 *)malloc(qkv_size * sizeof(__hip_bfloat16));
-        convert_float_array_to_bfloat16(w->w_qkv, h_w_qkv_bf16, qkv_size);
-        HIP_CHECK(hipMemcpy(gpu_weights->w_qkv, h_w_qkv_bf16, qkv_size * sizeof(__hip_bfloat16), hipMemcpyHostToDevice));
-        free(h_w_qkv_bf16);
+        size_t qkv_size = (size_t)p->n_layers * p->hidden_dim *
+                          (p->n_attn_heads + 2 * p->n_kv_heads) * p->head_dim;
+        __hip_bfloat16 *tq = (__hip_bfloat16 *)malloc(qkv_size * sizeof(__hip_bfloat16));
+        convert_float_array_to_bfloat16(w->w_qkv, tq, qkv_size);
+        HIP_CHECK(hipMemcpy(gpu_weights->w_qkv, tq, qkv_size * sizeof(__hip_bfloat16), hipMemcpyHostToDevice));
+        free(tq);
 
-        size_t b_qkv_size = p->n_layers * (p->n_attn_heads + 2 * p->n_kv_heads) * p->head_dim;
-        __hip_bfloat16 *h_b_qkv_bf16 = (__hip_bfloat16 *)malloc(b_qkv_size * sizeof(__hip_bfloat16));
-        convert_float_array_to_bfloat16(w->b_qkv, h_b_qkv_bf16, b_qkv_size);
-        HIP_CHECK(hipMemcpy(gpu_weights->b_qkv, h_b_qkv_bf16, b_qkv_size * sizeof(__hip_bfloat16), hipMemcpyHostToDevice));
-        free(h_b_qkv_bf16);
+        size_t bqkv = (size_t)p->n_layers * (p->n_attn_heads + 2 * p->n_kv_heads) * p->head_dim;
+        __hip_bfloat16 *tbq = (__hip_bfloat16 *)malloc(bqkv * sizeof(__hip_bfloat16));
+        convert_float_array_to_bfloat16(w->b_qkv, tbq, bqkv);
+        HIP_CHECK(hipMemcpy(gpu_weights->b_qkv, tbq, bqkv * sizeof(__hip_bfloat16), hipMemcpyHostToDevice));
+        free(tbq);
 
-        size_t attn_out_size = p->n_layers * (p->n_attn_heads * p->head_dim) * p->hidden_dim;
-        __hip_bfloat16 *h_w_o_bf16 = (__hip_bfloat16 *)malloc(attn_out_size * sizeof(__hip_bfloat16));
-        convert_float_array_to_bfloat16(w->w_o, h_w_o_bf16, attn_out_size);
-        HIP_CHECK(hipMemcpy(gpu_weights->w_o, h_w_o_bf16, attn_out_size * sizeof(__hip_bfloat16), hipMemcpyHostToDevice));
-        free(h_w_o_bf16);
+        size_t wo = (size_t)p->n_layers * (size_t)(p->n_attn_heads * p->head_dim) * p->hidden_dim;
+        __hip_bfloat16 *two = (__hip_bfloat16 *)malloc(wo * sizeof(__hip_bfloat16));
+        convert_float_array_to_bfloat16(w->w_o, two, wo);
+        HIP_CHECK(hipMemcpy(gpu_weights->w_o, two, wo * sizeof(__hip_bfloat16), hipMemcpyHostToDevice));
+        free(two);
 
-        size_t b_o_size = p->n_layers * p->hidden_dim;
-        __hip_bfloat16 *h_b_o_bf16 = (__hip_bfloat16 *)malloc(b_o_size * sizeof(__hip_bfloat16));
-        convert_float_array_to_bfloat16(w->b_o, h_b_o_bf16, b_o_size);
-        HIP_CHECK(hipMemcpy(gpu_weights->b_o, h_b_o_bf16, b_o_size * sizeof(__hip_bfloat16), hipMemcpyHostToDevice));
-        free(h_b_o_bf16);
+        size_t bo = (size_t)p->n_layers * p->hidden_dim;
+        __hip_bfloat16 *tbo = (__hip_bfloat16 *)malloc(bo * sizeof(__hip_bfloat16));
+        convert_float_array_to_bfloat16(w->b_o, tbo, bo);
+        HIP_CHECK(hipMemcpy(gpu_weights->b_o, tbo, bo * sizeof(__hip_bfloat16), hipMemcpyHostToDevice));
+        free(tbo);
     }
 
-    // Attention sinks
+    // ===== Router + sinks (BF16) =====
     {
-        size_t attn_sinks_size = p->n_layers * p->n_attn_heads;
-        __hip_bfloat16 *h_attn_sinks_bf16 = (__hip_bfloat16 *)malloc(attn_sinks_size * sizeof(__hip_bfloat16));
-        convert_float_array_to_bfloat16(w->attn_sinks, h_attn_sinks_bf16, attn_sinks_size);
-        HIP_CHECK(hipMemcpy(gpu_weights->attn_sinks, h_attn_sinks_bf16, attn_sinks_size * sizeof(__hip_bfloat16), hipMemcpyHostToDevice));
-        free(h_attn_sinks_bf16);
+        size_t wr = (size_t)p->n_layers * p->hidden_dim * p->n_experts;
+        __hip_bfloat16 *twr = (__hip_bfloat16 *)malloc(wr * sizeof(__hip_bfloat16));
+        convert_float_array_to_bfloat16(w->w_router, twr, wr);
+        HIP_CHECK(hipMemcpy(gpu_weights->w_router, twr, wr * sizeof(__hip_bfloat16), hipMemcpyHostToDevice));
+        free(twr);
+
+        size_t br = (size_t)p->n_layers * p->n_experts;
+        __hip_bfloat16 *tbr = (__hip_bfloat16 *)malloc(br * sizeof(__hip_bfloat16));
+        convert_float_array_to_bfloat16(w->b_router, tbr, br);
+        HIP_CHECK(hipMemcpy(gpu_weights->b_router, tbr, br * sizeof(__hip_bfloat16), hipMemcpyHostToDevice));
+        free(tbr);
+
+        size_t sinks = (size_t)p->n_layers * p->n_attn_heads;
+        __hip_bfloat16 *ts = (__hip_bfloat16 *)malloc(sinks * sizeof(__hip_bfloat16));
+        convert_float_array_to_bfloat16(w->attn_sinks, ts, sinks);
+        HIP_CHECK(hipMemcpy(gpu_weights->attn_sinks, ts, sinks * sizeof(__hip_bfloat16), hipMemcpyHostToDevice));
+        free(ts);
     }
 
-    // Router
+    // ===== Figure out TP shard geometry =====
+    int dev = 0; HIP_CHECK(hipGetDevice(&dev));
+    const int rank = dev % TP;
+
+    const int H = p->hidden_dim;
+    const int D = p->intermediate_dim;
+    const int E = p->n_experts;
+    const int L = p->n_layers;
+
+    int Oloc, Ostart; // MLP1 (2D split)
     {
-        size_t w_router_size = (size_t)p->n_layers * p->hidden_dim * p->n_experts;
-        __hip_bfloat16 *h_w_router_bf16 = (__hip_bfloat16 *)malloc(w_router_size * sizeof(__hip_bfloat16));
-        convert_float_array_to_bfloat16(w->w_router, h_w_router_bf16, w_router_size);
-        HIP_CHECK(hipMemcpy(gpu_weights->w_router, h_w_router_bf16,
-                            w_router_size * sizeof(__hip_bfloat16), hipMemcpyHostToDevice));
-        free(h_w_router_bf16);
-
-        size_t b_router_size = (size_t)p->n_layers * p->n_experts;
-        __hip_bfloat16 *h_b_router_bf16 = (__hip_bfloat16 *)malloc(b_router_size * sizeof(__hip_bfloat16));
-        convert_float_array_to_bfloat16(w->b_router, h_b_router_bf16, b_router_size);
-        HIP_CHECK(hipMemcpy(gpu_weights->b_router, h_b_router_bf16,
-                            b_router_size * sizeof(__hip_bfloat16), hipMemcpyHostToDevice));
-        free(h_b_router_bf16);
-    }
-
-    // ============ MLP1/2 sharded copies with MXFP4 quantization ============
-    {
-        const int TP = TENSOR_PARALLEL_SIZE;
-        int dev = 0;
-        HIP_CHECK(hipGetDevice(&dev));
-        const int group_base = (dev / TP) * TP;
-        const int rank_in_group = dev - group_base;
-
-        const int H = p->hidden_dim;
-        const int D = p->intermediate_dim;
-        const int E = p->n_experts;
         const int twoD = 2 * D;
-
-        // Shard geometry
-        int Oloc, Ostart;
-        {
-            const int base = twoD / TP;
-            const int rem = twoD % TP;
-            Oloc = base + (rank_in_group < rem ? 1 : 0);
-            Ostart = rank_in_group * base + (rank_in_group < rem ? rank_in_group : rem);
-        }
-        int Kloc, Istart;
-        {
-            const int base = D / TP;
-            const int rem = D % TP;
-            Kloc = base + (rank_in_group < rem ? 1 : 0);
-            Istart = rank_in_group * base + (rank_in_group < rem ? rank_in_group : rem);
-        }
-
-        // Small host float staging buffers for building the local contiguous shards
-        const size_t max_w_stage_elems = std::max((size_t)Oloc * (size_t)H, (size_t)H * (size_t)Kloc);
-        float *staging_f = nullptr;
-        HIP_CHECK(hipHostMalloc((void **)&staging_f, max_w_stage_elems * sizeof(float)));
-
-        // ----- convenience strides for device shards -----
-        const size_t seg1_loc_elems = (size_t)Oloc * (size_t)H; // per-expert MLP1 shard elements
-        const size_t seg2_loc_elems = (size_t)H * (size_t)Kloc; // per-expert MLP2 shard elements
-
-        const size_t seg1_loc_packed = (seg1_loc_elems + 1) / 2;
-        const size_t seg2_loc_packed = (seg2_loc_elems + 1) / 2;
-        const size_t seg1_loc_scales = (seg1_loc_elems + 31) / 32;
-        const size_t seg2_loc_scales = (seg2_loc_elems + 31) / 32;
-
-        // ------------------ pack & copy MLP1 weight shard -> MXFP4 ------------------
-        // Source layout (CPU full): [L, E, 2D, H] row-major by (O, then H)
-        // Dest layout (GPU shard, MXFP4):  [L, E, Oloc, H] as nibbles + e8m0 scales
-        {
-            const size_t seg1_full = (size_t)(2 * D) * (size_t)H; // CPU per-expert stride
-            size_t packed_off = 0, scale_off = 0;
-
-            for (int L = 0; L < p->n_layers; ++L)
-            {
-                for (int e = 0; e < E; ++e)
-                {
-                    const float *base = w->w_mlp1 + (size_t)L * E * seg1_full + (size_t)e * seg1_full;
-
-                    // Build local contiguous [Oloc, H] into staging_f
-                    for (int o = 0; o < Oloc; ++o)
-                    {
-                        const float *row_f = base + (size_t)(Ostart + o) * (size_t)H;
-                        float *row_dst = staging_f + (size_t)o * (size_t)H;
-                        memcpy(row_dst, row_f, (size_t)H * sizeof(float));
-                    }
-
-                    // Quantize & copy directly into final device shard buffers
-                    streaming_quantize_copy_mxfp4_cpu_to_gpu(
-                        staging_f, seg1_loc_elems,
-                        gpu_weights->w_mlp1_mxfp4 + packed_off,
-                        gpu_weights->w_mlp1_scales + scale_off,
-                        /*unused_stream_ok*/ nullptr);
-
-                    packed_off += seg1_loc_packed;
-                    scale_off  += seg1_loc_scales;
-                }
-            }
-
-            // ----- Debug: compare first element (L=0,e=0,o=0,h=0) -----
-            {
-                // Original CPU value
-                const float cpu_v0 = *(w->w_mlp1 + /*L=0,e=0*/ 0 + (size_t)Ostart * (size_t)H + 0);
-
-                // Pull first packed byte & first scale from device
-                uint8_t h_byte = 0, h_scale = 127;
-                HIP_CHECK(hipMemcpy(&h_byte,  gpu_weights->w_mlp1_mxfp4, 1, hipMemcpyDeviceToHost));
-                HIP_CHECK(hipMemcpy(&h_scale, gpu_weights->w_mlp1_scales, 1, hipMemcpyDeviceToHost));
-
-                const uint8_t nib0 = (h_byte & 0x0F);         // first element is low nibble
-                const float   X    = ldexpf(1.0f, (int)h_scale - 127);
-                const float   deq  = MXFP4_LUT_CPU[nib0] * X;
-
-                printf("[MXFP4][MLP1] First elem check: CPU=%g  nib=%u  scale(e8m0)=%u  deq=%g\n",
-                       (double)cpu_v0, (unsigned)nib0, (unsigned)h_scale, (double)deq);
-            }
-        }
-
-        // ------------------ pack & copy MLP1 bias shard (BF16, unchanged) ------------------
-        // Source (CPU full): [L, E, 2D]; Dest (GPU shard): [L, E, Oloc]
-        {
-            const size_t segb1_full = (size_t)(2 * D);
-            __hip_bfloat16 *staging_b = nullptr;
-            HIP_CHECK(hipHostMalloc((void **)&staging_b, (size_t)Oloc * sizeof(__hip_bfloat16)));
-
-            size_t dev_off = 0;
-            for (int L = 0; L < p->n_layers; ++L)
-            {
-                for (int e = 0; e < E; ++e)
-                {
-                    const float *base = w->b_mlp1 + (size_t)L * E * segb1_full + (size_t)e * segb1_full;
-                    convert_float_array_to_bfloat16(base + Ostart, staging_b, (size_t)Oloc);
-
-                    HIP_CHECK(hipMemcpy(gpu_weights->b_mlp1 + dev_off,
-                                        staging_b, (size_t)Oloc * sizeof(__hip_bfloat16),
-                                        hipMemcpyHostToDevice));
-
-                    dev_off += (size_t)Oloc;
-                }
-            }
-            HIP_CHECK(hipHostFree(staging_b));
-        }
-
-        // ------------------ pack & copy MLP2 weight shard -> MXFP4 ------------------
-        // Source (CPU full): [L, E, H, D] row-major; take columns [Istart, Istart+Kloc)
-        // Dest (GPU shard, MXFP4):  [L, E, H, Kloc] as nibbles + e8m0 scales
-        {
-            const size_t seg2_full = (size_t)H * (size_t)D;
-            size_t packed_off = 0, scale_off = 0;
-
-            for (int L = 0; L < p->n_layers; ++L)
-            {
-                for (int e = 0; e < E; ++e)
-                {
-                    const float *base = w->w_mlp2 + (size_t)L * E * seg2_full + (size_t)e * seg2_full;
-
-                    // Build local contiguous [H, Kloc] into staging_f
-                    for (int h = 0; h < H; ++h)
-                    {
-                        const float *row_f = base + (size_t)h * (size_t)D + (size_t)Istart;
-                        float *row_dst = staging_f + (size_t)h * (size_t)Kloc;
-                        memcpy(row_dst, row_f, (size_t)Kloc * sizeof(float));
-                    }
-
-                    // Quantize & copy directly into final device shard buffers
-                    streaming_quantize_copy_mxfp4_cpu_to_gpu(
-                        staging_f, seg2_loc_elems,
-                        gpu_weights->w_mlp2_mxfp4 + packed_off,
-                        gpu_weights->w_mlp2_scales + scale_off,
-                        /*unused_stream_ok*/ nullptr);
-
-                    packed_off += seg2_loc_packed;
-                    scale_off  += seg2_loc_scales;
-                }
-            }
-
-            // ----- Debug: compare first element (L=0,e=0,h=0,k=0 local) -----
-            {
-                // Original CPU value
-                const float cpu_v0 = *(w->w_mlp2 + /*L=0,e=0*/ 0 + 0 * (size_t)D + (size_t)Istart);
-
-                // Pull first packed byte & first scale from device
-                uint8_t h_byte = 0, h_scale = 127;
-                HIP_CHECK(hipMemcpy(&h_byte,  gpu_weights->w_mlp2_mxfp4, 1, hipMemcpyDeviceToHost));
-                HIP_CHECK(hipMemcpy(&h_scale, gpu_weights->w_mlp2_scales, 1, hipMemcpyDeviceToHost));
-
-                const uint8_t nib0 = (h_byte & 0x0F);
-                const float   X    = ldexpf(1.0f, (int)h_scale - 127);
-                const float   deq  = MXFP4_LUT_CPU[nib0] * X;
-
-                printf("[MXFP4][MLP2] First elem check: CPU=%g  nib=%u  scale(e8m0)=%u  deq=%g\n",
-                       (double)cpu_v0, (unsigned)nib0, (unsigned)h_scale, (double)deq);
-            }
-        }
-
-        HIP_CHECK(hipHostFree(staging_f));
+        const int base = twoD / TP;
+        const int rem  = twoD % TP;
+        Oloc   = base + (rank < rem ? 1 : 0);
+        Ostart = rank * base + (rank < rem ? rank : rem);
     }
-
-    // ------------------ copy MLP2 bias (FULL H) scaled by 1/TP ------------------
+    int Kloc, Istart; // MLP2 (D split)
     {
-        const int H = p->hidden_dim;
-        const int E = p->n_experts;
-        __hip_bfloat16 *staging_b = nullptr;
-        HIP_CHECK(hipHostMalloc((void **)&staging_b, (size_t)H * sizeof(__hip_bfloat16)));
+        const int base = D / TP;
+        const int rem  = D % TP;
+        Kloc   = base + (rank < rem ? 1 : 0);
+        Istart = rank * base + (rank < rem ? rank : rem);
+    }
 
-        for (int L = 0; L < p->n_layers; ++L)
-        {
-            for (int e = 0; e < E; ++e)
-            {
-                const float *base = w->b_mlp2 + ((size_t)L * (size_t)E + (size_t)e) * (size_t)H;
-                convert_float_array_to_bfloat16_scaled(base, staging_b, (size_t)H, invTP);
+    // ===== Register CPU weight arrays once for async 2D copies =====
+    const size_t mlp1_total_bytes = (size_t)L * (size_t)E * (size_t)(2 * D) * (size_t)H * sizeof(float);
+    const size_t mlp2_total_bytes = (size_t)L * (size_t)E * (size_t)H * (size_t)D * sizeof(float);
+    HIP_CHECK(hipHostRegister((void*)w->w_mlp1, mlp1_total_bytes, hipHostRegisterPortable));
+    HIP_CHECK(hipHostRegister((void*)w->w_mlp2, mlp2_total_bytes, hipHostRegisterPortable));
 
-                const size_t dev_off = ((size_t)L * (size_t)E + (size_t)e) * (size_t)H;
-                HIP_CHECK(hipMemcpy(gpu_weights->b_mlp2 + dev_off,
-                                    staging_b, (size_t)H * sizeof(__hip_bfloat16),
-                                    hipMemcpyHostToDevice));
+    // ===== MLP2: [L, E, H, D] — host-mapped gather+quantize (no SDMA rows) =====
+{
+    const size_t per_exp_elems = (size_t)H * (size_t)D;   // source stride per expert
+    const size_t layer_rows    = (size_t)E * (size_t)H;   // treat as rows
+    // TP shard: keep Kloc contiguous columns; final output elems per layer:
+    const size_t layer_elems   = layer_rows * (size_t)Kloc;
+    const size_t packed_per_layer = (layer_elems + 1) / 2;
+    const size_t scales_per_layer = (layer_elems + 31) / 32;
+
+    // Kernel config
+    constexpr int BLOCK_THREADS = 512;
+    constexpr int LANES = 32;
+    const int WPB = BLOCK_THREADS / LANES;
+    const size_t shmem_bytes =
+        (size_t)WPB * (32 * sizeof(float) + 32 * sizeof(uint8_t)) + WPB * sizeof(int);
+
+    for (int l = 0; l < L; ++l) {
+        const float* layer_base_h = w->w_mlp2 + (size_t)l * (size_t)E * per_exp_elems;
+
+        // We need rows=E*H, each row starts at (expert,head) with pitch D,
+        // and we only need columns [Istart .. Istart+Kloc) — make that the "col 0" by offsetting host ptr.
+        const float* src2d_h = layer_base_h + (size_t)Istart;
+
+        // Try to map this layer region; if mapping fails, fall back to your 2D-tiled SDMA path.
+        // Size: full rows * D minus the initial column offset (conservative).
+        const size_t reg_bytes = layer_rows * (size_t)D * sizeof(float) - (size_t)Istart * sizeof(float);
+        bool mapped_ok = false;
+        float* src2d_dev = nullptr;
+
+        hipError_t r1 = hipHostRegister((void*)src2d_h, reg_bytes,
+                                        hipHostRegisterPortable | hipHostRegisterMapped);
+        if (r1 == hipSuccess) {
+            void* devptr = nullptr;
+            hipError_t r2 = hipHostGetDevicePointer(&devptr, (void*)src2d_h, 0);
+            if (r2 == hipSuccess && devptr) {
+                mapped_ok = true;
+                src2d_dev = reinterpret_cast<float*>(devptr);
+            } else {
+                (void)hipHostUnregister((void*)src2d_h);
             }
         }
 
-        HIP_CHECK(hipHostFree(staging_b));
+        if (mapped_ok) {
+            // One big kernel: gather+quantize directly from host-mapped memory
+            const size_t total_elems = layer_elems;
+            const size_t warps = (total_elems + 31) / 32;
+            dim3 block(BLOCK_THREADS);
+            dim3 grid((unsigned)((warps + WPB - 1) / WPB));
+
+            hipLaunchKernelGGL(
+                (quantize_pack_mxfp4_from_hostmapped_rows_kernel<BLOCK_THREADS>),
+                grid, block, shmem_bytes, 0,
+                /*src_host_mapped*/ src2d_dev,
+                /*D*/ (size_t)D,
+                /*rows*/ layer_rows,
+                /*row_len*/ (size_t)Kloc,  // we already offset by Istart
+                /*dst_packed*/ gpu_weights->w_mlp2_mxfp4 + (size_t)l * packed_per_layer,
+                /*dst_scales*/ gpu_weights->w_mlp2_scales + (size_t)l * scales_per_layer,
+                /*total_elems*/ total_elems);
+            HIP_CHECK(hipGetLastError());
+            HIP_CHECK(hipDeviceSynchronize()); // ensure layer finished before unmap
+
+            hipError_t ur = hipHostUnregister((void*)src2d_h);
+            (void)ur; // ignore unregister errors (non-fatal)
+
+        } else {
+            // Fallback: SDMA 2D → device staging → quantize (your previous fast path)
+            mxfp4_copy_quantize_host2d_tiled(
+                /*src_base_host*/ src2d_h,
+                /*width_elems  */ (size_t)Kloc,
+                /*height_rows  */ layer_rows,
+                /*src_pitch_el */ (size_t)D,
+                /*dst_packed   */ gpu_weights->w_mlp2_mxfp4 + (size_t)l * packed_per_layer,
+                /*dst_scales   */ gpu_weights->w_mlp2_scales + (size_t)l * scales_per_layer,
+                /*total_elems  */ layer_elems);
+        }
+
+        // ---- Debug first element (L=0, e=0, h=0, k=0 local) ----
+        if (l == 0) {
+            const float cpu_v0 = *(w->w_mlp2
+                                   + /*L*/0 * (size_t)E * per_exp_elems
+                                   + /*e*/0 * per_exp_elems
+                                   + /*h*/0 * (size_t)D
+                                   + (size_t)Istart);
+            uint8_t h_byte = 0, h_scale = 127;
+            HIP_CHECK(hipMemcpy(&h_byte,  gpu_weights->w_mlp2_mxfp4, 1, hipMemcpyDeviceToHost));
+            HIP_CHECK(hipMemcpy(&h_scale, gpu_weights->w_mlp2_scales, 1, hipMemcpyDeviceToHost));
+            const uint8_t nib0 = (h_byte & 0x0F);
+            const float   X    = ldexpf(1.0f, (int)h_scale - 127);
+            const float   deq  = MXFP4_LUT_CPU[nib0] * X;
+            printf("[MXFP4][TP-mapped][MLP2] First elem: CPU=%g nib=%u e8m0=%u deq=%g\n",
+                   (double)cpu_v0, (unsigned)nib0, (unsigned)h_scale, (double)deq);
+        }
     }
 
-    // Output head
-    {
-        size_t out_size = (size_t)p->hidden_dim * (size_t)p->vocab_size;
-        __hip_bfloat16 *h_out_bf16 = (__hip_bfloat16 *)malloc(out_size * sizeof(__hip_bfloat16));
-        convert_float_array_to_bfloat16(w->out, h_out_bf16, out_size);
-        HIP_CHECK(hipMemcpy(gpu_weights->out, h_out_bf16, out_size * sizeof(__hip_bfloat16), hipMemcpyHostToDevice));
-        free(h_out_bf16);
+    // MLP2 bias [L,E,H], scaled by 1/TP (unchanged)
+    __hip_bfloat16 *staging_b2 = (__hip_bfloat16 *)malloc((size_t)H * sizeof(__hip_bfloat16));
+    for (int l = 0; l < L; ++l) {
+        for (int e = 0; e < E; ++e) {
+            const float *base = w->b_mlp2 + ((size_t)l * (size_t)E + (size_t)e) * (size_t)H;
+            convert_float_array_to_bfloat16_scaled(base, staging_b2, (size_t)H, invTP);
+            const size_t dev_off = ((size_t)l * (size_t)E + (size_t)e) * (size_t)H;
+            HIP_CHECK(hipMemcpy(gpu_weights->b_mlp2 + dev_off,
+                                staging_b2, (size_t)H * sizeof(__hip_bfloat16),
+                                hipMemcpyHostToDevice));
+        }
     }
-
-    printf("Weights copied. MoE MLP weights in MXFP4 (packed+scales); biases BF16. w_qkv and out are transposed in-place on GPU ([K,N] layout).\n");
+    free(staging_b2);
 }
+
+
+
+    // ===== Output head (BF16) =====
+    {
+        size_t out_size = (size_t)p->hidden_dim * p->vocab_size;
+        __hip_bfloat16 *tout = (__hip_bfloat16 *)malloc(out_size * sizeof(__hip_bfloat16));
+        convert_float_array_to_bfloat16(w->out, tout, out_size);
+        HIP_CHECK(hipMemcpy(gpu_weights->out, tout, out_size * sizeof(__hip_bfloat16), hipMemcpyHostToDevice));
+        free(tout);
+    }
+
+    printf("Weights copied (TP 2D-DMA optimized): no CPU repack, double-buffered H2D+quantize, 1024T blocks.\n");
+}
+
+
+
 
 
 void malloc_cpu_buffers(CPUBuffers *cpu_buf, Config *p)
