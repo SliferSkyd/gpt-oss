@@ -1,158 +1,149 @@
-#ifndef MXFP4_HPP
-#define MXFP4_HPP
-
+#pragma once
 #include <hip/hip_runtime.h>
 #include <cstdint>
 #include <cmath>
 #include <algorithm>
 
-// MXFP4 format constants
-constexpr int MXFP4_BLOCK_SIZE = 32;  // 32 FP4 values share one scale
-constexpr int MXFP4_VALUES_PER_BYTE = 2;  // 2 4-bit values per byte
-
-// MXFP4 lookup table - 16 possible FP4 values
-// Based on OpenAI GPT-OSS implementation
-__device__ __constant__ float MXFP4_LUT[16] = {
-    0.0f,    // 0b0000
-    0.5f,    // 0b0001
-    1.0f,    // 0b0010
-    1.5f,    // 0b0011
-    2.0f,    // 0b0100
-    3.0f,    // 0b0101
-    4.0f,    // 0b0110
-    6.0f,    // 0b0111
-    -0.0f,   // 0b1000 (negative zero, treated as zero)
-    -0.5f,   // 0b1001
-    -1.0f,   // 0b1010
-    -1.5f,   // 0b1011
-    -2.0f,   // 0b1100
-    -3.0f,   // 0b1101
-    -4.0f,   // 0b1110
-    -6.0f    // 0b1111
+static const float MXFP4_LUT_CPU[16] = {
+    0.0f,  0.5f,  1.0f,  1.5f,  2.0f,  3.0f,  4.0f,  6.0f,
+   -0.0f, -0.5f, -1.0f, -1.5f, -2.0f, -3.0f, -4.0f, -6.0f
 };
 
-// CPU-side lookup table for quantization
-const float MXFP4_LUT_CPU[16] = {
-    0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f,
-    -0.0f, -0.5f, -1.0f, -1.5f, -2.0f, -3.0f, -4.0f, -6.0f
-};
+__device__ __constant__ float MXFP4_LUT_DEV[16];
 
-// Structure to hold MXFP4 quantized weights
-struct MXFP4Weights {
-    uint8_t* packed_values;  // Packed 4-bit indices (2 per byte)
-    float* scales;           // Scale factor for each block
-    size_t num_elements;     // Total number of elements
-    size_t num_blocks;       // Number of MXFP4 blocks
-};
+static inline void init_mxfp4_lut_on_device() {
+    HIP_CHECK(hipMemcpyToSymbol(HIP_SYMBOL(MXFP4_LUT_DEV),
+                                MXFP4_LUT_CPU, sizeof(MXFP4_LUT_CPU)));
+}
 
-// Find closest FP4 value index
-inline uint8_t find_closest_fp4_index(float value) {
-    float min_diff = std::abs(value - MXFP4_LUT_CPU[0]);
-    uint8_t best_idx = 0;
-    
-    for (uint8_t i = 1; i < 16; i++) {
-        float diff = std::abs(value - MXFP4_LUT_CPU[i]);
-        if (diff < min_diff) {
-            min_diff = diff;
-            best_idx = i;
+// E8M0 scale byte: encode exponent + 127 (no sign)
+__device__ __forceinline__ float ldexp_pow2_e8m0(uint8_t e8m0) {
+    const int exp_unbiased = (int)e8m0 - 127;
+    // ldexpf is supported in device code on HIP and CUDA
+    return ldexpf(1.0f, exp_unbiased);
+}
+
+// Dequant one element from MXFP4 (block-of-32 with e8m0 scales)
+__device__ __forceinline__ float dequantize_mxfp4_block32(
+    const uint8_t* __restrict__ packed,
+    const uint8_t* __restrict__ scales,
+    size_t idx)
+{
+    const size_t blk_id   = idx >> 5;       // /32
+    const uint8_t e8m0    = scales[blk_id]; // (exp + 127)
+    const float X         = ldexp_pow2_e8m0(e8m0);
+
+    const size_t byte_id  = idx >> 1;       // /2
+    const uint8_t byte    = packed[byte_id];
+    const uint8_t nib     = (idx & 1) ? ((byte >> 4) & 0x0F) : (byte & 0x0F);
+
+    return MXFP4_LUT_DEV[nib] * X;
+}
+
+// Reuse MXFP4_LUT_DEV[16] and ldexp_pow2_e8m0() from your header.
+
+__device__ __forceinline__ uint8_t encode_e8m0_from_exp_dev(int exp_unbiased) {
+    int e = exp_unbiased + 127;
+    if (e < 0)   e = 0;
+    if (e > 255) e = 255;
+    return static_cast<uint8_t>(e);
+}
+
+__device__ __forceinline__ uint8_t enc_fp4_e2m1_nearest_dev(float x) {
+    // 16-entry brute force; small and fast enough.
+    uint8_t best = 0;
+    float best_diff = fabsf(x - MXFP4_LUT_DEV[0]);
+    #pragma unroll
+    for (uint8_t i = 1; i < 16; ++i) {
+        float d = fabsf(x - MXFP4_LUT_DEV[i]);
+        if (d < best_diff) { best_diff = d; best = i; }
+    }
+    return best;
+}
+
+// Each "logical warp" (32 lanes) handles one 32-elem block:
+// - computes maxabs -> exp_scale = ilog2(maxabs) - 2
+// - writes e8m0 scale byte
+// - quantizes and packs to nibbles (2 per byte) directly to final dst
+//
+// Grid: any; BlockDim must be a multiple of 32
+// Shared mem layout: [WPB*32 floats] + [WPB*32 uint8] + [WPB int]
+template<int BLOCK_THREADS>
+__global__ void quantize_pack_mxfp4_block32_kernel(
+    const float* __restrict__ src_chunk,   // FP32 chunk on device
+    size_t      chunk_blocks,              // number of 32-elem blocks in this chunk
+    size_t      global_block0,             // global block-id offset (elem_off/32)
+    uint8_t*    __restrict__ dst_packed,   // final destination on device
+    uint8_t*    __restrict__ dst_scales,   // final destination on device
+    size_t      total_elems                // total original element count
+){
+    constexpr int LANES = 32;
+    static_assert(BLOCK_THREADS % LANES == 0, "BLOCK_THREADS must be multiple of 32");
+    const int WPB = BLOCK_THREADS / LANES; // logical warps per block
+
+        extern __shared__ __align__(16) unsigned char mxfp4_smem[];
+    float*   svals = reinterpret_cast<float*>(mxfp4_smem);
+    uint8_t* snibs = reinterpret_cast<uint8_t*>(svals + WPB * LANES);
+    int*     sexps = reinterpret_cast<int*>(snibs + WPB * LANES);
+
+    const int tid = threadIdx.x;
+    const int warp_local = tid / LANES;
+    const int lane       = tid % LANES;
+
+    // Which 32-elem block this logical warp handles (within the chunk)
+    size_t block_in_chunk = (size_t)blockIdx.x * WPB + warp_local;
+    if (block_in_chunk >= chunk_blocks) return;
+
+    const size_t elem_base = block_in_chunk * LANES; // elem offset within chunk
+    const size_t g_block   = global_block0 + block_in_chunk; // global 32-elem block id
+    const size_t g_elem0   = g_block * (size_t)LANES;
+
+    // Load value (guard tail)
+    float v = 0.0f;
+    const size_t g_elem = g_elem0 + lane;
+    if (g_elem < total_elems) {
+        v = src_chunk[elem_base + lane];
+    }
+
+    // Stash to shared for a simple reduction (avoid warp intrinsics; AMD wavefront is 64)
+    svals[warp_local * LANES + lane] = fabsf(v);
+    __syncthreads();
+
+    // lane 0 of the logical warp computes maxabs & exp
+    if (lane == 0) {
+        float maxabs = 0.f;
+        #pragma unroll
+        for (int i = 0; i < LANES; ++i) {
+            float a = svals[warp_local * LANES + i];
+            if (a > maxabs) maxabs = a;
         }
-    }
-    return best_idx;
-}
-
-// CPU function to quantize FP32 to MXFP4
-inline void quantize_to_mxfp4(const float* input, MXFP4Weights& output, size_t count) {
-    output.num_elements = count;
-    output.num_blocks = (count + MXFP4_BLOCK_SIZE - 1) / MXFP4_BLOCK_SIZE;
-    
-    // Allocate memory for packed values and scales
-    size_t packed_size = (count + 1) / 2;  // 2 values per byte
-    output.packed_values = new uint8_t[packed_size];
-    output.scales = new float[output.num_blocks];
-    
-    // Process each block
-    for (size_t block_idx = 0; block_idx < output.num_blocks; block_idx++) {
-        size_t block_start = block_idx * MXFP4_BLOCK_SIZE;
-        size_t block_end = std::min(block_start + MXFP4_BLOCK_SIZE, count);
-        
-        // Find max absolute value in block for scaling
-        float max_abs = 0.0f;
-        for (size_t i = block_start; i < block_end; i++) {
-            max_abs = std::max(max_abs, std::abs(input[i]));
+        int exp_scale = 0;
+        if (maxabs > 0.f) {
+            // frexpf: x = m * 2^e, with 0.5 <= m < 1  => ilogb(x) = e-1
+            int e;
+            frexpf(maxabs, &e);
+            exp_scale = (e - 1) - 2; // largest pow2 representable in E2M1 is 2^2
         }
-        
-        // Calculate scale (avoid division by zero)
-        float scale = (max_abs > 0.0f) ? max_abs / 6.0f : 1.0f;
-        output.scales[block_idx] = scale;
-        
-        // Quantize values in block
-        for (size_t i = block_start; i < block_end; i++) {
-            float scaled_value = (scale > 0.0f) ? input[i] / scale : 0.0f;
-            uint8_t idx = find_closest_fp4_index(scaled_value);
-            
-            // Pack two 4-bit values into one byte
-            size_t byte_idx = i / 2;
-            if (i % 2 == 0) {
-                // Store in lower 4 bits
-                output.packed_values[byte_idx] = (output.packed_values[byte_idx] & 0xF0) | (idx & 0x0F);
-            } else {
-                // Store in upper 4 bits
-                output.packed_values[byte_idx] = (output.packed_values[byte_idx] & 0x0F) | ((idx << 4) & 0xF0);
-            }
-        }
+        sexps[warp_local] = exp_scale;
+        dst_scales[g_block] = encode_e8m0_from_exp_dev(exp_scale);
+    }
+    __syncthreads();
+
+    // Broadcast exp -> compute X
+    const int exp_scale = sexps[warp_local];
+    const float X = ldexpf(1.0f, exp_scale);
+
+    // Quantize to nearest LUT code
+    uint8_t nib = enc_fp4_e2m1_nearest_dev(v / X);
+    snibs[warp_local * LANES + lane] = nib;
+    __syncthreads();
+
+    // Pack two nibbles per byte (even lanes write)
+    if ((lane & 1) == 0) {
+        const uint8_t lo = snibs[warp_local * LANES + lane];
+        const uint8_t hi = (lane + 1 < LANES) ? snibs[warp_local * LANES + lane + 1] : 0;
+        const size_t byte_in_block = (size_t)(lane >> 1); // 0..15
+        const size_t byte_global   = (size_t)g_block * 16 + byte_in_block;
+        dst_packed[byte_global] = (uint8_t)((hi << 4) | (lo & 0xF));
     }
 }
-
-// GPU function to dequantize MXFP4 to FP32
-__device__ __forceinline__ float dequantize_mxfp4(
-    const uint8_t* packed_values,
-    const float* scales,
-    size_t element_idx,
-    size_t total_elements
-) {
-    if (element_idx >= total_elements) return 0.0f;
-    
-    // Calculate block index and scale
-    size_t block_idx = element_idx / MXFP4_BLOCK_SIZE;
-    float scale = scales[block_idx];
-    
-    // Extract 4-bit index from packed byte
-    size_t byte_idx = element_idx / 2;
-    uint8_t packed_byte = packed_values[byte_idx];
-    uint8_t fp4_idx;
-    
-    if (element_idx % 2 == 0) {
-        // Extract from lower 4 bits
-        fp4_idx = packed_byte & 0x0F;
-    } else {
-        // Extract from upper 4 bits
-        fp4_idx = (packed_byte >> 4) & 0x0F;
-    }
-    
-    // Lookup FP4 value and apply scale
-    return MXFP4_LUT[fp4_idx] * scale;
-}
-
-// Helper function to calculate MXFP4 storage size
-inline size_t calculate_mxfp4_size(size_t num_elements) {
-    size_t packed_size = (num_elements + 1) / 2;  // 2 values per byte
-    size_t num_blocks = (num_elements + MXFP4_BLOCK_SIZE - 1) / MXFP4_BLOCK_SIZE;
-    size_t scales_size = num_blocks * sizeof(float);
-    return packed_size + scales_size;
-}
-
-// Cleanup function
-inline void free_mxfp4_weights(MXFP4Weights& weights) {
-    if (weights.packed_values) {
-        delete[] weights.packed_values;
-        weights.packed_values = nullptr;
-    }
-    if (weights.scales) {
-        delete[] weights.scales;
-        weights.scales = nullptr;
-    }
-    weights.num_elements = 0;
-    weights.num_blocks = 0;
-}
-
-#endif // MXFP4_HPP
