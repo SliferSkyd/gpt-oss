@@ -613,249 +613,211 @@ static void streaming_quantize_copy_mxfp4_cpu_to_gpu(
     HIP_CHECK(hipStreamDestroy(compute_stream));
 }
 
-// Packs `rows` segments from pageable host into pinned tiles, each segment has
-// length `row_len` (floats) and starts every `row_stride` floats.
-// Then H2D to device staging and launches the MXFP4 quantizer per tile.
-//
-// Dest arrays are the *final* device buffers (packed nibbles & e8m0 scales).
+static inline long long tick_msec() {
+    using namespace std::chrono;
+    return duration_cast<milliseconds>(high_resolution_clock::now().time_since_epoch()).count();
+}
+
+static size_t getenv_stage_mb_or(const char* name, size_t def_mb) {
+    const char* s = std::getenv(name);
+    if (!s) return def_mb;
+    long v = std::strtol(s, nullptr, 10);
+    if (v <= 0) return def_mb;
+    return (size_t)v;
+}
+
+// Parallel pack of rows from src (pageable) into a pinned tile.
+// Each row copies 'row_len' floats starting every 'row_stride' floats.
+// Work is split into N threads on whole-row boundaries.
+static void pack_rows_mt(float* __restrict__ dst,
+                         const float* __restrict__ src_base,
+                         size_t start_row,
+                         size_t n_rows,
+                         size_t row_stride,
+                         size_t row_len,
+                         int n_threads)
+{
+    if (n_rows == 0) return;
+    if (n_threads < 2) {
+        // single-thread fallback
+        const float* src = src_base + start_row * row_stride;
+        for (size_t r = 0; r < n_rows; ++r) {
+            memcpy(dst + r * row_len, src + r * row_stride, row_len * sizeof(float));
+        }
+        return;
+    }
+
+    auto worker = [&](size_t r0, size_t r1) {
+        const float* src = src_base + (start_row + r0) * row_stride;
+        float* out       = dst + r0 * row_len;
+        for (size_t r = r0; r < r1; ++r) {
+            memcpy(out, src, row_len * sizeof(float));
+            src += row_stride;
+            out += row_len;
+        }
+    };
+
+    const size_t chunk = (n_rows + (size_t)n_threads - 1) / (size_t)n_threads;
+    std::vector<std::thread> th;
+    th.reserve(n_threads);
+    size_t r = 0;
+    for (int t = 0; t < n_threads && r < n_rows; ++t) {
+        size_t r1 = std::min(n_rows, r + chunk);
+        th.emplace_back(worker, r, r1);
+        r = r1;
+    }
+    for (auto& tt : th) tt.join();
+}
+
 static void streaming_quantize_copy_mxfp4_cpu_to_gpu_strided(
-    const float* __restrict__ src_base, // host (pageable is OK)
-    size_t rows,                        // number of gathered segments
-    size_t row_stride,                  // distance (in floats) between starts
-    size_t row_len,                     // length (in floats) of each segment
-    uint8_t* __restrict__ dst_packed_dev,   // device final
-    uint8_t* __restrict__ dst_scales_dev,   // device final
+    const float* __restrict__ src_base, // host pageable
+    size_t rows,                        // #segments to gather
+    size_t row_stride,                  // in floats
+    size_t row_len,                     // in floats
+    uint8_t* __restrict__ dst_packed_dev,
+    uint8_t* __restrict__ dst_scales_dev,
     hipStream_t /*unused_stream_ok*/ = nullptr)
 {
     if (rows == 0 || row_len == 0) return;
 
-    const size_t shard_elems = rows * row_len;
-
-    // --- Heuristics for tile size ---
+    // === Tile size heuristics ===
     size_t free_b = 0, total_b = 0;
     (void)hipMemGetInfo(&free_b, &total_b);
 
-    const size_t CAP_HOST_STAGE_BYTES = (size_t)(512ULL << 20); // 512 MiB
-    const size_t CAP_DEV_STAGE_BYTES  = (size_t)(512ULL << 20);
-    const size_t DEV_LIMIT            = (free_b > (size_t)(4ULL << 30)) ? (size_t)(free_b / 4)
-                                   : (size_t)(256ULL << 20);
-    const size_t STAGE_BYTES = std::min({CAP_HOST_STAGE_BYTES, CAP_DEV_STAGE_BYTES, DEV_LIMIT});
+    // env knob (MB)
+    const size_t ENV_MB = getenv_stage_mb_or("MXFP4_STAGE_MB", /*default*/1024);
+    const size_t CAP_HOST_STAGE_BYTES = ENV_MB * (size_t)(1ULL << 20); // MB -> bytes
+    // Leave headroom in VRAM; if low, cap to free/4
+    const size_t DEV_LIMIT = (free_b > (size_t)(4ULL << 30)) ? (size_t)(free_b / 4) : (size_t)(256ULL << 20);
+    const size_t STAGE_BYTES = std::min(CAP_HOST_STAGE_BYTES, DEV_LIMIT);
 
     const size_t BYTES_PER_ROW = row_len * sizeof(float);
-    size_t tile_rows = STAGE_BYTES / BYTES_PER_ROW;
-    if (tile_rows == 0) tile_rows = 2048 / std::max<size_t>(row_len, 1); // small minimum
+    size_t tile_rows = STAGE_BYTES / std::max<size_t>(BYTES_PER_ROW, 1);
+    if (tile_rows == 0)   tile_rows = 1;
     if (tile_rows > rows) tile_rows = rows;
 
     const size_t tile_elems = tile_rows * row_len;
     const size_t tile_bytes = tile_elems * sizeof(float);
 
-    // Streams & events
+    // === Triple-buffered streams/events ===
     hipStream_t s_copy, s_comp;
     HIP_CHECK(hipStreamCreateWithFlags(&s_copy, hipStreamNonBlocking));
     HIP_CHECK(hipStreamCreateWithFlags(&s_comp, hipStreamNonBlocking));
-    hipEvent_t e_copy[2], e_comp[2];
-    HIP_CHECK(hipEventCreateWithFlags(&e_copy[0], hipEventDisableTiming));
-    HIP_CHECK(hipEventCreateWithFlags(&e_copy[1], hipEventDisableTiming));
-    HIP_CHECK(hipEventCreateWithFlags(&e_comp[0], hipEventDisableTiming));
-    HIP_CHECK(hipEventCreateWithFlags(&e_comp[1], hipEventDisableTiming));
 
-    // Host pinned & device staging (double buffer)
-    void*  h_stage_raw[2] = {nullptr, nullptr};
-    float* h_stage[2]     = {nullptr, nullptr};
-    HIP_CHECK(hipHostMalloc(&h_stage_raw[0], tile_bytes, hipHostMallocPortable));
-    HIP_CHECK(hipHostMalloc(&h_stage_raw[1], tile_bytes, hipHostMallocPortable));
-    h_stage[0] = reinterpret_cast<float*>(h_stage_raw[0]);
-    h_stage[1] = reinterpret_cast<float*>(h_stage_raw[1]);
+    hipEvent_t e_copy[3], e_comp[3];
+    for (int i = 0; i < 3; ++i) {
+        HIP_CHECK(hipEventCreateWithFlags(&e_copy[i], hipEventDisableTiming));
+        HIP_CHECK(hipEventCreateWithFlags(&e_comp[i], hipEventDisableTiming));
+    }
 
-    float* d_stage[2] = {nullptr, nullptr};
-    HIP_CHECK(hipMalloc((void**)&d_stage[0], tile_bytes));
-    HIP_CHECK(hipMalloc((void**)&d_stage[1], tile_bytes));
+    // === Triple host pinned + device staging ===
+    void*  h_stage_raw[3] = {nullptr, nullptr, nullptr};
+    float* h_stage[3]     = {nullptr, nullptr, nullptr};
+    for (int i = 0; i < 3; ++i) {
+        HIP_CHECK(hipHostMalloc(&h_stage_raw[i], tile_bytes, hipHostMallocPortable));
+        h_stage[i] = reinterpret_cast<float*>(h_stage_raw[i]);
+    }
+    float* d_stage[3] = {nullptr, nullptr, nullptr};
+    for (int i = 0; i < 3; ++i) {
+        HIP_CHECK(hipMalloc((void**)&d_stage[i], tile_bytes));
+    }
 
-    // Quant kernel config (logical 32-lane warps)
-    constexpr int BLOCK_THREADS = 512; // higher occupancy on CDNA/MI-series
+    // === Kernel config ===
+    constexpr int BLOCK_THREADS = 1024; // higher occupancy; shared mem still tiny
     constexpr int LANES = 32;
     const int WPB = BLOCK_THREADS / LANES;
     const size_t shmem_bytes =
         (size_t)WPB * (32 * sizeof(float) + 32 * sizeof(uint8_t)) + WPB * sizeof(int);
 
+    // === Parallel pack threads ===
+    const int n_threads = std::max(2, (int)std::thread::hardware_concurrency()); // use all cores
+
     size_t rows_done = 0;
-    size_t blocks_done = 0; // in 32-elem blocks within this shard
-    int ping = 0;
+    size_t blocks_done = 0; // measured in 32-elem blocks within this shard
+    int buf = 0;
 
-    auto pack_rows_to_pinned = [&](float* dst, const float* base, size_t start_row, size_t n_rows) {
-        const float* src = base + start_row * row_stride;
-        for (size_t r = 0; r < n_rows; ++r) {
-            memcpy(dst + r * row_len, src + r * row_stride, row_len * sizeof(float));
-        }
-    };
-
-    // Prepack first tile
-    pack_rows_to_pinned(h_stage[ping], src_base, /*start_row=*/0, /*n_rows=*/std::min(tile_rows, rows));
+    // Pre-pack first two tiles so that copy+compute can overlap ASAP
+    const size_t warm_tiles = std::min<size_t>(2, (rows + tile_rows - 1) / tile_rows);
+    for (size_t w = 0; w < warm_tiles; ++w) {
+        const size_t r0 = rows_done + w * tile_rows;
+        const size_t rN = std::min(tile_rows, rows - r0);
+        pack_rows_mt(h_stage[(buf + w) % 3], src_base, r0, rN, row_stride, row_len, n_threads);
+    }
 
     while (rows_done < rows) {
-        const size_t this_rows   = std::min(tile_rows, rows - rows_done);
-        const size_t this_elems  = this_rows * row_len;
+        const long long t0 = tick_msec();
+
+        const size_t r_this = std::min(tile_rows, rows - rows_done);
+        const size_t this_elems  = r_this * row_len;
         const size_t this_bytes  = this_elems * sizeof(float);
         const size_t this_blocks = (this_elems + 31) / 32;
 
-        // H2D
-        HIP_CHECK(hipMemcpyAsync(d_stage[ping], h_stage[ping], this_bytes,
+        // ---- H2D on current buffer ----
+        HIP_CHECK(hipMemcpyAsync(d_stage[buf], h_stage[buf], this_bytes,
                                  hipMemcpyHostToDevice, s_copy));
-        HIP_CHECK(hipEventRecord(e_copy[ping], s_copy));
+        HIP_CHECK(hipEventRecord(e_copy[buf], s_copy));
 
-        // Prepare next tile in host while copy+compute overlap
-        const int pong = ping ^ 1;
-        const size_t next_rows_off = rows_done + this_rows;
-        if (next_rows_off < rows) {
-            const size_t next_rows = std::min(tile_rows, rows - next_rows_off);
-            pack_rows_to_pinned(h_stage[pong], src_base, next_rows_off, next_rows);
+        // ---- Pack the next tile (in parallel) while copy/compute overlap ----
+        const size_t r_next0 = rows_done + r_this;
+        if (r_next0 < rows) {
+            const size_t r_nextN = std::min(tile_rows, rows - r_next0);
+            const int next_buf = (buf + 1) % 3;
+            const long long tp0 = tick_msec();
+            pack_rows_mt(h_stage[next_buf], src_base, r_next0, r_nextN, row_stride, row_len, n_threads);
+            const long long tp1 = tick_msec();
+            // (Optional) keep this lightweight; detailed per-tile print below
+            (void)tp0; (void)tp1;
         }
 
-        // Compute after H2D
-        HIP_CHECK(hipStreamWaitEvent(s_comp, e_copy[ping], 0));
+        // ---- Compute when H2D is done ----
+        HIP_CHECK(hipStreamWaitEvent(s_comp, e_copy[buf], 0));
+
         dim3 grid((unsigned)((this_blocks + WPB - 1) / WPB));
         dim3 block(BLOCK_THREADS);
 
-        const size_t global_block0 = blocks_done; // offset within THIS shard
+        const size_t global_block0 = blocks_done;
 
+        const long long tc0 = tick_msec();
         hipLaunchKernelGGL((quantize_pack_mxfp4_block32_kernel<BLOCK_THREADS>),
             grid, block, shmem_bytes, s_comp,
-            d_stage[ping],
+            d_stage[buf],
             this_blocks,
             global_block0,
             dst_packed_dev,
             dst_scales_dev,
-            shard_elems);
+            rows * row_len); // shard_elems
         HIP_CHECK(hipGetLastError());
-        HIP_CHECK(hipEventRecord(e_comp[ping], s_comp));
+        HIP_CHECK(hipEventRecord(e_comp[buf], s_comp));
 
-        rows_done   += this_rows;
+        // ---- Advance ----
         blocks_done += this_blocks;
-        ping ^= 1;
+        rows_done   += r_this;
 
-        // Ensure we don't overwrite buffers still in use
-        HIP_CHECK(hipEventSynchronize(e_comp[ping]));
+        // ---- Optional: detailed per-tile timing (pack/H2D/ker) ----
+        HIP_CHECK(hipEventSynchronize(e_comp[buf]));
+        const long long t3 = tick_msec();
+
+        // We can approximate H2D+kernel time as (t3 - t0) minus pack time of the next tile,
+        // but to keep overhead low, we report wall time and effective "GB/s on bytes moved".
+        const double gb = (double)this_bytes / (1024.0*1024.0*1024.0);
+        const double ms = (double)(t3 - t0);
+        printf("[streaming quantize strided] tile %5zu rows, %7.2f ms, %7.2f GB/s\n",
+               r_this, ms, (ms > 0.0 ? gb * 1000.0 / ms : 0.0));
+
+        // ---- Move to next buffer, ensure it's not in use ----
+        buf = (buf + 1) % 3;
+        HIP_CHECK(hipEventSynchronize(e_comp[buf])); // make sure the next buffer is free
     }
 
     HIP_CHECK(hipStreamSynchronize(s_copy));
     HIP_CHECK(hipStreamSynchronize(s_comp));
 
-    // Cleanup
-    HIP_CHECK(hipFree(d_stage[0]));
-    HIP_CHECK(hipFree(d_stage[1]));
-    HIP_CHECK(hipHostFree(h_stage_raw[0]));
-    HIP_CHECK(hipHostFree(h_stage_raw[1]));
-    HIP_CHECK(hipEventDestroy(e_copy[0]));
-    HIP_CHECK(hipEventDestroy(e_copy[1]));
-    HIP_CHECK(hipEventDestroy(e_comp[0]));
-    HIP_CHECK(hipEventDestroy(e_comp[1]));
-    HIP_CHECK(hipStreamDestroy(s_copy));
-    HIP_CHECK(hipStreamDestroy(s_comp));
-}
-
-static void mxfp4_copy_quantize_host2d_tiled(
-    const float* __restrict__ src_base_host,
-    size_t width_elems,            // contiguous elems per row to copy
-    size_t height_rows,            // number of rows (tiled on Y)
-    size_t src_pitch_elems,        // distance between starts of rows in source (in elems)
-    uint8_t* __restrict__ dst_packed_dev,   // final device packed buffer (layer-base)
-    uint8_t* __restrict__ dst_scales_dev,   // final device scales buffer (layer-base)
-    size_t   shard_total_elems)              // total elems in this layer's shard
-{
-    if (width_elems == 0 || height_rows == 0) return;
-
-    size_t free_b = 0, total_b = 0;
-    (void)hipMemGetInfo(&free_b, &total_b);
-
-    // ~512 MiB tiles by default (back off a bit if VRAM is tight)
-    const size_t CAP_TILE_BYTES = (size_t)(512ULL << 20);
-    const size_t DEV_LIMIT      = (free_b > (size_t)(4ULL << 30)) ? (size_t)(free_b / 4)
-                                                                  : (size_t)(256ULL << 20);
-    const size_t STAGE_BYTES    = std::min(CAP_TILE_BYTES, DEV_LIMIT);
-
-    const size_t width_bytes = width_elems * sizeof(float);
-    size_t tile_rows = STAGE_BYTES / width_bytes;
-    if (tile_rows == 0) tile_rows = 1;
-    if (tile_rows > height_rows) tile_rows = height_rows;
-
-    const size_t tile_bytes = tile_rows * width_bytes;
-
-    // Streams / events
-    hipStream_t s_copy, s_comp;
-    HIP_CHECK(hipStreamCreateWithFlags(&s_copy, hipStreamNonBlocking));
-    HIP_CHECK(hipStreamCreateWithFlags(&s_comp, hipStreamNonBlocking));
-    hipEvent_t e_copy[2], e_comp[2];
-    HIP_CHECK(hipEventCreateWithFlags(&e_copy[0], hipEventDisableTiming));
-    HIP_CHECK(hipEventCreateWithFlags(&e_copy[1], hipEventDisableTiming));
-    HIP_CHECK(hipEventCreateWithFlags(&e_comp[0], hipEventDisableTiming));
-    HIP_CHECK(hipEventCreateWithFlags(&e_comp[1], hipEventDisableTiming));
-
-    // Device staging (double buffer)
-    float* d_stage[2] = {nullptr, nullptr};
-    HIP_CHECK(hipMalloc((void**)&d_stage[0], tile_bytes));
-    HIP_CHECK(hipMalloc((void**)&d_stage[1], tile_bytes));
-
-    // Kernel config (small shmem, high occupancy)
-    constexpr int BLOCK_THREADS = 1024; // multiple of 32
-    constexpr int LANES = 32;
-    const int WPB = BLOCK_THREADS / LANES;
-    const size_t shmem_bytes =
-        (size_t)WPB * (32 * sizeof(float) + 32 * sizeof(uint8_t)) + WPB * sizeof(int);
-
-    size_t rows_done   = 0;
-    size_t elems_done  = 0; // offset inside this layer shard
-    int ping = 0;
-
-    while (rows_done < height_rows) {
-        const size_t this_rows  = std::min(tile_rows, height_rows - rows_done);
-        const size_t this_elems = this_rows * width_elems;
-        const size_t this_bytes = this_elems * sizeof(float);
-        const size_t this_blocks= (this_elems + 31) / 32;
-
-        // 2D H2D: host -> device staging
-        const char* src_ptr = reinterpret_cast<const char*>(src_base_host + rows_done * src_pitch_elems);
-        HIP_CHECK(hipMemcpy2DAsync(
-            /*dst=*/ d_stage[ping], /*dpitch=*/ width_bytes,
-            /*src=*/ src_ptr,       /*spitch=*/ src_pitch_elems * sizeof(float),
-            /*width=*/ width_bytes, /*height=*/ this_rows,
-            hipMemcpyHostToDevice, s_copy));
-        HIP_CHECK(hipEventRecord(e_copy[ping], s_copy));
-
-        // Compute after copy
-        HIP_CHECK(hipStreamWaitEvent(s_comp, e_copy[ping], 0));
-        const size_t global_block0 = elems_done / 32;
-
-        dim3 grid((unsigned)((this_blocks + WPB - 1) / WPB));
-        dim3 block(BLOCK_THREADS);
-
-        hipLaunchKernelGGL((quantize_pack_mxfp4_block32_kernel<BLOCK_THREADS>),
-            grid, block, shmem_bytes, s_comp,
-            d_stage[ping],
-            this_blocks,            // chunk_blocks
-            global_block0,          // global block offset within this layer shard
-            dst_packed_dev,         // final packed base for this layer
-            dst_scales_dev,         // final scales base for this layer
-            shard_total_elems);     // used for tail-safe loads
-        HIP_CHECK(hipGetLastError());
-        HIP_CHECK(hipEventRecord(e_comp[ping], s_comp));
-
-        rows_done  += this_rows;
-        elems_done += this_elems;
-        ping ^= 1;
-
-        // Make sure we don't overwrite buffers still in use
-        HIP_CHECK(hipEventSynchronize(e_comp[ping]));
+    for (int i = 0; i < 3; ++i) {
+        HIP_CHECK(hipFree(d_stage[i]));
+        HIP_CHECK(hipHostFree(h_stage_raw[i]));
+        HIP_CHECK(hipEventDestroy(e_copy[i]));
+        HIP_CHECK(hipEventDestroy(e_comp[i]));
     }
-
-    HIP_CHECK(hipStreamSynchronize(s_copy));
-    HIP_CHECK(hipStreamSynchronize(s_comp));
-
-    HIP_CHECK(hipFree(d_stage[0]));
-    HIP_CHECK(hipFree(d_stage[1]));
-    HIP_CHECK(hipEventDestroy(e_copy[0]));
-    HIP_CHECK(hipEventDestroy(e_copy[1]));
-    HIP_CHECK(hipEventDestroy(e_comp[0]));
-    HIP_CHECK(hipEventDestroy(e_comp[1]));
     HIP_CHECK(hipStreamDestroy(s_copy));
     HIP_CHECK(hipStreamDestroy(s_comp));
 }
