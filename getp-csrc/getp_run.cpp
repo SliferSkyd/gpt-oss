@@ -94,27 +94,11 @@ typedef struct
     float *sin_vals; // (head_dim/2, seq_len)
 
     // === legacy MoE (kept for shared kernels/utilities) ===
-    float *router_score;         // (batch_size, n_experts)
-    float *topk_v;               // (batch_size, K)
-    int *topk_i;                 // (batch_size, K)
-    float *mlp1_out;             // (batch_size*K, 2*D)  — local version not used in TP path
-    float *gate;                 // (batch_size*K, D)
-    float *up;                   // (batch_size*K, D)
-    float *gate_up;              // (batch_size*K, D)
-    float *e_agg;                // (batch_size, H)
-    float *expert_input_buffer;  // (batch_size*K, H)
-    float *expert_output_buffer; // (batch_size*K, H)
-    int *expert_indices;         // (batch_size*K)
-    float *expert_weights;       // (batch_size*K)
-    int *batch_count;
+    float *router_score; // (batch_size, n_experts)
 
     // Persistent routing buffers
-    int *d_expert_counts;    // (n_experts)
-    int *d_expert_offsets;   // (n_experts)
-    int *d_expert_write_idx; // (n_experts)
-    int *d_total_tokens;     // (1)
-    int *d_tile2expert;
-    int *d_tile2local;
+    int *d_expert_counts;  // (n_experts)
+    int *d_expert_offsets; // (n_experts)
 
     // === NEW: TP-union MoE buffers (per rank) ===
     // union batch (within a TP group) = Bgrp_max = TENSOR_PARALLEL_SIZE * BATCH_SIZE
@@ -264,8 +248,6 @@ void malloc_gpu_run_state(GPURunState *s, Config *p)
     s->mask = NULL;
     s->d_expert_counts = NULL;
     s->d_expert_offsets = NULL;
-    s->d_expert_write_idx = NULL;
-    s->d_total_tokens = NULL;
 
     // Check memory requirements
     size_t batch_hidden = BATCH_SIZE * H * sizeof(float);
@@ -295,21 +277,11 @@ void malloc_gpu_run_state(GPURunState *s, Config *p)
     HIP_CHECK(hipMalloc((void **)&s->k, BATCH_SIZE * kv_dim * sizeof(float)));
     HIP_CHECK(hipMalloc((void **)&s->v, BATCH_SIZE * kv_dim * sizeof(float)));
 
-    // Routing & expert buffers (legacy/local)
-    HIP_CHECK(hipMalloc((void **)&s->expert_indices, BATCH_SIZE * K * sizeof(int)));
-    HIP_CHECK(hipMalloc((void **)&s->expert_weights, BATCH_SIZE * K * sizeof(float)));
-    HIP_CHECK(hipMalloc((void **)&s->batch_count, sizeof(int)));
-    HIP_CHECK(hipMalloc((void **)&s->expert_output_buffer, BATCH_SIZE * H * sizeof(float) * expert_per_token));
-
     // Persistent routing buffers
     HIP_CHECK(hipMalloc((void **)&s->d_expert_counts, E * sizeof(int)));
     HIP_CHECK(hipMalloc((void **)&s->d_expert_offsets, E * sizeof(int)));
-    HIP_CHECK(hipMalloc((void **)&s->d_expert_write_idx, E * sizeof(int)));
-    HIP_CHECK(hipMalloc((void **)&s->d_total_tokens, sizeof(int)));
 
     int total_mtiles = BATCH_SIZE * K;
-    HIP_CHECK(hipMalloc((void **)&s->d_tile2expert, total_mtiles * sizeof(int)));
-    HIP_CHECK(hipMalloc((void **)&s->d_tile2local, total_mtiles * sizeof(int)));
 
     // KV cache
     HIP_CHECK(hipMalloc((void **)&s->key_cache, kv_cache_size));
@@ -323,18 +295,10 @@ void malloc_gpu_run_state(GPURunState *s, Config *p)
     HIP_CHECK(hipMalloc((void **)&s->n_local, BATCH_SIZE * sizeof(int)));
 
     HIP_CHECK(hipMalloc((void **)&s->router_score, BATCH_SIZE * E * sizeof(float)));
-    HIP_CHECK(hipMalloc((void **)&s->topk_v, BATCH_SIZE * K * sizeof(float)));
-    HIP_CHECK(hipMalloc((void **)&s->topk_i, BATCH_SIZE * K * sizeof(int)));
-    HIP_CHECK(hipMalloc((void **)&s->mlp1_out, (size_t)BATCH_SIZE * 2 * D * sizeof(float) * expert_per_token));
-    HIP_CHECK(hipMalloc((void **)&s->gate, (size_t)BATCH_SIZE * D * sizeof(float) * expert_per_token));
-    HIP_CHECK(hipMalloc((void **)&s->up, (size_t)BATCH_SIZE * D * sizeof(float) * expert_per_token));
-    HIP_CHECK(hipMalloc((void **)&s->gate_up, (size_t)BATCH_SIZE * D * sizeof(float) * expert_per_token));
-    HIP_CHECK(hipMalloc((void **)&s->e_agg, batch_hidden));
     HIP_CHECK(hipMalloc((void **)&s->current_tokens, BATCH_SIZE * sizeof(int)));
     HIP_CHECK(hipMalloc((void **)&s->positions, BATCH_SIZE * sizeof(int)));
     HIP_CHECK(hipMalloc((void **)&s->cos_vals, (p->head_dim / 2) * MAX_SEQ_LEN * sizeof(float)));
     HIP_CHECK(hipMalloc((void **)&s->sin_vals, (p->head_dim / 2) * MAX_SEQ_LEN * sizeof(float)));
-    HIP_CHECK(hipMalloc((void **)&s->expert_input_buffer, batch_hidden * expert_per_token));
     HIP_CHECK(hipMalloc((void **)&s->temp_buffer, batch_hidden));
 
     // Continuous batching fields
@@ -924,30 +888,16 @@ void free_gpu_run_state(GPURunState *s)
     df(s->sin_vals);
 
     df(s->router_score);
-    df(s->topk_v);
-    df(s->topk_i);
-    df(s->mlp1_out);
-    df(s->gate);
-    df(s->up);
-    df(s->gate_up);
-    df(s->e_agg);
-    df(s->expert_input_buffer);
-    df(s->expert_output_buffer);
-    df(s->expert_indices);
-    df(s->expert_weights);
-    df(s->batch_count);
+
     df(s->d_expert_counts);
     df(s->d_expert_offsets);
-    df(s->d_expert_write_idx);
-    df(s->d_total_tokens);
+
     df(s->current_tokens);
     df(s->positions);
     df(s->logits);
     df(s->seq_lengths);
     df(s->slot_active);
     df(s->request_mapping);
-    df(s->d_tile2expert);
-    df(s->d_tile2local);
 
     // TP-union
     df(s->gather_x_g);
