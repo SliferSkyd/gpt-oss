@@ -63,6 +63,9 @@ typedef struct
     uint8_t *w_mlp1_mxfp4, *w_mlp2_mxfp4; // packed n/2 bytes
     uint8_t *w_mlp1_scales, *w_mlp2_scales; // n/32 bytes (e8m0 per block)
     __hip_bfloat16 *b_mlp1, *b_mlp2;
+    // GPUTransformerWeights (add two pointers)
+    float *w_mlp1_scales_f32, *w_mlp2_scales_f32; // one float per 32 elems
+
     // Output weights
     __hip_bfloat16 *out; // (vocab_size, hidden_dim)
 } GPUTransformerWeights;
@@ -437,6 +440,13 @@ void malloc_gpu_weights(GPUTransformerWeights *w, Config *p)
     HIP_CHECK(hipMalloc((void **)&w->w_mlp2_mxfp4, mlp2_loc_packed_bytes * sizeof(uint8_t)));
     HIP_CHECK(hipMalloc((void **)&w->w_mlp2_scales, mlp2_loc_scale_bytes * sizeof(uint8_t)));
 
+    // blocks of 32 (one scale per block)
+    const size_t mlp1_loc_blocks = (mlp1_loc_elems + 31) / 32;
+    const size_t mlp2_loc_blocks = (mlp2_loc_elems + 31) / 32;
+
+    HIP_CHECK(hipMalloc((void **)&w->w_mlp1_scales_f32, mlp1_loc_blocks * sizeof(float)));
+    HIP_CHECK(hipMalloc((void **)&w->w_mlp2_scales_f32, mlp2_loc_blocks * sizeof(float)));
+
     // Biases unchanged (BF16)
     const size_t b1_local = (size_t)p->n_layers * (size_t)E * (size_t)Oloc; // [L, E, Oloc]
     HIP_CHECK(hipMalloc((void **)&w->b_mlp1, b1_local * sizeof(__hip_bfloat16)));
@@ -457,6 +467,22 @@ static inline void convert_float_array_to_bfloat16_scaled(const float *src, __hi
     convert_float_array_to_bfloat16(tmp.data(), dst, n);
 }
 
+__global__ void e8m0_to_f32_kernel(const uint8_t* __restrict__ e8,
+                                   float* __restrict__ f, size_t nblocks) {
+    size_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < nblocks) {
+        // X = 2^(e8-127) via bit-cast exponent (fast!)
+        f[i] = __uint_as_float(uint32_t(e8[i]) << 23);
+    }
+}
+static inline void launch_e8m0_to_f32(const uint8_t* e8, float* f, size_t n,
+                                      hipStream_t s=0) {
+    if (!n) return;
+    const int T = 256;
+    dim3 grid((int)((n + T - 1) / T));
+    e8m0_to_f32_kernel<<<grid, T, 0, s>>>(e8, f, n);
+    HIP_CHECK(hipGetLastError());
+}
 
 
 static void streaming_quantize_copy_mxfp4_cpu_to_gpu(
@@ -756,6 +782,11 @@ void copy_weights_to_gpu(Transformer *transformer, GPUTransformerWeights *gpu_we
                         gpu_weights->w_mlp1_mxfp4 + packed_off,
                         gpu_weights->w_mlp1_scales + scale_off,
                         /*unused_stream_ok*/ nullptr);
+                    
+                    launch_e8m0_to_f32(gpu_weights->w_mlp1_scales + scale_off,
+                        gpu_weights->w_mlp1_scales_f32 + scale_off,
+                        seg1_loc_scales /* blocks count */);
+
 
                     packed_off += seg1_loc_packed;
                     scale_off  += seg1_loc_scales;
@@ -833,7 +864,11 @@ void copy_weights_to_gpu(Transformer *transformer, GPUTransformerWeights *gpu_we
                         gpu_weights->w_mlp2_mxfp4 + packed_off,
                         gpu_weights->w_mlp2_scales + scale_off,
                         /*unused_stream_ok*/ nullptr);
-
+                    
+                    launch_e8m0_to_f32(gpu_weights->w_mlp2_scales + scale_off,
+                                    gpu_weights->w_mlp2_scales_f32 + scale_off,
+                                    seg2_loc_scales);
+                   
                     packed_off += seg2_loc_packed;
                     scale_off  += seg2_loc_scales;
                 }
@@ -1500,7 +1535,7 @@ int o_len = 0;
     const size_t layer_sc_off   = (size_t)layer_idx * (size_t)E * seg1_blocks_loc;
 
     const uint8_t        *W1_packed_layer = w->w_mlp1_mxfp4 + layer_pack_off;
-    const uint8_t        *S1_layer        = w->w_mlp1_scales + layer_sc_off;
+    const float        *S1_layer        = w->w_mlp1_scales_f32 + layer_sc_off;
 
     dim3 grid((o_len + BLOCK_N_MLP - 1) / BLOCK_N_MLP, cur_tiles);
     dim3 block(LANE_PER_WAVE, WAVES_PER_BLOCK_MLP);
@@ -1564,7 +1599,7 @@ const int Dloc = o_len / 2;
     const size_t layer_sc_off   = (size_t)layer_idx * (size_t)E * seg2_blocks_loc;
 
     const uint8_t        *W2_packed_layer = w->w_mlp2_mxfp4 + layer_pack_off; // local shard
-    const uint8_t        *S2_layer        = w->w_mlp2_scales + layer_sc_off;  // local shard
+    const float        *S2_layer        = w->w_mlp2_scales_f32 + layer_sc_off;  // local shard
     const __hip_bfloat16 *b2s             = w->b_mlp2 + (size_t)layer_idx * (size_t)E * (size_t)H;
 
     dim3 grid((H + BLOCK_N_MLP - 1) / BLOCK_N_MLP, cur_tiles);

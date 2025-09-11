@@ -23,6 +23,72 @@ __device__ __forceinline__ float ldexp_pow2_e8m0(uint8_t e8m0) {
     return ldexpf(1.0f, exp_unbiased);
 }
 
+// Fast, branch-light E2M1 magnitude mapping (no LUT).
+// m in [0..7]  -> {0, 0.5, 1, 1.5, 2, 3, 4, 6}
+__device__ __forceinline__ float mxfp4_mag_from_code(uint8_t m) {
+    // For m<=3: 0.5*m ; for 4..6: (m-2); for 7: 6
+    return (m <= 3) ? (0.5f * float(m))
+                    : ((m < 7) ? float(m - 2) : 6.0f);
+}
+
+// Nibble -> float using scale X (X = 2^(e8m0-127) already as float)
+__device__ __forceinline__ float mxfp4_from_nib(uint8_t nib, float X) {
+    const float mag = mxfp4_mag_from_code(nib & 7);
+    return ((nib & 8) ? -mag : mag) * X;
+}
+
+// --- Variant A: scales stored as E8M0 bytes (current layout) ---
+// packed: 2 nibbles per byte; scales: 1 byte per 32 elements (E8M0)
+__device__ __forceinline__ float dequantize_mxfp4_block32(
+    const uint8_t* __restrict__ packed,
+    const uint8_t* __restrict__ scales_e8m0,
+    size_t idx)
+{
+    // Block & nibble addressing
+    const size_t blk   = idx >> 5;                 // /32
+    const uint8_t byte = packed[idx >> 1];         // /2
+    const uint8_t nib  = (byte >> ((idx & 1) << 2)) & 0xF;
+
+    // X = 2^(e8m0-127) via float bit trick (no ldexpf):
+    // reinterpret exponent field = e8m0, mantissa=0
+    const float X = __uint_as_float(uint32_t(scales_e8m0[blk]) << 23);
+
+    return mxfp4_from_nib(nib, X);
+}
+
+/*
+
+// --- Variant B: scales preexpanded to float on device (recommended) ---
+// (convert once during weight copy; then runtime dequant is just 1 FMA)
+__device__ __forceinline__ float dequantize_mxfp4_block32_fscale_fast(
+    const uint8_t* __restrict__ packed,
+    const float*   __restrict__ scales_f32,
+    size_t idx)
+{
+    const size_t blk   = idx >> 5;
+    const uint8_t byte = packed[idx >> 1];
+    const uint8_t nib  = (byte >> ((idx & 1) << 2)) & 0xF;
+    return mxfp4_from_nib(nib, scales_f32[blk]);
+}
+
+// --- Bonus: decode TWO values from the same byte (even idx) ---
+// Useful in tight loops: one scale fetch, one byte fetch, two outputs.
+__device__ __forceinline__ void dequantize2_mxfp4_block32_fast(
+    const uint8_t* __restrict__ packed,
+    const uint8_t* __restrict__ scales_e8m0,
+    size_t even_idx, float &out0, float &out1)
+{
+    // require even index: even_idx and even_idx+1 share the same byte & block
+    const size_t blk    = even_idx >> 5;
+    const uint8_t b     = packed[even_idx >> 1];
+    const uint8_t nib0  =  b        & 0xF;
+    const uint8_t nib1  = (b >> 4)  & 0xF;
+    const float  X      = __uint_as_float(uint32_t(scales_e8m0[blk]) << 23);
+    out0 = mxfp4_from_nib(nib0, X);
+    out1 = mxfp4_from_nib(nib1, X);
+}
+
+
 // Dequant one element from MXFP4 (block-of-32 with e8m0 scales)
 __device__ __forceinline__ float dequantize_mxfp4_block32(
     const uint8_t* __restrict__ packed,
@@ -39,6 +105,8 @@ __device__ __forceinline__ float dequantize_mxfp4_block32(
 
     return MXFP4_LUT_DEV[nib] * X;
 }
+
+*/
 
 // Reuse MXFP4_LUT_DEV[16] and ldexp_pow2_e8m0() from your header.
 
