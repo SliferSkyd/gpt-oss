@@ -474,10 +474,14 @@ __device__ inline void store_c_tile_addbias(
 
 
 #ifndef WAVES_M_MLP
-#define WAVES_M_MLP 1
+#define WAVES_M_MLP 4
 #endif
 #ifndef WAVES_N_MLP
 #define WAVES_N_MLP 4
+#endif
+
+#ifndef WAVES_K_MLP
+#define WAVES_K_MLP 1
 #endif
 
 static_assert(WM == 16 && WN == 16 && WK == 16, "This MFMA microkernel assumes 16x16x16 bf16 tiles.");
@@ -485,6 +489,7 @@ static_assert(WM == 16 && WN == 16 && WK == 16, "This MFMA microkernel assumes 1
 constexpr int BLOCK_M_MLP = WM * WAVES_M_MLP;        // e.g. 64 if WAVES_M_MLP=4
 constexpr int BLOCK_N_MLP = WN * WAVES_N_MLP;        // e.g. 64 if WAVES_N_MLP=4
 constexpr int WAVES_PER_BLOCK_MLP = WAVES_M_MLP * WAVES_N_MLP;
+constexpr int BLOCK_K_MLP = WK * WAVES_K_MLP;        // e.g. 16 if WAVES_K_MLP=1
 
 __device__ __forceinline__ float fast_expf(float x) {
 #if defined(__HIP_PLATFORM_AMD__) || defined(__HIPCC__)
@@ -618,7 +623,7 @@ __device__ __forceinline__ uint32_t deq2_pack_bf16_u32_fscale(
 }
 
 // Load B tile: global (MXFP4) -> LDS (bf16 col-major).
-// Layout in LDS matches your mfma path: [BLOCK_K x BLOCK_N], ldB = BLOCK_K.
+// Layout in LDS matches your mfma path: [BLOCK_K_MLP x BLOCK_N], ldB = BLOCK_K_MLP.
 template<int LD_B>
 __device__ inline void copy_B_tile_vec_MLP_MXFP4(
     uint32_t* __restrict__ dst_u32,           // writes u32 (2×bf16) into LDS
@@ -628,7 +633,7 @@ __device__ inline void copy_B_tile_vec_MLP_MXFP4(
     int linearT, int threadsPerBlock)
 {
     constexpr int BN_ = BLOCK_N_MLP;
-    constexpr int BK_ = BLOCK_K;
+    constexpr int BK_ = BLOCK_K_MLP;
     const int pairsPerCol = BK_ >> 1;           // 2 elems per u32
     const int totalPairs  = BN_ * pairsPerCol;
 
@@ -663,7 +668,7 @@ __device__ inline void copy_B_tile_vec_MLP_MXFP4_f32(
     int linearT, int threadsPerBlock)
 {
     constexpr int BN_ = BLOCK_N_MLP;
-    constexpr int BK_ = BLOCK_K;
+    constexpr int BK_ = BLOCK_K_MLP;
     const int pairsPerCol = BK_ >> 1;           // 2 elems per u32
     const int totalPairs  = BN_ * pairsPerCol;
 
@@ -692,7 +697,7 @@ __device__ inline void copy_A_tile_vec_MLP(uint32_t* __restrict__ dst_u32,
                                        int m_start, int M_bound, int K, int kBase,
                                        int linearT, int threadsPerBlock) {
     constexpr int BM_ = BLOCK_M_MLP;
-    constexpr int BK_ = BLOCK_K;
+    constexpr int BK_ = BLOCK_K_MLP;
     const int pairsPerRow = BK_ >> 1;
     const int totalPairs  = BM_ * pairsPerRow;
 
@@ -722,7 +727,7 @@ __device__ inline void copy_A_tile_vec_MLP(uint32_t* __restrict__ dst_u32,
 #ifndef PAD_K_MLP
 #define PAD_K_MLP 0   // try 2 or 8 if you see LDS conflicts
 #endif
-static_assert((BLOCK_K % 2) == 0, "BLOCK_K must be even (packs 2×bf16).");
+static_assert((BLOCK_K_MLP % 2) == 0, "BLOCK_K_MLP must be even (packs 2×bf16).");
 static_assert((PAD_K_MLP % 2) == 0, "PAD_K_MLP must be even (u32 pair addressing).");
 
 
@@ -754,8 +759,8 @@ __global__ void grouped_mlp1_mxfp4_kernel(
     const int wave_n = wave % WAVES_N_MLP;
 
     extern __shared__ uint8_t smemRaw[];
-    const int ldA = BLOCK_K + PAD_K_MLP;
-    const int ldB = BLOCK_K + PAD_K_MLP;
+    const int ldA = BLOCK_K_MLP + PAD_K_MLP;
+    const int ldB = BLOCK_K_MLP + PAD_K_MLP;
 
     uint16_t* sA0_u16 = reinterpret_cast<uint16_t*>(smemRaw);
     uint16_t* sA1_u16 = sA0_u16 + (BLOCK_M_MLP * ldA);
@@ -798,7 +803,7 @@ __global__ void grouped_mlp1_mxfp4_kernel(
     const int aRowBase = wave_m * WM;
     const int bColBase = wave_n * WN;
 
-    const int BK_ = BLOCK_K;
+    const int BK_ = BLOCK_K_MLP;
     const int Kmain = (K / BK_) * BK_;
     const bool has_tail = (Kmain < K);
 
@@ -813,7 +818,7 @@ __global__ void grouped_mlp1_mxfp4_kernel(
         }
 
         #pragma unroll
-        for (int kk = 0; kk < BLOCK_K; kk += WK) {
+        for (int kk = 0; kk < BLOCK_K_MLP; kk += WK) {
             bf16x4 avec = make_a_vec_k(currA, ldA, aRowBase, kk, lane);
             bf16x4 bvec = make_b_vec_k(currB, ldB, bColBase, kk, lane);
             acc = mfma_16x16x16_bf16(avec, bvec, acc);
@@ -835,7 +840,7 @@ __global__ void grouped_mlp1_mxfp4_kernel(
 
         __syncthreads();
         #pragma unroll
-        for (int kk = 0; kk < BLOCK_K; kk += WK) {
+        for (int kk = 0; kk < BLOCK_K_MLP; kk += WK) {
             bf16x4 avec = make_a_vec_k(nextA, ldA, aRowBase, kk, lane);
             bf16x4 bvec = make_b_vec_k(nextB, ldB, bColBase, kk, lane);
             acc = mfma_16x16x16_bf16(avec, bvec, acc);
@@ -880,8 +885,8 @@ __global__ void grouped_mlp2_mxfp4_bias_kernel(
     const int wave_n = wave % WAVES_N_MLP;
 
     extern __shared__ uint8_t smemRaw[];
-    const int ldA = BLOCK_K + PAD_K_MLP;
-    const int ldB = BLOCK_K + PAD_K_MLP;
+    const int ldA = BLOCK_K_MLP + PAD_K_MLP;
+    const int ldB = BLOCK_K_MLP + PAD_K_MLP;
 
     uint16_t* sA0_u16 = reinterpret_cast<uint16_t*>(smemRaw);
     uint16_t* sA1_u16 = sA0_u16 + (BLOCK_M_MLP * ldA);
@@ -925,7 +930,7 @@ __global__ void grouped_mlp2_mxfp4_bias_kernel(
     const int aRowBase = wave_m * WM;
     const int bColBase = wave_n * WN;
 
-    const int BK_ = BLOCK_K;
+    const int BK_ = BLOCK_K_MLP;
     const int Kmain = (K / BK_) * BK_;
     const bool has_tail = (Kmain < K);
 
@@ -940,7 +945,7 @@ __global__ void grouped_mlp2_mxfp4_bias_kernel(
         }
 
         #pragma unroll
-        for (int kk = 0; kk < BLOCK_K; kk += WK) {
+        for (int kk = 0; kk < BLOCK_K_MLP; kk += WK) {
             bf16x4 avec = make_a_vec_k(currA, ldA, aRowBase, kk, lane);
             bf16x4 bvec = make_b_vec_k(currB, ldB, bColBase, kk, lane);
             acc = mfma_16x16x16_bf16(avec, bvec, acc);
@@ -963,7 +968,7 @@ __global__ void grouped_mlp2_mxfp4_bias_kernel(
 
         __syncthreads();
         #pragma unroll
-        for (int kk = 0; kk < BLOCK_K; kk += WK) {
+        for (int kk = 0; kk < BLOCK_K_MLP; kk += WK) {
             bf16x4 avec = make_a_vec_k(nextA, ldA, aRowBase, kk, lane);
             bf16x4 bvec = make_b_vec_k(nextB, ldB, bColBase, kk, lane);
             acc = mfma_16x16x16_bf16(avec, bvec, acc);

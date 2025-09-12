@@ -848,6 +848,53 @@ static void streaming_quantize_copy_mxfp4_cpu_to_gpu_strided(
     HIP_CHECK(hipStreamDestroy(s_comp));
 }
 
+// Convert device-side E8M0 scale bytes into float multipliers.
+// Each block of 32 MXFP4 weights has one scale byte (E8M0).
+// The f32 expansion is stored in gpu_weights->w_mlp{1,2}_scales_f32.
+static void convert_all_scales_to_f32(GPUTransformerWeights* w, Config* p, hipStream_t stream=0) {
+    int dev = 0;
+    HIP_CHECK(hipGetDevice(&dev));
+    const int TP = TENSOR_PARALLEL_SIZE;
+    const int rank = dev % TP;
+
+    const int H = p->hidden_dim;
+    const int D = p->intermediate_dim;
+    const int E = p->n_experts;
+    const int L = p->n_layers;
+
+    // ---- MLP1: column-parallel on output (2D) ----
+    int Ostart, Oloc;
+    {
+        const int twoD = 2 * D;
+        const int base = twoD / TP, rem = twoD % TP;
+        Oloc   = base + (rank < rem ? 1 : 0);
+        Ostart = rank * base + (rank < rem ? rank : rem);
+    }
+    const size_t seg1_blocks_loc = ((size_t)Oloc * (size_t)H + 31) / 32;
+    const size_t total_blocks_mlp1 = (size_t)L * (size_t)E * seg1_blocks_loc;
+    if (total_blocks_mlp1) {
+        launch_e8m0_to_f32(w->w_mlp1_scales, w->w_mlp1_scales_f32,
+                           total_blocks_mlp1, stream);
+    }
+
+    // ---- MLP2: row-parallel on input (D) ----
+    int Istart, Kloc;
+    {
+        const int base = D / TP, rem = D % TP;
+        Kloc   = base + (rank < rem ? 1 : 0);
+        Istart = rank * base + (rank < rem ? rank : rem);
+    }
+    const size_t seg2_blocks_loc = ((size_t)H * (size_t)Kloc + 31) / 32;
+    const size_t total_blocks_mlp2 = (size_t)L * (size_t)E * seg2_blocks_loc;
+    if (total_blocks_mlp2) {
+        launch_e8m0_to_f32(w->w_mlp2_scales, w->w_mlp2_scales_f32,
+                           total_blocks_mlp2, stream);
+    }
+
+    HIP_CHECK(hipStreamSynchronize(stream));
+    printf("[MXFP4] Converted %zu MLP1 + %zu MLP2 scale blocks to f32\n",
+           total_blocks_mlp1, total_blocks_mlp2);
+}
 
 
 void copy_weights_to_gpu(Transformer *transformer, GPUTransformerWeights *gpu_weights)
@@ -1079,6 +1126,7 @@ void copy_weights_to_gpu(Transformer *transformer, GPUTransformerWeights *gpu_we
             }
         }
     }
+    convert_all_scales_to_f32(gpu_weights, p);
 
     printf("Weights copied (TP optimized): per-layer strided-gather tiling for MLP1/MLP2, biases BF16.\n");
 }
@@ -1711,8 +1759,8 @@ int o_len = 0;
     dim3 grid((o_len + BLOCK_N_MLP - 1) / BLOCK_N_MLP, cur_tiles);
     dim3 block(LANE_PER_WAVE, WAVES_PER_BLOCK_MLP);
 
-    const int ldA = BLOCK_K + PAD_K_MC;
-    const int ldB = BLOCK_K + PAD_K_MC;
+    const int ldA = BLOCK_K_MLP + PAD_K_MC;
+    const int ldB = BLOCK_K_MLP + PAD_K_MC;
     const size_t shmem =
         sizeof(float) * (size_t)(2 * BLOCK_M_MLP * ldA +   // sA0, sA1
                                  2 * ldB * BLOCK_N_MLP +   // sB0, sB1
@@ -1778,8 +1826,8 @@ const int Dloc = o_len / 2;
     dim3 grid((H + BLOCK_N_MLP - 1) / BLOCK_N_MLP, cur_tiles);
     dim3 block(LANE_PER_WAVE, WAVES_PER_BLOCK_MLP);
 
-    const int ldA = BLOCK_K + PAD_K_MC;
-    const int ldB = BLOCK_K + PAD_K_MC;
+    const int ldA = BLOCK_K_MLP + PAD_K_MC;
+    const int ldB = BLOCK_K_MLP + PAD_K_MC;
     const size_t shmem =
         sizeof(float) * (size_t)(2 * BLOCK_M_MLP * ldA +   // sA0, sA1
                                  2 * ldB * BLOCK_N_MLP);   // sB0, sB1
