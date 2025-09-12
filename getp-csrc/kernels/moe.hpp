@@ -947,7 +947,7 @@ template<
     int TW_M=1,  int TW_N=2,
     int PAD_K=0
 >
-inline void launch_grouped_mlp1_tuned(
+inline void mlp1(
     float* C, const float* A, const __hip_bfloat16* W1,
     const int* expert_offsets, const int* expert_counts,
     const int* tile2expert, const int* tile2local,
@@ -995,7 +995,7 @@ template<
     int TW_M=1,  int TW_N=2,
     int PAD_K=0
 >
-inline void launch_grouped_mlp2_tuned(
+inline void mlp2(
     float* C, const float* A, const __hip_bfloat16* W2, const __hip_bfloat16* b2,
     const int* expert_offsets, const int* expert_counts,
     const int* tile2expert, const int* tile2local,
@@ -1033,36 +1033,3 @@ inline void launch_grouped_mlp2_tuned(
         tile2expert, tile2local, E, K, N);
     HIP_CHECK(hipGetLastError());
 }
-
-// ================================
-// Defaults (match your current config)
-// (TW_N=2 so each wave computes 16x32; WAVES_N=8 → BN=256)
-// ================================
-inline void launch_mlp1_default(
-    float* C, const float* A, const __hip_bfloat16* W1,
-    const int* expert_offsets, const int* expert_counts,
-    const int* tile2expert, const int* tile2local,
-    int E, int H, int twoD, int cur_tiles, hipStream_t s)
-{
-    launch_grouped_mlp1_tuned<
-        16,16,16,  /*WAVES_M,N,K*/ 1,8,2,
-        /*TW_M,TW_N*/ 1,1,
-        /*PAD_K*/ 0>(
-        C, A, W1, expert_offsets, expert_counts, tile2expert, tile2local,
-        /*E=*/E, /*K=*/H, /*N=*/twoD, cur_tiles, s);
-}
-
-inline void launch_mlp2_default(
-    float* C, const float* A, const __hip_bfloat16* W2, const __hip_bfloat16* b2,
-    const int* expert_offsets, const int* expert_counts,
-    const int* tile2expert, const int* tile2local,
-    int E, int D, int H, int cur_tiles, hipStream_t s)
-{
-    launch_grouped_mlp2_tuned<
-        16,16,16,  /*WAVES_M,N,K*/ 1,8,2,
-        /*TW_M,TW_N*/ 1,1,
-        /*PAD_K*/ 0>(
-        C, A, W2, b2, expert_offsets, expert_counts, tile2expert, tile2local,
-        /*E=*/E, /*K=*/D, /*N=*/H, cur_tiles, s);
-}
-

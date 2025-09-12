@@ -829,7 +829,7 @@ void attention_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size,
         const int woff = layer_idx * H * QKV;
         matmul<
             /*WM,WN,WK*/ 16,16,16,
-            /*WAVES_M,N,K*/ 1,4,2,
+            /*WAVES_M,N,K*/ 4,4,1,
             /*TW_M,TW_N*/ 1,1,
             /*PAD_K*/ 0,
             /*FUSED*/ false
@@ -897,7 +897,7 @@ void attention_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size,
         const int boff = (size_t)layer_idx * H;
         matmul<
             16,16,16,
-            1,4,2,
+            4,4,1,
             1,1,
             0,
             /*FUSED*/ true
@@ -951,7 +951,7 @@ void moe_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size,
         // Corrected: matmul signature is (C, A, Wbf16, M,K,N, bias=nullptr, stream=nullptr)
         matmul<
             16,16,16,
-            1,4,2,
+            4,4,1,
             1,1,
             0,
             /*FUSED*/ false
@@ -1008,7 +1008,7 @@ void moe_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size,
         HIP_CHECK(hipMemsetAsync(s->d_expert_write_idx, 0, E * sizeof(int), sMoe));
 
         // Tile mapping along M uses the same per-block M as the default launcher (WM=16, WAVES_M=1)
-        constexpr int BLOCK_M_MLP = 16 * 1; // keep in sync with launch_mlp*_default above
+        constexpr int BLOCK_M_MLP = 16 * 4; // keep in sync with launch_mlp*_default above
 
         cur_tiles = 0;
         for (int e = 0; e < E; ++e) {
@@ -1047,7 +1047,9 @@ void moe_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size,
         const size_t w1_off = (size_t)layer_idx * (size_t)E * seg1;
         const __hip_bfloat16 *W1 = w->w_mlp1 + w1_off;
 
-        launch_mlp1_default(
+        mlp1<16,16,16,  /*WAVES_M,N,K*/ 4,4,1,
+            /*TW_M,TW_N*/ 1,1,
+            /*PAD_K*/ 0>(
             /*C=*/mlp1_out_mb, /*A=*/exp_in_mb, /*W1=*/W1,
             s->d_expert_offsets, s->d_expert_counts,
             s->d_tile2expert, s->d_tile2local,
@@ -1070,11 +1072,13 @@ void moe_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size,
         const __hip_bfloat16 *W2 = w->w_mlp2 + w2_off;
         const __hip_bfloat16 *b2 = w->b_mlp2 + (size_t)layer_idx * (size_t)E * H;
 
-        launch_mlp2_default(
-            /*C=*/exp_out_mb, /*A=*/gate_up_mb, /*W2=*/W2, /*b2=*/b2,
-            s->d_expert_offsets, s->d_expert_counts,
-            s->d_tile2expert, s->d_tile2local,
-            /*E=*/E, /*D=*/D, /*H=*/H, /*cur_tiles=*/cur_tiles, sMoe);
+        mlp2<16,16,16,  /*WAVES_M,N,K*/ 4,4,1,
+            /*TW_M,TW_N*/ 1,1,
+            /*PAD_K*/ 0>(
+                /*C=*/exp_out_mb, /*A=*/gate_up_mb, /*W2=*/W2, /*b2=*/b2,
+                s->d_expert_offsets, s->d_expert_counts,
+                s->d_tile2expert, s->d_tile2local,
+                /*E=*/E, /*D=*/D, /*H=*/H, /*cur_tiles=*/cur_tiles, sMoe);
     }
 
     // 5) reduce + residual
@@ -1208,7 +1212,7 @@ int *forward_batch_gpu(GPUTransformer *gpu_t, int *tokens, int batch_size)
     {
         matmul<
             16,16,16,
-            1,4,2,
+            4,4,1,
             1,1,
             0,
             false>(s->logits, s->x, w->out, B, H, p->vocab_size);
