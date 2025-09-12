@@ -34,6 +34,8 @@
 #ifndef GETP_RUN
 #define GETP_RUN
 
+#define BLOCK_M_MLP 16 * 4
+
 int num_gpus = 1;
 
 // GPU Transformer Weights struct - stores all model weights on GPU in bfloat16 format
@@ -320,8 +322,8 @@ void malloc_gpu_run_state(GPURunState *s, Config *p)
     HIP_CHECK(hipMalloc((void **)&s->gate_up_g, (size_t)pairs_max * Dloc_max * sizeof(float)));
     HIP_CHECK(hipMalloc((void **)&s->expert_output_partial_g, (size_t)pairs_max * H * sizeof(float)));
     HIP_CHECK(hipMalloc((void **)&s->expert_output_gather_g, (size_t)TP * pairs_max * H * sizeof(float)));
-
-    s->cap_tiles = (pairs_max + BLOCK_M_MLP - 1) / BLOCK_M_MLP + E;
+    
+    s->cap_tiles = (pairs_max + BLOCK_M_MLP - 1) / BLOCK_M_MLP + E * 12;
     HIP_CHECK(hipMalloc((void **)&s->d_tile2expert_g, s->cap_tiles * sizeof(int)));
     HIP_CHECK(hipMalloc((void **)&s->d_tile2local_g, s->cap_tiles * sizeof(int)));
 
@@ -992,7 +994,13 @@ void attention_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size,
     // 2) QKV
     {
         const int woff = layer_idx * H * QKV;
-        matmul_mc(qkv_mb, t_mb, w->w_qkv + woff, batch_size, H, QKV, sAttn);
+        matmul<
+            /*WM,WN,WK*/ 16,16,16,
+            /*WAVES_M,N,K*/ 2,4,2,
+            /*TW_M,TW_N*/ 1,1,
+            /*PAD_K*/ 0,
+            /*FUSED*/ false
+        >(qkv_mb, t_mb, w->w_qkv + woff, batch_size, H, QKV, nullptr, sAttn);
         HIP_CHECK(hipGetLastError());
     }
     // 3) bias
@@ -1053,18 +1061,14 @@ void attention_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size,
         const int woff = (size_t)layer_idx * Kproj * H;
         const int boff = (size_t)layer_idx * H;
 
-        dim3 gridDim((N + BLOCK_N - 1) / BLOCK_N, (batch_size + BLOCK_M - 1) / BLOCK_M);
-        dim3 blockDim(LANE_PER_WAVE, WAVES_PER_BLOCK);
-        const int ldA = BLOCK_K + PAD_K_MC;
-        const int ldB = BLOCK_K + PAD_K_MC;
-        const size_t shmem =
-            sizeof(uint16_t) * (size_t)(2 * BLOCK_M * ldA + 2 * ldB * BLOCK_N);
-        assert_smem_or_die(shmem, "fused_output_projection_kernel_optimized");
-
-        fused_output_projection_kernel_optimized<<<gridDim, blockDim, shmem, sAttn>>>(
-            s->x + (size_t)row_offset * H, s->tb + (size_t)row_offset * Kproj,
-            w->w_o + woff, w->b_o + boff,
-            /*M=*/batch_size, /*K=*/Kproj, /*N=*/N);
+        matmul<
+            16,16,16,
+            2,4,2,
+            1,1,
+            0,
+            /*FUSED*/ true
+        >(x_mb, tb_mb, w->w_o + woff, /*M=*/batch_size, /*K=*/Hd*NA, /*N=*/H,
+        /*bias=*/w->b_o + boff, /*stream=*/sAttn);
         HIP_CHECK(hipGetLastError());
     }
 }
@@ -1176,9 +1180,16 @@ void moe_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size,
     }
     tp_group_barrier(tp);
 
-    // 2) Router on union -> topk indices/weights (softmax on top-k scores)
-    matmul_mc(s->router_score_g, s->gather_x_g,
-              w->w_router + (size_t)layer_idx * H * E, Bgrp, H, E, sMoe);
+    matmul<
+        16,16,16,
+        2,4,2,
+        1,1,
+        0,
+        /*FUSED*/ false
+    >(s->router_score_g, s->gather_x_g,
+        w->w_router + (size_t)layer_idx * H * E,
+        /*M=*/Bgrp, /*K=*/H, /*N=*/E,
+        /*bias=*/nullptr, /*stream=*/sMoe);
     HIP_CHECK(hipGetLastError());
     {
         const int elems = Bgrp * E;
@@ -1279,16 +1290,13 @@ void moe_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size,
         const size_t seg1_loc = (size_t)o_len * H; // per-expert stride in local shard
         const __hip_bfloat16 *W1 = w->w_mlp1 + (size_t)layer_idx * (size_t)E * seg1_loc;
 
-        dim3 grid((o_len + BLOCK_N_MLP - 1) / BLOCK_N_MLP, cur_tiles);
-        dim3 block(LANE_PER_WAVE, WAVES_PER_BLOCK_MLP);
-        const size_t shmem = (size_t)(2 * BLOCK_M_MLP * BLOCK_K + 2 * BLOCK_K * BLOCK_N_MLP) * sizeof(uint16_t);
-        assert_smem_or_die(shmem, "grouped_mlp1_bf16_kernel(TP)");
-        hipLaunchKernelGGL(grouped_mlp1_bf16_kernel, grid, block, shmem, sMoe,
-                           s->mlp1_out_g, s->expert_input_buffer_g, W1,
-                           s->d_expert_offsets, s->d_expert_counts,
-                           s->d_tile2expert_g, s->d_tile2local_g,
-                           E, /*K=*/H, /*N=*/o_len);
-        HIP_CHECK(hipGetLastError());
+        mlp1<16,16,16,  /*WAVES_M,N,K*/ 2,4,2,
+            /*TW_M,TW_N*/ 1,1,
+            /*PAD_K*/ 0>(
+            s->mlp1_out_g, s->expert_input_buffer_g, W1,
+            s->d_expert_offsets, s->d_expert_counts,
+            s->d_tile2expert_g, s->d_tile2local_g,
+            /*E=*/E, /*H=*/H, /*twoD=*/o_len, /*cur_tiles=*/cur_tiles, sMoe);
     }
 
     // 6) SwiGLU + bias for local columns -> gate_up_g with Dloc = o_len/2
@@ -1325,16 +1333,14 @@ void moe_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size,
         const size_t seg2_loc = (size_t)H * (size_t)i_len;
         const __hip_bfloat16 *W2 = w->w_mlp2 + (size_t)layer_idx * (size_t)E * seg2_loc;
         const __hip_bfloat16 *b2s = w->b_mlp2 + (size_t)layer_idx * (size_t)E * H;
-
-        dim3 grid((H + BLOCK_N_MLP - 1) / BLOCK_N_MLP, cur_tiles);
-        dim3 block(LANE_PER_WAVE, WAVES_PER_BLOCK_MLP);
-        const size_t shmem = (size_t)(2 * BLOCK_M_MLP * BLOCK_K + 2 * BLOCK_K * BLOCK_N_MLP) * sizeof(uint16_t);
-        assert_smem_or_die(shmem, "grouped_mlp2_bf16_bias_kernel(TP)");
-        hipLaunchKernelGGL(grouped_mlp2_bf16_bias_kernel, grid, block, shmem, sMoe,
-                           s->expert_output_partial_g, s->gate_up_g, W2, b2s,
+        
+        mlp2<16,16,16,  /*WAVES_M,N,K*/ 2,4,2,
+            /*TW_M,TW_N*/ 1,1,
+            /*PAD_K*/ 0>(
+                s->expert_output_partial_g, s->gate_up_g, W2, b2s,
                            s->d_expert_offsets, s->d_expert_counts,
                            s->d_tile2expert_g, s->d_tile2local_g,
-                           E, /*K=*/i_len, /*N=*/H);
+                /*E=*/E, /*D=*/i_len, /*H=*/H, /*cur_tiles=*/cur_tiles, sMoe);
         HIP_CHECK(hipGetLastError());
     }
 
@@ -1519,7 +1525,12 @@ int *forward_batch_gpu(GPUTransformer *gpu_t, int *tokens, int batch_size)
         HIP_CHECK(hipGetLastError());
     }
     {
-        matmul_mc(s->logits, s->x, w->out, B, H, p->vocab_size);
+        matmul<
+            16,16,16,
+            2,4,2,
+            1,1,
+            0,
+            false>(s->logits, s->x, w->out, B, H, p->vocab_size);
         HIP_CHECK(hipGetLastError());
     }
     {
