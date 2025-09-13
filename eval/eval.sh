@@ -1,1 +1,3 @@
-python eval.py -p /nfs/gpu_trainee/getp02/gpt-oss/data/input.txt -s /nfs/gpu_trainee/getp02/gpt-oss/data/output_sliding_window.txt -r /nfs/gpu_trainee/getp02/gpt-oss/eval/ref_new_truncated_100.jsonl
+export MODELS_ROOT="/nfs/gpu_trainee/final-project/models"
+export MODELBIN_ROOT="/nfs/gpu_trainee/final-project/modelbin"
+srun -N 1 --gres=gpu:2 python evaluation.py -m 120b
