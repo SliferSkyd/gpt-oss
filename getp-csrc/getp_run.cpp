@@ -264,19 +264,16 @@ void malloc_gpu_run_state(GPURunState *s, Config *p)
     size_t batch_hidden = BATCH_SIZE * H * sizeof(float);
     size_t batch_qkv = BATCH_SIZE * p->head_dim * (p->n_attn_heads + 2 * p->n_kv_heads) * sizeof(float);
 
-    // per-layer capacities: even layers use SW_WINDOW (if sliding enabled), odd are full
-    const int n_even = (p->n_layers + 1) / 2;
-    const int n_odd = p->n_layers - n_even;
-    const int even_cap = (p->sliding_window > 0 ? SW_WINDOW : MAX_SEQ_LEN);
+    // --- per-layer capacity is uniform now ---
+    const int per_layer_cap = (p->sliding_window > 0 ? SW_WINDOW : MAX_SEQ_LEN);
+    const size_t layers_capacity = (size_t)p->n_layers * (size_t)per_layer_cap;
+    const size_t kv_cache_size =
+        (size_t)BATCH_SIZE * layers_capacity * (size_t)kv_dim * sizeof(__hip_bfloat16);
 
-    const size_t layers_capacity =
-        (size_t)n_even * (size_t)even_cap + (size_t)n_odd * (size_t)MAX_SEQ_LEN;
-
-    size_t kv_cache_size = (size_t)BATCH_SIZE * layers_capacity * (size_t)kv_dim * sizeof(__hip_bfloat16);
-
-    printf("KV cache (fp32) total capacity: layers_capacity=%zu positions/layer-stack\n",
-           layers_capacity);
+    printf("KV cache total capacity: %zu layers × %d positions = %zu positions per slot\n",
+        (size_t)p->n_layers, per_layer_cap, layers_capacity);
     printf("KV cache size per batch: %zu MB\n", kv_cache_size / (1024 * 1024));
+
 
     // Base activations
     HIP_CHECK(hipMalloc((void **)&s->x, batch_hidden));
@@ -1411,23 +1408,12 @@ void attention_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size,
     const int KV = Hd * NK;
     const int QKV = Hd * (NA + 2 * NK);
 
-    const int even_cap = (p->sliding_window > 0 ? SW_WINDOW : MAX_SEQ_LEN);
+    const int  per_layer_cap = (p->sliding_window > 0 ? SW_WINDOW : MAX_SEQ_LEN);
+    const size_t layers_capacity = (size_t)p->n_layers * (size_t)per_layer_cap;
+    const size_t kv_slice        = layers_capacity * (size_t)KV;
 
-    size_t layers_capacity = 0;
-    for (int L = 0; L < p->n_layers; ++L)
-    {
-        const bool evenL = ((L & 1) == 0);
-        layers_capacity += (size_t)(evenL ? even_cap : MAX_SEQ_LEN);
-    }
-    const size_t kv_slice = layers_capacity * (size_t)KV;
+    const size_t layer_elem_offset = (size_t)layer_idx * (size_t)per_layer_cap * (size_t)KV;
 
-    size_t layer_pos_offset = 0;
-    for (int L = 0; L < layer_idx; ++L)
-    {
-        const bool evenL = ((L & 1) == 0);
-        layer_pos_offset += (size_t)(evenL ? even_cap : MAX_SEQ_LEN);
-    }
-    const size_t layer_elem_offset = layer_pos_offset * (size_t)KV;
 
     float *x_mb = s->x + (size_t)row_offset * H;
     float *t_mb = s->t + (size_t)row_offset * H;
@@ -1484,13 +1470,14 @@ void attention_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size,
         update_kv_cache_kernel<<<grid, block, 0, sAttn>>>(
             key_cache_mb, value_cache_mb, k_mb, v_mb, pos_mb,
             batch_size, p->n_layers, layer_idx, MAX_SEQ_LEN, KV,
-            /* batch_kv_stride = */ layers_capacity * (size_t)KV,
-            /* layer_kv_offset = */ layer_elem_offset);
+            /*batch_kv_stride*/ layers_capacity * (size_t)KV,
+            /*layer_kv_offset*/ layer_elem_offset,
+            /*use_sliding_window*/ (p->sliding_window > 0));  // NEW ARG
     }
     // 6) fused attention
     {
         // TIMER_BLOCK("fused_attention_kernel_attention");
-        const bool apply_window = (p->sliding_window > 0) && ((layer_idx & 1) == 0);
+        const bool apply_window = (p->sliding_window > 0);
         constexpr int HOST_WARPSIZE = 64;
         dim3 grid(batch_size, NA);
         dim3 block(256);
@@ -2067,35 +2054,21 @@ static inline void clear_kv_cache_for_slot(GPURunState *s, const Config *p, int 
         return;
 
     const int kv_dim = p->head_dim * p->n_kv_heads;
-    const size_t elem_bytes = sizeof(float);
+    const size_t elem_bytes = sizeof(__hip_bfloat16); // matches actual cache type
 
-    const int even_cap = (p->sliding_window > 0 ? SW_WINDOW : MAX_SEQ_LEN);
-
-    size_t layers_capacity = 0;
-    for (int L = 0; L < p->n_layers; ++L)
-    {
-        const bool evenL = ((L & 1) == 0);
-        layers_capacity += (size_t)(evenL ? even_cap : MAX_SEQ_LEN);
-    }
+    const int per_layer_cap = (p->sliding_window > 0 ? SW_WINDOW : MAX_SEQ_LEN);
+    const size_t layers_capacity = (size_t)p->n_layers * (size_t)per_layer_cap;
     const size_t slot_base_elems = (size_t)slot * layers_capacity * (size_t)kv_dim;
 
-    size_t layer_pos_offset = 0;
-    for (int L = 0; L < p->n_layers; ++L)
-    {
-        const bool evenL = ((L & 1) == 0);
-        const size_t capL = (size_t)(evenL ? even_cap : MAX_SEQ_LEN);
-
-        const size_t layer_base_elems = slot_base_elems + layer_pos_offset * (size_t)kv_dim;
-        const size_t bytes_this_layer = capL * (size_t)kv_dim * elem_bytes;
-
-        void *k_ptr = (void *)((char *)s->key_cache + layer_base_elems * elem_bytes);
+    for (int L = 0; L < p->n_layers; ++L) {
+        const size_t layer_base_elems = slot_base_elems + (size_t)L * (size_t)per_layer_cap * (size_t)kv_dim;
+        const size_t bytes_this_layer = (size_t)per_layer_cap * (size_t)kv_dim * elem_bytes;
+        void *k_ptr = (void *)((char *)s->key_cache   + layer_base_elems * elem_bytes);
         void *v_ptr = (void *)((char *)s->value_cache + layer_base_elems * elem_bytes);
-
         HIP_CHECK(hipMemset(k_ptr, 0, bytes_this_layer));
         HIP_CHECK(hipMemset(v_ptr, 0, bytes_this_layer));
-
-        layer_pos_offset += capL;
     }
+
 }
 
 long long continuous_batching_inference(Tokenizer *tokenizer,
@@ -2283,7 +2256,7 @@ long long continuous_batching_inference(Tokenizer *tokenizer,
             HIP_CHECK(hipMemcpy(state->positions, cpu_buf->positions, BATCH_SIZE * sizeof(int), hipMemcpyHostToDevice));
         }
     }
-
+    /*
     int max_steps = gpu_transformers[0]->config.seq_len;
     Config *p0 = gpu_transformers[0] ? &gpu_transformers[0]->config : nullptr;
 
@@ -2316,6 +2289,7 @@ long long continuous_batching_inference(Tokenizer *tokenizer,
     fflush(stdout);
 
     write_profile_info();
+    */
     return total_tokens_generated;
 }
 

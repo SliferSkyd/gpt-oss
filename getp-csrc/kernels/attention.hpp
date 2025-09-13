@@ -87,7 +87,7 @@ __global__ void fused_attention_kernel(
         output + 1LL * b * n_heads * head_dim + 1LL * h * head_dim;
 
     // Windowing + capacities
-    const bool apply_window = use_sliding_window && ((layer_idx & 1) == 0);
+    const bool apply_window = use_sliding_window;
     const int  win_start    = apply_window ? max(0, pos - (SW_WINDOW - 1)) : 0;
     const int  win_core_len = pos - win_start + 1;                  // tokens before sink
     const int  att_cap      = apply_window ? (SW_WINDOW + 1) : seq_len; // <= host reserve
@@ -102,8 +102,9 @@ __global__ void fused_attention_kernel(
     // ---- Pass 1: compute attention scores into s_att[0..win_core_len-1]
     for (int w = wid; w < win_core_len; w += WARPS) {
         const int t = win_start + w;
-        const __hip_bfloat16 *k_vec = k_base + 1LL * ((layer_idx & 1) ? t : t % SW_WINDOW) * kv_dim
-                                      + 1LL * kv_h * head_dim;
+        const __hip_bfloat16 *k_vec =
+            k_base + 1LL * (apply_window ? (t % SW_WINDOW) : t) * kv_dim
+                + 1LL * kv_h * head_dim;
 
         float prod = 0.f;
         if (lane < head_dim) {
@@ -151,8 +152,9 @@ __global__ void fused_attention_kernel(
         float partial = 0.f;
         for (int w = wid; w < win_core_len; w += WARPS) {
             const int t = win_start + w;
-            const __hip_bfloat16 *v_vec = v_base + 1LL * ((layer_idx & 1) ? t : t % SW_WINDOW) * kv_dim
-                                          + 1LL * kv_h * head_dim;
+            const __hip_bfloat16 *v_vec =
+                v_base + 1LL * (apply_window ? (t % SW_WINDOW) : t) * kv_dim
+                    + 1LL * kv_h * head_dim;
             const float vf = __bfloat162float(v_vec[lane]);
             partial += (double)s_att[w] * vf;
         }
@@ -175,25 +177,25 @@ __global__ void update_kv_cache_kernel(__hip_bfloat16 *key_cache, __hip_bfloat16
                                        const float *k, const float *v,
                                        const int *positions, int batch_size,
                                        int n_layers, int layer_idx, int seq_len,
-                                       int kv_dim, size_t batch_kv_stride, size_t layer_kv_offset)
+                                       int kv_dim, size_t batch_kv_stride, size_t layer_kv_offset,
+                                       bool use_sliding_window)  // <--- NEW
 {
     size_t batch_idx = blockIdx.x;
-    size_t dim_idx = 1LL * blockIdx.y * blockDim.y + threadIdx.y;
+    size_t dim_idx   = 1LL * blockIdx.y * blockDim.y + threadIdx.y;
 
-    if (batch_idx >= (size_t)batch_size || dim_idx >= (size_t)kv_dim)
-        return;
+    if (batch_idx >= (size_t)batch_size || dim_idx >= (size_t)kv_dim) return;
 
-    int pos = positions[batch_idx];
-    if (pos >= seq_len)
-        return; // Safety check
+    const int pos = positions[batch_idx];
+    if (pos >= seq_len) return;
 
     const size_t base = (size_t)batch_idx * batch_kv_stride + layer_kv_offset;
-    const int row = ((layer_idx & 1) ? pos : (pos % SW_WINDOW));
-    const size_t cache_idx = base + (size_t)row * (size_t)kv_dim + (size_t)dim_idx;
+    const int row = use_sliding_window ? (pos % SW_WINDOW) : pos;   // <--- unified
 
-    key_cache[cache_idx]   = __float2bfloat16(k[1LL*batch_idx * kv_dim + dim_idx]);
-    value_cache[cache_idx] = __float2bfloat16(v[1LL*batch_idx * kv_dim + dim_idx]);
+    const size_t cache_idx = base + (size_t)row * (size_t)kv_dim + (size_t)dim_idx;
+    key_cache[cache_idx]   = __float2bfloat16(k[1LL * batch_idx * kv_dim + dim_idx]);
+    value_cache[cache_idx] = __float2bfloat16(v[1LL * batch_idx * kv_dim + dim_idx]);
 }
+
 
 
 // Stores the accumulator tile back to global memory and performs the fusion steps.
