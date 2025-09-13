@@ -195,8 +195,10 @@ __global__ void route_and_pack_fused_kernel(
     int* kidx    = excl  + T;     // [T]  (which k matched e, or -1)
     int* toklist = kidx  + T;     // [T]  (selected token indices in this chunk)
     int* cmplist = toklist + T;   // [T]  (their compact indices)
+    int* carry_shared = cmplist + T; // [1]  (shared carry value)
 
-    int carry = 0;                // how many tokens for expert e packed so far
+    if (tid == 0) carry_shared[0] = 0;  // Initialize shared carry
+    __syncthreads();
 
     // Process tokens in tiles of T to support B > T
     for (int base = 0; base < B; base += T) {
@@ -229,7 +231,7 @@ __global__ void route_and_pack_fused_kernel(
 
         // ---- 3) For selected tokens: compute compact_idx, store lists, fill ids/wts ----
         if (flags[tid]) {
-            const int compact_idx = expert_offsets[e] + carry + rank_local;
+            const int compact_idx = expert_offsets[e] + carry_shared[0] + rank_local;
             const int lid = t_global * K + kidx[tid];
 
             // per-(b,k) mapping; exactly one expert block writes each entry
@@ -255,7 +257,7 @@ __global__ void route_and_pack_fused_kernel(
         __syncthreads();
 
         // ---- 5) Advance global carry for this expert ----
-        if (tid == 0) carry += chunk_total;
+        if (tid == 0) carry_shared[0] += chunk_total;
         __syncthreads();
     }
 }
@@ -1043,114 +1045,6 @@ inline void mlp2(
         C, A, W2, b2, expert_offsets, expert_counts,
         tile2expert, tile2local, E, K, N);
     HIP_CHECK(hipGetLastError());
-}
-
-// --- compact score/index pair for reductions ---
-struct __align__(8) ScorePick {
-    float v;
-    int   i;
-};
-
-__device__ __forceinline__ bool better_pick(ScorePick a, ScorePick b, float eps) {
-    // epsilon-stable: prefer larger; if ~equal within eps*max(|.|), prefer smaller index
-    float thr = eps * fmaxf(fabsf(a.v), fabsf(b.v));
-    if (a.v > b.v + thr) return true;
-    if (fabsf(a.v - b.v) <= thr && a.i < b.i) return true;
-    return false;
-}
-
-// block-wide reduction to best pick; uses shared memory array of ScorePick size=blockDim.x
-__device__ __forceinline__ ScorePick reduce_block_best(ScorePick local, ScorePick* smem, float eps) {
-    const int tid = threadIdx.x;
-    smem[tid] = local;
-    __syncthreads();
-    for (int s = blockDim.x >> 1; s > 0; s >>= 1) {
-        if (tid < s) {
-            ScorePick r = smem[tid + s];
-            if (better_pick(r, smem[tid], eps)) smem[tid] = r;
-        }
-        __syncthreads();
-    }
-    return smem[0]; // valid at tid==0
-}
-
-// Kernel: one block per token. Reads router_score once to smem (with bf16 bias).
-// Uses a visited bitmap to avoid mutating the score array for K rounds.
-template<int KSEL>
-__global__ void route_select_softmax_kernel(
-    const float* __restrict__ router_score,        // [B, E]
-    const __hip_bfloat16* __restrict__ bias_bf16,  // [E]
-    int n_experts,
-    float* __restrict__ topk_v_out,                // [B, KSEL]
-    int*   __restrict__ topk_i_out)                // [B, KSEL]
-{
-    const int b   = blockIdx.x;
-    const int tid = threadIdx.x;
-
-    const float* s_in = router_score + (size_t)b * n_experts;
-    float* v_out = topk_v_out + (size_t)b * KSEL;
-    int*   i_out = topk_i_out + (size_t)b * KSEL;
-
-    // Shared memory layout:
-    // [ scores(E floats) | visited(E bytes) | scratch(blockDim.x ScorePick) | sel_idx(K) | sel_val(K) ]
-    extern __shared__ unsigned char smem_raw[];
-    float* scores = reinterpret_cast<float*>(smem_raw);
-    unsigned char* visited = reinterpret_cast<unsigned char*>(scores + n_experts);
-
-    // align the rest to 8 bytes for ScorePick
-    uintptr_t p = reinterpret_cast<uintptr_t>(visited + n_experts);
-    p = (p + 7u) & ~uintptr_t(7u);
-    ScorePick* scratch = reinterpret_cast<ScorePick*>(p);
-    int* sel_idx = reinterpret_cast<int*>(scratch + blockDim.x);
-    float* sel_val = reinterpret_cast<float*>(sel_idx + KSEL);
-
-    // 1) load scores (+bf16 bias) and clear visited flags
-    for (int i = tid; i < n_experts; i += blockDim.x) {
-        scores[i]  = s_in[i] + __bfloat162float(bias_bf16[i]);
-        visited[i] = 0;
-    }
-    if (tid < KSEL) { sel_idx[tid] = -1; sel_val[tid] = -INFINITY; }
-    __syncthreads();
-
-    // 2) K selections with epsilon-stable tie-break
-    constexpr float EPS = 1e-6f;
-#pragma unroll
-    for (int sel = 0; sel < KSEL; ++sel) {
-        // local scan
-        ScorePick best = { -INFINITY, n_experts };
-        for (int i = tid; i < n_experts; i += blockDim.x) {
-            if (!visited[i]) {
-                ScorePick cand = { scores[i], i };
-                if (better_pick(cand, best, EPS)) best = cand;
-            }
-        }
-        // reduce to block best
-        ScorePick blk = reduce_block_best(best, scratch, EPS);
-
-        if (tid == 0) {
-            sel_idx[sel] = blk.i;
-            sel_val[sel] = blk.v;
-            if (blk.i < n_experts) visited[blk.i] = 1; // mark used
-        }
-        __syncthreads();
-    }
-
-    // 3) softmax over the K selected only
-    if (tid == 0) {
-        float mx = sel_val[0];
-#pragma unroll
-        for (int i = 1; i < KSEL; ++i) mx = fmaxf(mx, sel_val[i]);
-        float ex[KSEL];
-        float sum = 0.f;
-#pragma unroll
-        for (int i = 0; i < KSEL; ++i) { ex[i] = expf(sel_val[i] - mx); sum += ex[i]; }
-        const float inv = 1.f / sum;
-#pragma unroll
-        for (int i = 0; i < KSEL; ++i) {
-            v_out[i] = ex[i] * inv;   // normalized
-            i_out[i] = sel_idx[i];
-        }
-    }
 }
 
 
