@@ -15,116 +15,116 @@ sliding window: 128
 swiglu_limit: 7.000000
 requests size = 134348800 B
 Num requests: 512
-KV cache (fp32) total capacity: layers_capacity=13824 positions/layer-stack
-KV cache size per batch: 6912 MB
-KV cache (fp32) total capacity: layers_capacity=13824 positions/layer-stack
-KV cache size per batch: 6912 MB
-[streaming quantize strided] tile    32 rows,   74.00 ms,   13.36 GB/s
-[streaming quantize strided] tile    32 rows,   75.00 ms,   13.18 GB/s
-[MXFP4][TP][MLP1] First elem: CPU=0 nib=0 e8m0=122 deq=0
+KV window on GPU: win_len=4, row_stride_alloc=2097152 floats, bytes/batch=2048 MB
+KV window on GPU: win_len=4, row_stride_alloc=2097152 floats, bytes/batch=2048 MB
+KV cache host-pinned: row_stride=7077888 floats, bytes/batch=6912 MB
+KV cache host-pinned: row_stride=7077888 floats, bytes/batch=6912 MB
+[streaming quantize strided] tile    32 rows,   42.00 ms,   23.54 GB/s
 [MXFP4][TP][MLP1] First elem: CPU=0.015625 nib=2 e8m0=121 deq=0.015625
-[streaming quantize strided] tile    32 rows,   76.00 ms,   13.01 GB/s
-[streaming quantize strided] tile    32 rows,   76.00 ms,   13.01 GB/s
+[streaming quantize strided] tile    32 rows,   64.00 ms,   15.45 GB/s
+[streaming quantize strided] tile    32 rows, 1069.00 ms,    0.92 GB/s
+[streaming quantize strided] tile    32 rows, 1062.00 ms,    0.93 GB/s
+[MXFP4][TP][MLP1] First elem: CPU=0 nib=0 e8m0=122 deq=0
 [streaming quantize strided] tile    32 rows,   79.00 ms,   12.52 GB/s
 [streaming quantize strided] tile    32 rows,   79.00 ms,   12.52 GB/s
 [streaming quantize strided] tile    32 rows,   77.00 ms,   12.84 GB/s
-[streaming quantize strided] tile    32 rows,   78.00 ms,   12.68 GB/s
-[streaming quantize strided] tile    32 rows,   71.00 ms,   13.93 GB/s
-[streaming quantize strided] tile    32 rows,  193.00 ms,    5.12 GB/s
-[streaming quantize strided] tile    32 rows,   78.00 ms,   12.68 GB/s
-[streaming quantize strided] tile    32 rows,   78.00 ms,   12.68 GB/s
-[streaming quantize strided] tile    32 rows,   74.00 ms,   13.36 GB/s
-[streaming quantize strided] tile    32 rows,   74.00 ms,   13.36 GB/s
 [streaming quantize strided] tile    32 rows,   77.00 ms,   12.84 GB/s
+[streaming quantize strided] tile    32 rows,   77.00 ms,   12.84 GB/s
+[streaming quantize strided] tile    32 rows,   77.00 ms,   12.84 GB/s
+[streaming quantize strided] tile    32 rows,   77.00 ms,   12.84 GB/s
+[streaming quantize strided] tile    32 rows,   78.00 ms,   12.68 GB/s
+[streaming quantize strided] tile    32 rows,   79.00 ms,   12.52 GB/s
+[streaming quantize strided] tile    32 rows,   78.00 ms,   12.68 GB/s
+[streaming quantize strided] tile    32 rows,   78.00 ms,   12.68 GB/s
 [streaming quantize strided] tile    32 rows,   77.00 ms,   12.84 GB/s
 [streaming quantize strided] tile    32 rows,   76.00 ms,   13.01 GB/s
-[streaming quantize strided] tile    32 rows,   75.00 ms,   13.18 GB/s
-[streaming quantize strided] tile    32 rows,   74.00 ms,   13.36 GB/s
-[streaming quantize strided] tile    32 rows,  253.00 ms,    3.91 GB/s
-[streaming quantize strided] tile    32 rows,   75.00 ms,   13.18 GB/s
-[streaming quantize strided] tile    32 rows,  258.00 ms,    3.83 GB/s
-[streaming quantize strided] tile    32 rows,   75.00 ms,   13.18 GB/s
-[streaming quantize strided] tile    32 rows,   74.00 ms,   13.36 GB/s
+[streaming quantize strided] tile    32 rows,   77.00 ms,   12.84 GB/s
+[streaming quantize strided] tile    32 rows,   79.00 ms,   12.52 GB/s
+[streaming quantize strided] tile    32 rows,   79.00 ms,   12.52 GB/s
+[streaming quantize strided] tile    32 rows,   78.00 ms,   12.68 GB/s
+[streaming quantize strided] tile    32 rows,   78.00 ms,   12.68 GB/s
 [streaming quantize strided] tile    32 rows,   80.00 ms,   12.36 GB/s
 [streaming quantize strided] tile    32 rows,   79.00 ms,   12.52 GB/s
-[streaming quantize strided] tile    32 rows,   79.00 ms,   12.52 GB/s
-[streaming quantize strided] tile    32 rows,   79.00 ms,   12.52 GB/s
-[streaming quantize strided] tile    32 rows,   79.00 ms,   12.52 GB/s
-[streaming quantize strided] tile    32 rows,   80.00 ms,   12.36 GB/s
-[streaming quantize strided] tile    32 rows,   79.00 ms,   12.52 GB/s
-[streaming quantize strided] tile    32 rows,   79.00 ms,   12.52 GB/s
-[streaming quantize strided] tile    32 rows,   78.00 ms,   12.68 GB/s
-[streaming quantize strided] tile    32 rows,   78.00 ms,   12.68 GB/s
-[streaming quantize strided] tile    32 rows,   79.00 ms,   12.52 GB/s
-[streaming quantize strided] tile    32 rows,   79.00 ms,   12.52 GB/s
-[streaming quantize strided] tile    32 rows,   78.00 ms,   12.68 GB/s
-[streaming quantize strided] tile    32 rows,   78.00 ms,   12.68 GB/s
-[streaming quantize strided] tile    32 rows,   76.00 ms,   13.01 GB/s
-[streaming quantize strided] tile    32 rows,   76.00 ms,   13.01 GB/s
-[streaming quantize strided] tile    32 rows,   79.00 ms,   12.52 GB/s
-[streaming quantize strided] tile    32 rows,   79.00 ms,   12.52 GB/s
-[streaming quantize strided] tile    32 rows,   77.00 ms,   12.84 GB/s
-[streaming quantize strided] tile    32 rows,   78.00 ms,   12.68 GB/s
-[streaming quantize strided] tile    32 rows,   78.00 ms,   12.68 GB/s
-[streaming quantize strided] tile    32 rows,   78.00 ms,   12.68 GB/s
-[streaming quantize strided] tile    32 rows,   79.00 ms,   12.52 GB/s
-[streaming quantize strided] tile    32 rows,   78.00 ms,   12.68 GB/s
-[streaming quantize strided] tile 92160 rows,   39.00 ms,   12.68 GB/s
-[streaming quantize strided] tile 92160 rows,   39.00 ms,   12.68 GB/s
+[streaming quantize strided] tile    32 rows,   62.00 ms,   15.95 GB/s
+[streaming quantize strided] tile    32 rows,  348.00 ms,    2.84 GB/s
+[streaming quantize strided] tile    32 rows,  128.00 ms,    7.72 GB/s
+[streaming quantize strided] tile    32 rows,  131.00 ms,    7.55 GB/s
+[streaming quantize strided] tile    32 rows,  133.00 ms,    7.43 GB/s
+[streaming quantize strided] tile    32 rows,  130.00 ms,    7.61 GB/s
+[streaming quantize strided] tile    32 rows,  127.00 ms,    7.79 GB/s
+[streaming quantize strided] tile    32 rows,  126.00 ms,    7.85 GB/s
+[streaming quantize strided] tile    32 rows,   55.00 ms,   17.98 GB/s
+[streaming quantize strided] tile    32 rows,  326.00 ms,    3.03 GB/s
+[streaming quantize strided] tile    32 rows,  129.00 ms,    7.66 GB/s
+[streaming quantize strided] tile    32 rows,  129.00 ms,    7.66 GB/s
+[streaming quantize strided] tile    32 rows,  218.00 ms,    4.54 GB/s
+[streaming quantize strided] tile    32 rows,  127.00 ms,    7.79 GB/s
+[streaming quantize strided] tile    32 rows,  128.00 ms,    7.72 GB/s
+[streaming quantize strided] tile    32 rows,   55.00 ms,   17.98 GB/s
+[streaming quantize strided] tile    32 rows,  313.00 ms,    3.16 GB/s
+[streaming quantize strided] tile    32 rows,  129.00 ms,    7.66 GB/s
+[streaming quantize strided] tile    32 rows,  222.00 ms,    4.45 GB/s
+[streaming quantize strided] tile    32 rows,   57.00 ms,   17.35 GB/s
+[streaming quantize strided] tile    32 rows,  314.00 ms,    3.15 GB/s
+[streaming quantize strided] tile    32 rows,   42.00 ms,   23.54 GB/s
+[streaming quantize strided] tile    32 rows,   49.00 ms,   20.18 GB/s
+[streaming quantize strided] tile 92160 rows,  309.00 ms,    1.60 GB/s
 [MXFP4][TP][MLP2] First elem: CPU=-0.015625 nib=12 e8m0=120 deq=-0.015625
+[streaming quantize strided] tile    32 rows,   53.00 ms,   18.66 GB/s
+[streaming quantize strided] tile 92160 rows,   42.00 ms,   11.77 GB/s
+[streaming quantize strided] tile 92160 rows,   40.00 ms,   12.36 GB/s
+[streaming quantize strided] tile 92160 rows,   40.00 ms,   12.36 GB/s
 [MXFP4][TP][MLP2] First elem: CPU=-0.0234375 nib=11 e8m0=121 deq=-0.0234375
-[streaming quantize strided] tile 92160 rows,   39.00 ms,   12.68 GB/s
-[streaming quantize strided] tile 92160 rows,   39.00 ms,   12.68 GB/s
-[streaming quantize strided] tile 92160 rows,   39.00 ms,   12.68 GB/s
-[streaming quantize strided] tile 92160 rows,   38.00 ms,   13.01 GB/s
-[streaming quantize strided] tile 92160 rows,   40.00 ms,   12.36 GB/s
-[streaming quantize strided] tile 92160 rows,   38.00 ms,   13.01 GB/s
-[streaming quantize strided] tile 92160 rows,   40.00 ms,   12.36 GB/s
-[streaming quantize strided] tile 92160 rows,   39.00 ms,   12.68 GB/s
-[streaming quantize strided] tile 92160 rows,   39.00 ms,   12.68 GB/s
-[streaming quantize strided] tile 92160 rows,   39.00 ms,   12.68 GB/s
-[streaming quantize strided] tile 92160 rows,   39.00 ms,   12.68 GB/s
-[streaming quantize strided] tile 92160 rows,   39.00 ms,   12.68 GB/s
+[streaming quantize strided] tile 92160 rows,   37.00 ms,   13.36 GB/s
+[streaming quantize strided] tile 92160 rows,   37.00 ms,   13.36 GB/s
 [streaming quantize strided] tile 92160 rows,   37.00 ms,   13.36 GB/s
 [streaming quantize strided] tile 92160 rows,   57.00 ms,    8.67 GB/s
-[streaming quantize strided] tile 92160 rows,   39.00 ms,   12.68 GB/s
-[streaming quantize strided] tile 92160 rows,   39.00 ms,   12.68 GB/s
+[streaming quantize strided] tile 92160 rows,   32.00 ms,   15.45 GB/s
+[streaming quantize strided] tile 92160 rows,   42.00 ms,   11.77 GB/s
+[streaming quantize strided] tile 92160 rows,   24.00 ms,   20.60 GB/s
+[streaming quantize strided] tile 92160 rows,   33.00 ms,   14.98 GB/s
+[streaming quantize strided] tile 92160 rows,   31.00 ms,   15.95 GB/s
 [streaming quantize strided] tile 92160 rows,   40.00 ms,   12.36 GB/s
-[streaming quantize strided] tile 92160 rows,   40.00 ms,   12.36 GB/s
-[streaming quantize strided] tile 92160 rows,   40.00 ms,   12.36 GB/s
-[streaming quantize strided] tile 92160 rows,   39.00 ms,   12.68 GB/s
-[streaming quantize strided] tile 92160 rows,   40.00 ms,   12.36 GB/s
-[streaming quantize strided] tile 92160 rows,   40.00 ms,   12.36 GB/s
-[streaming quantize strided] tile 92160 rows,   40.00 ms,   12.36 GB/s
-[streaming quantize strided] tile 92160 rows,   39.00 ms,   12.68 GB/s
-[streaming quantize strided] tile 92160 rows,   41.00 ms,   12.06 GB/s
-[streaming quantize strided] tile 92160 rows,   40.00 ms,   12.36 GB/s
-[streaming quantize strided] tile 92160 rows,   38.00 ms,   13.01 GB/s
-[streaming quantize strided] tile 92160 rows,   38.00 ms,   13.01 GB/s
-[streaming quantize strided] tile 92160 rows,   40.00 ms,   12.36 GB/s
-[streaming quantize strided] tile 92160 rows,   40.00 ms,   12.36 GB/s
-[streaming quantize strided] tile 92160 rows,   38.00 ms,   13.01 GB/s
-[streaming quantize strided] tile 92160 rows,   39.00 ms,   12.68 GB/s
-[streaming quantize strided] tile 92160 rows,   40.00 ms,   12.36 GB/s
-[streaming quantize strided] tile 92160 rows,   40.00 ms,   12.36 GB/s
-[streaming quantize strided] tile 92160 rows,   37.00 ms,   13.36 GB/s
-[streaming quantize strided] tile 92160 rows,   55.00 ms,    8.99 GB/s
-[streaming quantize strided] tile 92160 rows,   40.00 ms,   12.36 GB/s
-[streaming quantize strided] tile 92160 rows,  108.00 ms,    4.58 GB/s
-[streaming quantize strided] tile 92160 rows,   44.00 ms,   11.24 GB/s
-[streaming quantize strided] tile 92160 rows,  140.00 ms,    3.53 GB/s
-[streaming quantize strided] tile 92160 rows,   37.00 ms,   13.36 GB/s
-[streaming quantize strided] tile 92160 rows,   52.00 ms,    9.51 GB/s
-[streaming quantize strided] tile 92160 rows,   37.00 ms,   13.36 GB/s
-[streaming quantize strided] tile 92160 rows,   57.00 ms,    8.67 GB/s
+[streaming quantize strided] tile 92160 rows,   28.00 ms,   17.66 GB/s
 [streaming quantize strided] tile 92160 rows,   36.00 ms,   13.73 GB/s
-[streaming quantize strided] tile 92160 rows,   59.00 ms,    8.38 GB/s
+[streaming quantize strided] tile 92160 rows,   34.00 ms,   14.54 GB/s
+[streaming quantize strided] tile 92160 rows,   50.00 ms,    9.89 GB/s
+[streaming quantize strided] tile 92160 rows,   30.00 ms,   16.48 GB/s
+[streaming quantize strided] tile 92160 rows,   42.00 ms,   11.77 GB/s
+[streaming quantize strided] tile 92160 rows,   25.00 ms,   19.78 GB/s
+[streaming quantize strided] tile 92160 rows,   33.00 ms,   14.98 GB/s
+[streaming quantize strided] tile 92160 rows,   38.00 ms,   13.01 GB/s
+[streaming quantize strided] tile 92160 rows,   38.00 ms,   13.01 GB/s
+[streaming quantize strided] tile 92160 rows,   34.00 ms,   14.54 GB/s
+[streaming quantize strided] tile 92160 rows,   51.00 ms,    9.69 GB/s
+[streaming quantize strided] tile 92160 rows,   24.00 ms,   20.60 GB/s
+[streaming quantize strided] tile 92160 rows,   64.00 ms,    7.72 GB/s
+[streaming quantize strided] tile 92160 rows,   62.00 ms,    7.97 GB/s
+[streaming quantize strided] tile 92160 rows,   27.00 ms,   18.31 GB/s
+[streaming quantize strided] tile 92160 rows,   27.00 ms,   18.31 GB/s
+[streaming quantize strided] tile 92160 rows,   31.00 ms,   15.95 GB/s
+[streaming quantize strided] tile 92160 rows,   43.00 ms,   11.50 GB/s
+[streaming quantize strided] tile 92160 rows,   30.00 ms,   16.48 GB/s
+[streaming quantize strided] tile 92160 rows,   41.00 ms,   12.06 GB/s
+[streaming quantize strided] tile 92160 rows,   27.00 ms,   18.31 GB/s
+[streaming quantize strided] tile 92160 rows,   35.00 ms,   14.13 GB/s
+[streaming quantize strided] tile 92160 rows,   34.00 ms,   14.54 GB/s
+[streaming quantize strided] tile 92160 rows,   47.00 ms,   10.52 GB/s
+[streaming quantize strided] tile 92160 rows,   26.00 ms,   19.01 GB/s
+[streaming quantize strided] tile 92160 rows,   34.00 ms,   14.54 GB/s
+[streaming quantize strided] tile 92160 rows,   25.00 ms,   19.78 GB/s
+[streaming quantize strided] tile 92160 rows,   31.00 ms,   15.95 GB/s
+[streaming quantize strided] tile 92160 rows,   29.00 ms,   17.05 GB/s
+[streaming quantize strided] tile 92160 rows,   37.00 ms,   13.36 GB/s
+[streaming quantize strided] tile 92160 rows,   26.00 ms,   19.01 GB/s
+[streaming quantize strided] tile 92160 rows,   35.00 ms,   14.13 GB/s
 [MXFP4] Converted 199065600 MLP1 + 99532800 MLP2 scale blocks to f32
 Weights copied (TP optimized): per-layer strided-gather tiling for MLP1/MLP2, biases BF16.
+[streaming quantize strided] tile 92160 rows,   22.00 ms,   22.47 GB/s
 [MXFP4] Converted 199065600 MLP1 + 99532800 MLP2 scale blocks to f32
 Weights copied (TP optimized): per-layer strided-gather tiling for MLP1/MLP2, biases BF16.
 
-warm up elapsed time(s): 30.660000
+warm up elapsed time(s): 34.136000
 Hello!, World!".
 
 Answer:
@@ -40270,6 +40270,6 @@ Write a scene where two strangers accidentally swap phones.! The scene is a crow
 
 We need to write a scene where two strangers accidentally swap phones. The scene is a crowded, bustling city. The city is a bustling city. The scene is a bustling city. The scene is a bustling city. The scene is a ... The? The? ...? The? ...? ...? The? ...? ...? The? ...? ...? The? ...? ...? The? ...? ...? The? ...? ...? The? ...? ...? The? ...? ...? The? ...? ...? The? ...? ...? The? ...? ...? The? ...? ...? The? ...? ...? The? ...? ...? The? ...? ...? The? ...? ...? The? ...? ...? The? ...? ...? The? ...? ...? The? ...? ...? The? ...? ...? The? ...? ...? The? ...? ...? The? ...? ...? The? ...? ...? The? ...? ...? The? ...? ...? The? ...? ...? The? ...? ...? The? ...? ...? The? ...? ...? The? ...? ...? The? ...? ...? The? ...? ...? The? ...? ...? The? ...? ...? The? ...? ...? The? ...? ...? The? ...? ...? The? ...? ...? The? ...? ...? The? ...? ...? The? ...? ...? The? ...? ...? The? ...? ...? The? ...? ...? The? ...? ...? The? ...? ...? The? ...? ...? The? ...? ...? The? ...? ...? The? ...? ...? The? ...? ...? The? ...? ...? The? ...? ...? The? ...? ...? The? ...? ...? The? ...? ...? The? ...? ...? The? ...? ...? The? ...? ...? The? ...? ...? The? ...? ...? The? ...? ...? The? ...? ...? The? ...? ...? The? ...? ...? The? ...? ...? The? ...? ...? The? ...? ...? The? ...? ...? The? ...? ...? The? ...? ...? The? ...? ...? The? ...? ...? The? ...? ...? The? ...? ...? The? ...? ...? The? ...? ...? The? ...? ...? The? ...? ...? The? ...? ...? The? ...? ...? The? ...? ...? The? ...? ...? The? ...? ...? The? ...? ...? The? ...? ...? The? ...? ...? The? ...? ...? The? ...? ...? The? ...? ...? The? ...? ...? The? ...? ...? The? ...? ...? The? ...? ...? The? ...? ...? The? ...? ...? The? ...? ...? The? ...? ...? The? ...? ...? The? ...? ...? The? ...? ...? The? ...? ...? The? ...? ...? The? ...? ...? The? ...? ...? The? ...? ...? The? ...? ...? The? ...? ...? The? ...? ...? The? ...? ...? The? ...? ...? The? ...? ...? The? ...? ...? The? ...? ...? The? ...? ...? The? ...? ...? The? ...? ...? The? ...? ...? The? ...? ...? The? ...? ...? The? ...? ...? The? ...? ...? The? ...? ...? The? ...? ...? The? ...? ...? The? ...? ...? The? ...? ...? The? ...? ...? The? ...? ...? The? ...? ...? The? ...? ...? The? ...? ...? The? ...? ...? The? ...? ...? The? ...? ...? The? ...?
 
-elapsed time(s): 281.098000, achieved throughput TPS (tok/s): 1764.907612
+elapsed time(s): 2569.277000, achieved throughput TPS (tok/s): 193.094010
 
-finish elapsed time(s): 0.027000
+finish elapsed time(s): 0.428000

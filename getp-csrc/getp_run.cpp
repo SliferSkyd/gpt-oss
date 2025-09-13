@@ -13,6 +13,8 @@
 #include <chrono>
 #include <iomanip>
 #include <cfloat> // For FLT_MAX
+#include <thread>
+#include <cstring>
 #include "config.hpp"
 #include "utils.hpp"
 #include "kernels/attention.hpp"
@@ -43,6 +45,12 @@ long long get_time_msec() {
 #define GETP_RUN
 
 int num_gpus = 1;
+
+// How many consecutive layers' KV cache to keep resident on GPU.
+// Can be overridden at runtime via the env var GETP_KV_WIN_LAYERS.
+#ifndef KV_LAYERS_WINDOW
+#define KV_LAYERS_WINDOW 4
+#endif
 
 // GPU Transformer Weights struct - stores all model weights on GPU in bfloat16 format
 typedef struct
@@ -99,6 +107,14 @@ typedef struct
     // KV cache
     float *key_cache;   // (batch_size, n_layers, seq_len, kv_dim)
     float *value_cache; // (batch_size, n_layers, seq_len, kv_dim)
+
+    // === KV cache offload windowing ===
+    // Device-resident KV window bookkeeping
+    int kv_win_start;                 // start layer index of the current device window
+    int kv_win_len;                   // configured window length (max number of layers resident)
+    int kv_win_len_cur;               // actual window length (shorter at the end of stack)
+    size_t kv_row_stride_elems_alloc; // per-row stride (in floats) allocated on device (worst-case)
+    size_t kv_row_stride_elems_cur;   // per-row stride (in floats) currently in use (exact sum of caps)
 
     // RoPE buffers
     float *cos_vals; // (head_dim/2, seq_len)
@@ -175,6 +191,11 @@ typedef struct
     int *request_mapping_cpu; // CPU mirror of request_mapping
     int *h_tile2expert;
     int *h_tile2local;
+
+    // === Host-pinned KV offload storage (full model) ===
+    float *key_cache_host;   // [BATCH_SIZE, full_layers_capacity, kv_dim]
+    float *value_cache_host; // [BATCH_SIZE, full_layers_capacity, kv_dim]
+    size_t kv_row_stride_elems; // per-row stride across ALL layers (in floats)
 } CPUBuffers;
 
 // Main GPU Transformer struct
@@ -237,6 +258,128 @@ static inline void assert_smem_or_die(size_t bytes, const char *kernel_name)
 }
 // -------------------------------------------------
 
+// -------------------- KV window helpers --------------------
+static inline int getenv_int_or(const char *name, int vdef)
+{
+    const char *s = std::getenv(name);
+    if (!s)
+        return vdef;
+    long v = std::strtol(s, nullptr, 10);
+    if (v <= 0)
+        return vdef;
+    return (int)v;
+}
+
+static inline int cap_for_layer(const Config *p, int L)
+{
+    const int even_cap = (p->sliding_window > 0 ? SW_WINDOW : MAX_SEQ_LEN);
+    const bool evenL = ((L & 1) == 0);
+    return evenL ? even_cap : MAX_SEQ_LEN;
+}
+
+static inline size_t sum_caps_range(const Config *p, int L0, int L1)
+{
+    // sum of capacities for layers [L0, L1) — in positions (not multiplied by kv_dim)
+    size_t s = 0;
+    for (int L = L0; L < L1; ++L)
+        s += (size_t)cap_for_layer(p, L);
+    return s;
+}
+
+static inline size_t layer_local_elem_offset(const Config *p, const GPURunState *s, int layer_idx)
+{
+    const int kv_dim = p->head_dim * p->n_kv_heads;
+    if (layer_idx < s->kv_win_start)
+        return 0; // caller must ensure residency; return safe 0
+    const int L0 = s->kv_win_start;
+    const int L1 = layer_idx;
+    const size_t pos_cap = sum_caps_range(p, L0, L1);
+    return pos_cap * (size_t)kv_dim;
+}
+
+static inline size_t layer_host_elem_offset(const Config *p, int layer_idx)
+{
+    const int kv_dim = p->head_dim * p->n_kv_heads;
+    const size_t pos_cap = sum_caps_range(p, 0, layer_idx);
+    return pos_cap * (size_t)kv_dim;
+}
+// -----------------------------------------------------------
+
+// Set the current device KV window to start at new_start (inclusive).
+// Recomputes the current per-row stride in floats.
+static inline void kv_set_window_start(GPUTransformer *gpu_t, int new_start)
+{
+    GPURunState *s = &gpu_t->state;
+    Config *p = &gpu_t->config;
+    if (new_start < 0)
+        new_start = 0;
+    if (new_start >= p->n_layers)
+        new_start = p->n_layers - 1;
+    s->kv_win_start = new_start;
+    s->kv_win_len_cur = std::min(s->kv_win_len, p->n_layers - s->kv_win_start);
+    const size_t pos_cap = sum_caps_range(p, s->kv_win_start, s->kv_win_start + s->kv_win_len_cur);
+    const int kv_dim = p->head_dim * p->n_kv_heads;
+    s->kv_row_stride_elems_cur = pos_cap * (size_t)kv_dim;
+}
+
+// Prefetch a whole layer's KV slices for all rows [0..BATCH_SIZE) from host to device.
+static inline void kv_prefetch_layer_full_rows(GPUTransformer *gpu_t, int layer_idx, hipStream_t sIO)
+{
+    Config *p = &gpu_t->config;
+    GPURunState *s = &gpu_t->state;
+    CPUBuffers *cpu = &gpu_t->cpu_buffers;
+    const int kv_dim = p->head_dim * p->n_kv_heads;
+    const size_t layer_pos_cap = (size_t)cap_for_layer(p, layer_idx);
+    const size_t width_bytes = layer_pos_cap * (size_t)kv_dim * sizeof(float);
+    if (width_bytes == 0)
+        return;
+
+    const size_t host_row_pitch = cpu->kv_row_stride_elems * sizeof(float);
+    const size_t dev_row_pitch = s->kv_row_stride_elems_cur * sizeof(float);
+
+    const size_t host_layer_off = layer_host_elem_offset(p, layer_idx) * sizeof(float);
+    const size_t dev_layer_off = layer_local_elem_offset(p, s, layer_idx) * sizeof(float);
+
+    void *dstK = (void *)((char *)s->key_cache + dev_layer_off);
+    void *srcK = (void *)((char *)cpu->key_cache_host + host_layer_off);
+    void *dstV = (void *)((char *)s->value_cache + dev_layer_off);
+    void *srcV = (void *)((char *)cpu->value_cache_host + host_layer_off);
+
+    HIP_CHECK(hipMemcpy2DAsync(dstK, dev_row_pitch, srcK, host_row_pitch,
+                               width_bytes, BATCH_SIZE, hipMemcpyHostToDevice, sIO));
+    HIP_CHECK(hipMemcpy2DAsync(dstV, dev_row_pitch, srcV, host_row_pitch,
+                               width_bytes, BATCH_SIZE, hipMemcpyHostToDevice, sIO));
+}
+
+// Offload a whole layer's KV slices for all rows [0..BATCH_SIZE) from device to host.
+static inline void kv_offload_layer_full_rows(GPUTransformer *gpu_t, int layer_idx, hipStream_t sIO)
+{
+    Config *p = &gpu_t->config;
+    GPURunState *s = &gpu_t->state;
+    CPUBuffers *cpu = &gpu_t->cpu_buffers;
+    const int kv_dim = p->head_dim * p->n_kv_heads;
+    const size_t layer_pos_cap = (size_t)cap_for_layer(p, layer_idx);
+    const size_t width_bytes = layer_pos_cap * (size_t)kv_dim * sizeof(float);
+    if (width_bytes == 0)
+        return;
+
+    const size_t host_row_pitch = cpu->kv_row_stride_elems * sizeof(float);
+    const size_t dev_row_pitch = s->kv_row_stride_elems_cur * sizeof(float);
+
+    const size_t host_layer_off = layer_host_elem_offset(p, layer_idx) * sizeof(float);
+    const size_t dev_layer_off = layer_local_elem_offset(p, s, layer_idx) * sizeof(float);
+
+    void *srcK = (void *)((char *)s->key_cache + dev_layer_off);
+    void *dstK = (void *)((char *)cpu->key_cache_host + host_layer_off);
+    void *srcV = (void *)((char *)s->value_cache + dev_layer_off);
+    void *dstV = (void *)((char *)cpu->value_cache_host + host_layer_off);
+
+    HIP_CHECK(hipMemcpy2DAsync(dstK, host_row_pitch, srcK, dev_row_pitch,
+                               width_bytes, BATCH_SIZE, hipMemcpyDeviceToHost, sIO));
+    HIP_CHECK(hipMemcpy2DAsync(dstV, host_row_pitch, srcV, dev_row_pitch,
+                               width_bytes, BATCH_SIZE, hipMemcpyDeviceToHost, sIO));
+}
+
 // Memory allocation functions
 void malloc_gpu_run_state(GPURunState *s, Config *p)
 {
@@ -269,14 +412,26 @@ void malloc_gpu_run_state(GPURunState *s, Config *p)
     const int n_odd = p->n_layers - n_even;
     const int even_cap = (p->sliding_window > 0 ? SW_WINDOW : MAX_SEQ_LEN);
 
-    const size_t layers_capacity =
+    const size_t layers_capacity_all =
         (size_t)n_even * (size_t)even_cap + (size_t)n_odd * (size_t)MAX_SEQ_LEN;
 
-    size_t kv_cache_size = (size_t)BATCH_SIZE * layers_capacity * (size_t)kv_dim * sizeof(float);
+    // ------- Device KV window allocation (worst-case per-row stride) -------
+    s->kv_win_len = std::min(getenv_int_or("GETP_KV_WIN_LAYERS", KV_LAYERS_WINDOW), p->n_layers);
+    if (s->kv_win_len <= 0)
+        s->kv_win_len = 1;
+    s->kv_win_start = 0;
+    s->kv_win_len_cur = std::min(s->kv_win_len, p->n_layers - s->kv_win_start);
+    // Worst-case per-row stride: all layers in window have MAX_SEQ_LEN positions
+    s->kv_row_stride_elems_alloc = (size_t)s->kv_win_len * (size_t)MAX_SEQ_LEN * (size_t)kv_dim;
+    // Current in-use stride: sum of exact caps for current window [start, start+len_cur)
+    s->kv_row_stride_elems_cur = sum_caps_range(p, s->kv_win_start, s->kv_win_start + s->kv_win_len_cur) * (size_t)kv_dim;
 
-    printf("KV cache (fp32) total capacity: layers_capacity=%zu positions/layer-stack\n",
-           layers_capacity);
-    printf("KV cache size per batch: %zu MB\n", kv_cache_size / (1024 * 1024));
+    size_t kv_cache_dev_bytes = (size_t)BATCH_SIZE * s->kv_row_stride_elems_alloc * sizeof(float);
+
+    printf("KV window on GPU: win_len=%d, row_stride_alloc=%zu floats, bytes/batch=%zu MB\n",
+           s->kv_win_len,
+           s->kv_row_stride_elems_alloc,
+           kv_cache_dev_bytes / (1024 * 1024));
 
     // Base activations
     HIP_CHECK(hipMalloc((void **)&s->x, batch_hidden));
@@ -295,9 +450,9 @@ void malloc_gpu_run_state(GPURunState *s, Config *p)
 
     int total_mtiles = BATCH_SIZE * K;
    
-    // KV cache
-    HIP_CHECK(hipMalloc((void **)&s->key_cache, kv_cache_size));
-    HIP_CHECK(hipMalloc((void **)&s->value_cache, kv_cache_size));
+    // KV cache (device window)
+    HIP_CHECK(hipMalloc((void **)&s->key_cache, kv_cache_dev_bytes));
+    HIP_CHECK(hipMalloc((void **)&s->value_cache, kv_cache_dev_bytes));
 
     HIP_CHECK(hipMalloc((void **)&s->att, BATCH_SIZE * p->n_attn_heads * MAX_SEQ_LEN * sizeof(float)));
     HIP_CHECK(hipMalloc((void **)&s->logits, BATCH_SIZE * p->vocab_size * sizeof(float)));
@@ -347,8 +502,8 @@ void malloc_gpu_run_state(GPURunState *s, Config *p)
     HIP_CHECK(hipMemset(s->q, 0, BATCH_SIZE * p->n_attn_heads * p->head_dim * sizeof(float)));
     HIP_CHECK(hipMemset(s->k, 0, BATCH_SIZE * kv_dim * sizeof(float)));
     HIP_CHECK(hipMemset(s->v, 0, BATCH_SIZE * kv_dim * sizeof(float)));
-    HIP_CHECK(hipMemset(s->key_cache, 0, kv_cache_size));
-    HIP_CHECK(hipMemset(s->value_cache, 0, kv_cache_size));
+    HIP_CHECK(hipMemset(s->key_cache, 0, kv_cache_dev_bytes));
+    HIP_CHECK(hipMemset(s->value_cache, 0, kv_cache_dev_bytes));
     HIP_CHECK(hipMemset(s->att, 0, BATCH_SIZE * p->n_attn_heads * MAX_SEQ_LEN * sizeof(float)));
     HIP_CHECK(hipMemset(s->logits, 0, (size_t)BATCH_SIZE * p->vocab_size * sizeof(float)));
 
@@ -1177,6 +1332,26 @@ void malloc_cpu_buffers(CPUBuffers *cpu_buf, Config *p)
     // Not pinned
     cpu_buf->logits = (float *)malloc((size_t)BATCH_SIZE * p->vocab_size * sizeof(float));
 
+    // --- Host-pinned full KV storage (for offload) ---
+    {
+        const int kv_dim = p->head_dim * p->n_kv_heads;
+        const int n_even = (p->n_layers + 1) / 2;
+        const int n_odd = p->n_layers - n_even;
+        const int even_cap = (p->sliding_window > 0 ? SW_WINDOW : MAX_SEQ_LEN);
+        const size_t layers_capacity_all =
+            (size_t)n_even * (size_t)even_cap + (size_t)n_odd * (size_t)MAX_SEQ_LEN;
+        cpu_buf->kv_row_stride_elems = layers_capacity_all * (size_t)kv_dim;
+        const size_t host_bytes = (size_t)BATCH_SIZE * cpu_buf->kv_row_stride_elems * sizeof(float);
+
+        HIP_CHECK(hipHostMalloc((void **)&cpu_buf->key_cache_host, host_bytes));
+        HIP_CHECK(hipHostMalloc((void **)&cpu_buf->value_cache_host, host_bytes));
+        // initialize to 0
+        memset(cpu_buf->key_cache_host, 0, host_bytes);
+        memset(cpu_buf->value_cache_host, 0, host_bytes);
+        printf("KV cache host-pinned: row_stride=%zu floats, bytes/batch=%zu MB\n",
+               cpu_buf->kv_row_stride_elems, host_bytes / (1024 * 1024));
+    }
+
     // Initialize
     std::fill_n(cpu_buf->slot_active_cpu, BATCH_SIZE, false);
     std::fill_n(cpu_buf->seq_lengths_cpu, BATCH_SIZE, 0);
@@ -1231,6 +1406,11 @@ void free_cpu_buffers(CPUBuffers *cpu_buf)
 
     if (cpu_buf->tp_host_stage)
         HIP_CHECK(hipHostFree(cpu_buf->tp_host_stage));
+
+    if (cpu_buf->key_cache_host)
+        HIP_CHECK(hipHostFree(cpu_buf->key_cache_host));
+    if (cpu_buf->value_cache_host)
+        HIP_CHECK(hipHostFree(cpu_buf->value_cache_host));
 }
 
 void build_gpu_transformer(GPUTransformer *gpu_t, Transformer *cpu_t)
@@ -1404,23 +1584,9 @@ void attention_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size,
     const int KV = Hd * NK;
     const int QKV = Hd * (NA + 2 * NK);
 
-    const int even_cap = (p->sliding_window > 0 ? SW_WINDOW : MAX_SEQ_LEN);
+    const size_t kv_slice = s->kv_row_stride_elems_cur; // per-row stride in floats for current window
 
-    size_t layers_capacity = 0;
-    for (int L = 0; L < p->n_layers; ++L)
-    {
-        const bool evenL = ((L & 1) == 0);
-        layers_capacity += (size_t)(evenL ? even_cap : MAX_SEQ_LEN);
-    }
-    const size_t kv_slice = layers_capacity * (size_t)KV;
-
-    size_t layer_pos_offset = 0;
-    for (int L = 0; L < layer_idx; ++L)
-    {
-        const bool evenL = ((L & 1) == 0);
-        layer_pos_offset += (size_t)(evenL ? even_cap : MAX_SEQ_LEN);
-    }
-    const size_t layer_elem_offset = layer_pos_offset * (size_t)KV;
+    const size_t layer_elem_offset = layer_local_elem_offset(p, s, layer_idx);
 
     float *x_mb = s->x + (size_t)row_offset * H;
     float *t_mb = s->t + (size_t)row_offset * H;
@@ -1477,7 +1643,7 @@ void attention_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size,
         update_kv_cache_kernel<<<grid, block, 0, sAttn>>>(
             key_cache_mb, value_cache_mb, k_mb, v_mb, pos_mb,
             batch_size, p->n_layers, layer_idx, MAX_SEQ_LEN, KV,
-            /* batch_kv_stride = */ layers_capacity * (size_t)KV,
+            /* batch_kv_stride = */ kv_slice,
             /* layer_kv_offset = */ layer_elem_offset);
     }
     // 6) fused attention
@@ -1498,7 +1664,7 @@ void attention_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size,
                            s->mask, pos_mb, batch_size,
                            NA, NK, Hd, MAX_SEQ_LEN, p->n_layers, layer_idx,
                            p->sliding_window > 0,
-                           /* batch_kv_stride = */ layers_capacity * (size_t)KV,
+                           /* batch_kv_stride = */ kv_slice,
                            /* layer_kv_offset = */ layer_elem_offset);
 
         HIP_CHECK(hipGetLastError());
@@ -1929,9 +2095,10 @@ int *forward_batch_gpu(GPUTransformer *gpu_t, int *tokens, int batch_size)
         return cpu_buf->current_tokens;
 
     // streams
-    hipStream_t attn_stream = nullptr, moe_stream = nullptr;
+    hipStream_t attn_stream = nullptr, moe_stream = nullptr, io_stream = nullptr;
     HIP_CHECK(hipStreamCreateWithFlags(&attn_stream, hipStreamNonBlocking));
     HIP_CHECK(hipStreamCreateWithFlags(&moe_stream, hipStreamNonBlocking));
+    HIP_CHECK(hipStreamCreateWithFlags(&io_stream, hipStreamNonBlocking));
 
     // microbatching — keep your MB exactly (no TP-capping inside attention)
     const int MB = (BATCH_SIZE <= B) ? BATCH_SIZE : B;
@@ -1946,6 +2113,8 @@ int *forward_batch_gpu(GPUTransformer *gpu_t, int *tokens, int batch_size)
     };
     std::vector<hipEvent_t> evt_attn_done(NUM_MB);
     std::vector<hipEvent_t> evt_moe_done_prev(NUM_MB), evt_moe_done_cur(NUM_MB);
+    hipEvent_t evt_kv_ready = make_evt();
+    hipEvent_t evt_kv_offloaded = make_evt();
     for (int i = 0; i < NUM_MB; ++i)
     {
         evt_attn_done[i] = make_evt();
@@ -1970,8 +2139,20 @@ int *forward_batch_gpu(GPUTransformer *gpu_t, int *tokens, int batch_size)
     }
 
     // pipelined schedule across layers and microbatches
+    int last_prefetched_layer = -1;
     for (int l = 0; l < p->n_layers; ++l)
     {
+        // Ensure device KV window covers this layer, then prefetch it if not already prefetched
+        if (l < s->kv_win_start || l >= s->kv_win_start + s->kv_win_len_cur)
+        {
+            kv_set_window_start(gpu_t, l);
+        }
+        if (last_prefetched_layer != l)
+        {
+            kv_prefetch_layer_full_rows(gpu_t, l, io_stream);
+            HIP_CHECK(hipEventRecord(evt_kv_ready, io_stream));
+            last_prefetched_layer = l;
+        }
         int mb_idx = 0;
         for (int row = 0; row < B; row += MB, ++mb_idx)
         {
@@ -1981,6 +2162,8 @@ int *forward_batch_gpu(GPUTransformer *gpu_t, int *tokens, int batch_size)
             // cross-layer dep: Attention(l,i) waits MoE(l-1,i)
             if (l > 0)
                 HIP_CHECK(hipStreamWaitEvent(attn_stream, evt_moe_done_prev[i], 0));
+            if (i == 0)
+                HIP_CHECK(hipStreamWaitEvent(attn_stream, evt_kv_ready, 0));
 
             // Attn(l,i)
             attention_gpu(gpu_t, l, bs, /*row_offset=*/row, attn_stream);
@@ -2009,6 +2192,24 @@ int *forward_batch_gpu(GPUTransformer *gpu_t, int *tokens, int batch_size)
                 HIP_CHECK(hipEventRecord(evt_moe_done_cur[i_last], moe_stream));
             }
         }
+        // Offload updated layer-l KV to host while MoE runs
+        {
+            const int i_last = NUM_MB - 1;
+            HIP_CHECK(hipStreamWaitEvent(io_stream, evt_attn_done[i_last], 0));
+            kv_offload_layer_full_rows(gpu_t, l, io_stream);
+            HIP_CHECK(hipEventRecord(evt_kv_offloaded, io_stream));
+        }
+        // Prefetch next layer if any (may slide window)
+        if (l + 1 < p->n_layers)
+        {
+            if (l + 1 < s->kv_win_start || l + 1 >= s->kv_win_start + s->kv_win_len_cur)
+            {
+                kv_set_window_start(gpu_t, l + 1);
+            }
+            kv_prefetch_layer_full_rows(gpu_t, l + 1, io_stream);
+            HIP_CHECK(hipEventRecord(evt_kv_ready, io_stream));
+            last_prefetched_layer = l + 1;
+        }
         // make next layer depend on current layer's MoE-done (per microbatch)
         std::swap(evt_moe_done_prev, evt_moe_done_cur);
         for (int i = 0; i < NUM_MB; ++i)
@@ -2021,6 +2222,7 @@ int *forward_batch_gpu(GPUTransformer *gpu_t, int *tokens, int batch_size)
     // sync compute streams before head
     HIP_CHECK(hipStreamSynchronize(attn_stream));
     HIP_CHECK(hipStreamSynchronize(moe_stream));
+    HIP_CHECK(hipStreamSynchronize(io_stream));
 
     // final norm + head on default stream
     {
@@ -2047,48 +2249,33 @@ int *forward_batch_gpu(GPUTransformer *gpu_t, int *tokens, int batch_size)
         HIP_CHECK(hipEventDestroy(evt_moe_done_prev[i]));
         HIP_CHECK(hipEventDestroy(evt_moe_done_cur[i]));
     }
+    HIP_CHECK(hipEventDestroy(evt_kv_ready));
+    HIP_CHECK(hipEventDestroy(evt_kv_offloaded));
     HIP_CHECK(hipStreamDestroy(attn_stream));
     HIP_CHECK(hipStreamDestroy(moe_stream));
+    HIP_CHECK(hipStreamDestroy(io_stream));
 
     return cpu_buf->current_tokens;
 }
 
-// Replace previous clear_kv_cache_for_slot kernel with host memset version
-static inline void clear_kv_cache_for_slot(GPURunState *s, const Config *p, int slot)
+// Replace previous clear_kv_cache_for_slot with host+device memset version (window-aware)
+static inline void clear_kv_cache_for_slot(GPUTransformer *gpu_t, int slot)
 {
     if (slot < 0 || slot >= BATCH_SIZE)
         return;
+    Config *p = &gpu_t->config;
+    GPURunState *s = &gpu_t->state;
+    CPUBuffers *cpu = &gpu_t->cpu_buffers;
 
-    const int kv_dim = p->head_dim * p->n_kv_heads;
-    const size_t elem_bytes = sizeof(float);
+    const size_t host_row_bytes = cpu->kv_row_stride_elems * sizeof(float);
+    // Zero host-pinned cache for this slot across all layers
+    memset((char *)cpu->key_cache_host + (size_t)slot * host_row_bytes, 0, host_row_bytes);
+    memset((char *)cpu->value_cache_host + (size_t)slot * host_row_bytes, 0, host_row_bytes);
 
-    const int even_cap = (p->sliding_window > 0 ? SW_WINDOW : MAX_SEQ_LEN);
-
-    size_t layers_capacity = 0;
-    for (int L = 0; L < p->n_layers; ++L)
-    {
-        const bool evenL = ((L & 1) == 0);
-        layers_capacity += (size_t)(evenL ? even_cap : MAX_SEQ_LEN);
-    }
-    const size_t slot_base_elems = (size_t)slot * layers_capacity * (size_t)kv_dim;
-
-    size_t layer_pos_offset = 0;
-    for (int L = 0; L < p->n_layers; ++L)
-    {
-        const bool evenL = ((L & 1) == 0);
-        const size_t capL = (size_t)(evenL ? even_cap : MAX_SEQ_LEN);
-
-        const size_t layer_base_elems = slot_base_elems + layer_pos_offset * (size_t)kv_dim;
-        const size_t bytes_this_layer = capL * (size_t)kv_dim * elem_bytes;
-
-        void *k_ptr = (void *)((char *)s->key_cache + layer_base_elems * elem_bytes);
-        void *v_ptr = (void *)((char *)s->value_cache + layer_base_elems * elem_bytes);
-
-        HIP_CHECK(hipMemset(k_ptr, 0, bytes_this_layer));
-        HIP_CHECK(hipMemset(v_ptr, 0, bytes_this_layer));
-
-        layer_pos_offset += capL;
-    }
+    // Zero device-resident window for this slot (optional but keeps window clean)
+    const size_t dev_row_bytes = s->kv_row_stride_elems_cur * sizeof(float);
+    HIP_CHECK(hipMemset((void *)((char *)s->key_cache + (size_t)slot * dev_row_bytes), 0, dev_row_bytes));
+    HIP_CHECK(hipMemset((void *)((char *)s->value_cache + (size_t)slot * dev_row_bytes), 0, dev_row_bytes));
 }
 
 long long continuous_batching_inference(Tokenizer *tokenizer,
@@ -2231,7 +2418,7 @@ long long continuous_batching_inference(Tokenizer *tokenizer,
 
                     if (cpu_buf->next_request_idx < end_request)
                     {
-                        clear_kv_cache_for_slot(&gpu_t->state, &gpu_t->config, slot);
+                        clear_kv_cache_for_slot(gpu_t, slot);
 
                         req_idx = cpu_buf->next_request_idx++;
                         const char *input_seq = get_str_req_ptr(requests, req_idx);
