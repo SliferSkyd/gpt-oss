@@ -49,13 +49,13 @@ __device__ inline float blockReduceSum(float v, float *smem) {
 }
 
 __global__ void fused_attention_kernel(
-    float * __restrict__ output,               // [batch, n_heads, head_dim]
-    const float * __restrict__ q,              // [batch, n_heads * head_dim]
-    const float * __restrict__ key_cache,   // [batch, n_layers, seq_len, kv_dim]
-    const float * __restrict__ value_cache, // [batch, n_layers, seq_len, kv_dim]
-    const __hip_bfloat16 * __restrict__ sinks,       // [n_heads] (already layer-offset on host)
-    const float * __restrict__ mask,                 // [seq_len, seq_len]
-    const int * __restrict__ positions,              // [batch]
+    float * __restrict__ output,                    // [batch, n_heads, head_dim]
+    const float * __restrict__ q,                   // [batch, n_heads * head_dim]
+    const __hip_bfloat16 * __restrict__ key_cache,  // [batch, n_layers, seq_len, kv_dim] (bf16)
+    const __hip_bfloat16 * __restrict__ value_cache,// [batch, n_layers, seq_len, kv_dim] (bf16)
+    const __hip_bfloat16 * __restrict__ sinks,      // [n_heads] (already layer-offset on host)
+    const float * __restrict__ mask,                // [seq_len, seq_len]
+    const int * __restrict__ positions,             // [batch]
     int batch_size, int n_heads, int n_kv_heads, int head_dim,
     int seq_len, int n_layers, int layer_idx,
     bool use_sliding_window, size_t batch_kv_stride, size_t layer_kv_offset)
@@ -81,8 +81,8 @@ __global__ void fused_attention_kernel(
     const int kv_dim     = head_dim * n_kv_heads;
 
     const float *q_head = q + 1LL * b * n_heads * head_dim + 1LL * h * head_dim;
-    const float *k_base = key_cache   + (size_t)b * batch_kv_stride + layer_kv_offset;
-    const float *v_base = value_cache + (size_t)b * batch_kv_stride + layer_kv_offset;
+    const __hip_bfloat16 *k_base = key_cache   + (size_t)b * batch_kv_stride + layer_kv_offset;
+    const __hip_bfloat16 *v_base = value_cache + (size_t)b * batch_kv_stride + layer_kv_offset;
     float *out_head =
         output + 1LL * b * n_heads * head_dim + 1LL * h * head_dim;
 
@@ -96,19 +96,19 @@ __global__ void fused_attention_kernel(
     float *s_reduce   = s_partials + WARPS * head_dim;              // [WARPS]
     const float inv_sqrt_d = rsqrtf((float)head_dim);
 
-    // === Fast path: map one lane per head-dim element (designed for head_dim == warpSize) ===
-    // Falls back correctly when head_dim < warpSize by masking lanes; for head_dim > warpSize,
-    // add a lane-strided loop over 'i += WARP' (omitted here since you asked about 64).
+    // Fast path: one lane per head-dim element
     const float q_lane = (lane < head_dim) ? q_head[lane] : 0.0f;
 
-    // ---- Pass 1: compute attention scores into s_att[0..win_core_len-1] (all warps participate)
+    // ---- Pass 1: compute attention scores into s_att[0..win_core_len-1]
     for (int w = wid; w < win_core_len; w += WARPS) {
         const int t = win_start + w;
-        const float *k_vec = k_base + 1LL * ((layer_idx & 1) ? t : t % SW_WINDOW) * kv_dim + 1LL * kv_h * head_dim;
+        const __hip_bfloat16 *k_vec = k_base + 1LL * ((layer_idx & 1) ? t : t % SW_WINDOW) * kv_dim
+                                      + 1LL * kv_h * head_dim;
 
         float prod = 0.f;
         if (lane < head_dim) {
-            prod = (float)q_lane * (k_vec[lane]);
+            const float kf = __bfloat162float(k_vec[lane]);
+            prod = q_lane * kf;
         }
         float dot = warpReduceSum(prod);  // 64-lane sum
         if (lane == 0) {
@@ -147,13 +147,14 @@ __global__ void fused_attention_kernel(
     __syncthreads();
 
     // ---- Pass 2: V-weighted sum over the core window (exclude optional sink)
-    // Every warp accumulates a partial output vector for its token stripe.
     if (lane < head_dim) {
         float partial = 0.f;
         for (int w = wid; w < win_core_len; w += WARPS) {
             const int t = win_start + w;
-            const float *v_vec = v_base + 1LL * ((layer_idx & 1) ? t : t % SW_WINDOW) * kv_dim + 1LL * kv_h * head_dim;
-            partial += (double)s_att[w] * (v_vec[lane]);
+            const __hip_bfloat16 *v_vec = v_base + 1LL * ((layer_idx & 1) ? t : t % SW_WINDOW) * kv_dim
+                                          + 1LL * kv_h * head_dim;
+            const float vf = __bfloat162float(v_vec[lane]);
+            partial += (double)s_att[w] * vf;
         }
         s_partials[wid * head_dim + lane] = partial;
     }
@@ -169,8 +170,8 @@ __global__ void fused_attention_kernel(
 }
 
 
-// NEW: KV cache update kernel with BF16 quantization
-__global__ void update_kv_cache_kernel(float *key_cache, float *value_cache,
+// === KV cache update kernel (write __hip_bfloat16) ===
+__global__ void update_kv_cache_kernel(__hip_bfloat16 *key_cache, __hip_bfloat16 *value_cache,
                                        const float *k, const float *v,
                                        const int *positions, int batch_size,
                                        int n_layers, int layer_idx, int seq_len,
@@ -179,7 +180,7 @@ __global__ void update_kv_cache_kernel(float *key_cache, float *value_cache,
     size_t batch_idx = blockIdx.x;
     size_t dim_idx = 1LL * blockIdx.y * blockDim.y + threadIdx.y;
 
-    if (batch_idx >= batch_size || dim_idx >= kv_dim)
+    if (batch_idx >= (size_t)batch_size || dim_idx >= (size_t)kv_dim)
         return;
 
     int pos = positions[batch_idx];
@@ -190,8 +191,8 @@ __global__ void update_kv_cache_kernel(float *key_cache, float *value_cache,
     const int row = ((layer_idx & 1) ? pos : (pos % SW_WINDOW));
     const size_t cache_idx = base + (size_t)row * (size_t)kv_dim + (size_t)dim_idx;
 
-    key_cache[cache_idx]   = k[1LL*batch_idx * kv_dim + dim_idx];
-    value_cache[cache_idx] = v[1LL*batch_idx * kv_dim + dim_idx];
+    key_cache[cache_idx]   = __float2bfloat16(k[1LL*batch_idx * kv_dim + dim_idx]);
+    value_cache[cache_idx] = __float2bfloat16(v[1LL*batch_idx * kv_dim + dim_idx]);
 }
 
 

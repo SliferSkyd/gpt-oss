@@ -97,8 +97,8 @@ typedef struct
     float *mask; // attention mask (seq_len, seq_len)
 
     // KV cache
-    float *key_cache;   // (batch_size, n_layers, seq_len, kv_dim)
-    float *value_cache; // (batch_size, n_layers, seq_len, kv_dim)
+    __hip_bfloat16 *key_cache;   // (batch_size, n_layers, seq_len, kv_dim)
+    __hip_bfloat16 *value_cache; // (batch_size, n_layers, seq_len, kv_dim)
 
     // RoPE buffers
     float *cos_vals; // (head_dim/2, seq_len)
@@ -272,7 +272,7 @@ void malloc_gpu_run_state(GPURunState *s, Config *p)
     const size_t layers_capacity =
         (size_t)n_even * (size_t)even_cap + (size_t)n_odd * (size_t)MAX_SEQ_LEN;
 
-    size_t kv_cache_size = (size_t)BATCH_SIZE * layers_capacity * (size_t)kv_dim * sizeof(float);
+    size_t kv_cache_size = (size_t)BATCH_SIZE * layers_capacity * (size_t)kv_dim * sizeof(__hip_bfloat16);
 
     printf("KV cache (fp32) total capacity: layers_capacity=%zu positions/layer-stack\n",
            layers_capacity);
@@ -334,7 +334,14 @@ void malloc_gpu_run_state(GPURunState *s, Config *p)
     HIP_CHECK(hipMalloc((void **)&s->expert_output_partial_g, (size_t)pairs_max * H * sizeof(float)));
     HIP_CHECK(hipMalloc((void **)&s->expert_output_gather_g, (size_t)TP * pairs_max * H * sizeof(float)));
 
-    s->cap_tiles = (pairs_max + BLOCK_M_MLP - 1) / BLOCK_M_MLP + E;
+    // s->cap_tiles = (pairs_max + BLOCK_M_MLP - 1) / BLOCK_M_MLP + E;
+    // Calculate maximum possible tiles needed
+    // In worst case, all tokens could be distributed across experts
+    // Each expert processes its tokens in tiles of size BLOCK_M_MLP
+    // Since each token selects K experts, max tokens per expert is min(pairs_max, Bgrp_max * K)
+    // But to be safe, we assume worst-case distribution
+    int max_tiles_per_expert = (pairs_max + BLOCK_M_MLP - 1) / BLOCK_M_MLP;
+    s->cap_tiles = max_tiles_per_expert * 4;  // 4x safety factor for worst-case distribution
     HIP_CHECK(hipMalloc((void **)&s->d_tile2expert_g, s->cap_tiles * sizeof(int)));
     HIP_CHECK(hipMalloc((void **)&s->d_tile2local_g, s->cap_tiles * sizeof(int)));
 
@@ -1431,8 +1438,8 @@ void attention_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size,
     float *v_mb = s->v + (size_t)row_offset * KV;
     int *pos_mb = s->positions + row_offset;
 
-    float *key_cache_mb = s->key_cache + (size_t)row_offset * kv_slice;
-    float *value_cache_mb = s->value_cache + (size_t)row_offset * kv_slice;
+    __hip_bfloat16 *key_cache_mb = s->key_cache + (size_t)row_offset * kv_slice;
+    __hip_bfloat16 *value_cache_mb = s->value_cache + (size_t)row_offset * kv_slice;
 
     // 1) RMSNorm
     {
@@ -1720,7 +1727,7 @@ void moe_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size,
         threads = min(threads, 1024); // hardware cap
 
         // 5 arrays of int[T]
-        size_t shmem = (size_t)threads * 5 * sizeof(int);
+        size_t shmem = (size_t)threads * 5 * sizeof(int) + sizeof(int);
 
         route_and_pack_fused_kernel<<<E, threads, shmem, sMoe>>>(
             s->gather_x_g, Bgrp, H,

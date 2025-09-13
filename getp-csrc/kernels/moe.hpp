@@ -22,8 +22,12 @@ __global__ void route_and_pack_fused_kernel(
     int* kidx    = excl  + T;     // [T]  (which k matched e, or -1)
     int* toklist = kidx  + T;     // [T]  (selected token indices in this chunk)
     int* cmplist = toklist + T;   // [T]  (their compact indices)
+    int* carry_shared = cmplist + T; // [1]  (shared carry value)
 
-    int carry = 0;                // how many tokens for expert e packed so far
+
+    // int carry = 0;                // how many tokens for expert e packed so far
+    if (tid == 0) carry_shared[0] = 0;  // Initialize shared carry
+    __syncthreads();
 
     // Process tokens in tiles of T to support B > T
     for (int base = 0; base < B; base += T) {
@@ -56,7 +60,7 @@ __global__ void route_and_pack_fused_kernel(
 
         // ---- 3) For selected tokens: compute compact_idx, store lists, fill ids/wts ----
         if (flags[tid]) {
-            const int compact_idx = expert_offsets[e] + carry + rank_local;
+            const int compact_idx = expert_offsets[e] + carry_shared[0] + rank_local;
             const int lid = t_global * K + kidx[tid];
 
             // per-(b,k) mapping; exactly one expert block writes each entry
@@ -82,7 +86,7 @@ __global__ void route_and_pack_fused_kernel(
         __syncthreads();
 
         // ---- 5) Advance global carry for this expert ----
-        if (tid == 0) carry += chunk_total;
+        if (tid == 0) carry_shared[0] += chunk_total;
         __syncthreads();
     }
 }
