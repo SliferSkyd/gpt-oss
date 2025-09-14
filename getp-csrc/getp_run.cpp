@@ -96,9 +96,11 @@ typedef struct
     float *att;  // attention scores (batch_size, n_attn_heads, seq_len)
     float *mask; // attention mask (seq_len, seq_len)
 
-    // KV cache (FP8 E4M3 format for memory efficiency)
+    // KV cache (Hybrid BF16/FP8 for keys and values)
     uint8_t *key_cache;   // (batch_size, n_layers, seq_len, kv_dim) - FP8 E4M3
+    __hip_bfloat16 *key_cache_bf16; // (batch_size, n_layers, BF16_KEY_TOKENS, kv_dim) - BF16 for first tokens
     uint8_t *value_cache; // (batch_size, n_layers, seq_len, kv_dim) - FP8 E4M3
+    __hip_bfloat16 *value_cache_bf16; // (batch_size, n_layers, BF16_VALUE_TOKENS, kv_dim) - BF16 for first tokens
 
     // FP8 quantization scales (per-layer for dynamic range)
     float *key_cache_scales;   // (n_layers) - scale factors for key cache
@@ -300,9 +302,17 @@ void malloc_gpu_run_state(GPURunState *s, Config *p)
 
     int total_mtiles = BATCH_SIZE * K;
 
-    // KV cache (FP8 E4M3)
+    // KV cache (Hybrid BF16/FP8 for keys and values)
     HIP_CHECK(hipMalloc((void **)&s->key_cache, kv_cache_size));
+    // BF16 key cache for first tokens (higher precision)
+    // BF16_KEY_TOKENS is defined in attention.hpp as 128
+    size_t bf16_key_cache_size = (size_t)BATCH_SIZE * p->n_layers * BF16_KEY_TOKENS * kv_dim * sizeof(__hip_bfloat16);
+    HIP_CHECK(hipMalloc((void **)&s->key_cache_bf16, bf16_key_cache_size));
     HIP_CHECK(hipMalloc((void **)&s->value_cache, kv_cache_size));
+    // BF16 value cache for first tokens (higher precision)
+    // BF16_VALUE_TOKENS is defined in attention.hpp as 128
+    size_t bf16_value_cache_size = (size_t)BATCH_SIZE * p->n_layers * BF16_VALUE_TOKENS * kv_dim * sizeof(__hip_bfloat16);
+    HIP_CHECK(hipMalloc((void **)&s->value_cache_bf16, bf16_value_cache_size));
 
     // FP8 scale factors (per-layer)
     HIP_CHECK(hipMalloc((void **)&s->key_cache_scales, p->n_layers * sizeof(float)));
@@ -368,7 +378,11 @@ void malloc_gpu_run_state(GPURunState *s, Config *p)
     HIP_CHECK(hipMemset(s->k, 0, BATCH_SIZE * kv_dim * sizeof(float)));
     HIP_CHECK(hipMemset(s->v, 0, BATCH_SIZE * kv_dim * sizeof(float)));
     HIP_CHECK(hipMemset(s->key_cache, 0, kv_cache_size));
+    // Initialize BF16 key cache (same size calculation as above)
+    HIP_CHECK(hipMemset(s->key_cache_bf16, 0, (size_t)BATCH_SIZE * p->n_layers * BF16_KEY_TOKENS * kv_dim * sizeof(__hip_bfloat16)));
     HIP_CHECK(hipMemset(s->value_cache, 0, kv_cache_size));
+    // Initialize BF16 value cache
+    HIP_CHECK(hipMemset(s->value_cache_bf16, 0, (size_t)BATCH_SIZE * p->n_layers * BF16_VALUE_TOKENS * kv_dim * sizeof(__hip_bfloat16)));
     HIP_CHECK(hipMemset(s->att, 0, BATCH_SIZE * p->n_attn_heads * MAX_SEQ_LEN * sizeof(float)));
     HIP_CHECK(hipMemset(s->logits, 0, (size_t)BATCH_SIZE * p->vocab_size * sizeof(float)));
 
@@ -1356,7 +1370,9 @@ void free_gpu_run_state(GPURunState *s)
     df(s->att);
     df(s->mask);
     df(s->key_cache);
+    df(s->key_cache_bf16);
     df(s->value_cache);
+    df(s->value_cache_bf16);
     df(s->key_cache_scales);
     df(s->value_cache_scales);
     df(s->cos_vals);
@@ -1504,8 +1520,8 @@ void attention_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size,
         dim3 grid(batch_size, (KV + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK);
         dim3 block(1, THREADS_PER_BLOCK);
         update_kv_cache_kernel<<<grid, block, 0, sAttn>>>(
-            key_cache_mb, value_cache_mb, k_mb, v_mb,
-            s->key_cache_scales, s->value_cache_scales, pos_mb,
+            key_cache_mb, s->key_cache_bf16, value_cache_mb, s->value_cache_bf16,
+            k_mb, v_mb, s->key_cache_scales, s->value_cache_scales, pos_mb,
             batch_size, p->n_layers, layer_idx, MAX_SEQ_LEN, KV,
             /* batch_kv_stride = */ layers_capacity * (size_t)KV,
             /* layer_kv_offset = */ layer_elem_offset);
@@ -1523,7 +1539,8 @@ void attention_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size,
         assert_smem_or_die(shmem, "fused_attention_kernel");
 
         hipLaunchKernelGGL(fused_attention_kernel, grid, block, shmem, sAttn,
-                           tb_mb, q_mb, key_cache_mb, value_cache_mb,
+                           tb_mb, q_mb, key_cache_mb, s->key_cache_bf16,
+                           value_cache_mb, s->value_cache_bf16,
                            s->key_cache_scales, s->value_cache_scales,
                            w->attn_sinks + (size_t)layer_idx * NA,
                            s->mask, pos_mb, batch_size,

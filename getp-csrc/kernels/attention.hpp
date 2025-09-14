@@ -9,6 +9,14 @@
 #define SW_WINDOW 128
 #endif
 
+#ifndef BF16_KEY_TOKENS
+#define BF16_KEY_TOKENS 128
+#endif
+
+#ifndef BF16_VALUE_TOKENS
+#define BF16_VALUE_TOKENS 128
+#endif
+
 // ===== warp/block reductions (HIP-safe) =====
 __device__ inline float warpReduceMax(float v) {
     for (int off = warpSize >> 1; off > 0; off >>= 1)
@@ -53,7 +61,9 @@ __global__ void fused_attention_kernel(
     float * __restrict__ output,                    // [batch, n_heads, head_dim]
     const float * __restrict__ q,                   // [batch, n_heads * head_dim]
     const uint8_t * __restrict__ key_cache,         // [batch, n_layers, seq_len, kv_dim] (FP8 E4M3)
+    const __hip_bfloat16 * __restrict__ key_cache_bf16, // [batch, n_layers, BF16_KEY_TOKENS, kv_dim] (BF16)
     const uint8_t * __restrict__ value_cache,       // [batch, n_layers, seq_len, kv_dim] (FP8 E4M3)
+    const __hip_bfloat16 * __restrict__ value_cache_bf16, // [batch, n_layers, BF16_VALUE_TOKENS, kv_dim] (BF16)
     const float * __restrict__ key_cache_scales,    // [n_layers] - FP8 scale factors
     const float * __restrict__ value_cache_scales,  // [n_layers] - FP8 scale factors
     const __hip_bfloat16 * __restrict__ sinks,      // [n_heads] (already layer-offset on host)
@@ -85,7 +95,13 @@ __global__ void fused_attention_kernel(
 
     const float *q_head = q + 1LL * b * n_heads * head_dim + 1LL * h * head_dim;
     const uint8_t *k_base = key_cache   + (size_t)b * batch_kv_stride + layer_kv_offset;
+    const __hip_bfloat16 *k_bf16_base = key_cache_bf16 +
+        1LL * b * n_layers * BF16_KEY_TOKENS * kv_dim +
+        1LL * layer_idx * BF16_KEY_TOKENS * kv_dim;
     const uint8_t *v_base = value_cache + (size_t)b * batch_kv_stride + layer_kv_offset;
+    const __hip_bfloat16 *v_bf16_base = value_cache_bf16 +
+        1LL * b * n_layers * BF16_VALUE_TOKENS * kv_dim +
+        1LL * layer_idx * BF16_VALUE_TOKENS * kv_dim;
     float *out_head =
         output + 1LL * b * n_heads * head_dim + 1LL * h * head_dim;
 
@@ -109,13 +125,22 @@ __global__ void fused_attention_kernel(
     // ---- Pass 1: compute attention scores into s_att[0..win_core_len-1]
     for (int w = wid; w < win_core_len; w += WARPS) {
         const int t = win_start + w;
-        const uint8_t *k_vec = k_base + 1LL * ((layer_idx & 1) ? t : t % SW_WINDOW) * kv_dim
-                                      + 1LL * kv_h * head_dim;
+        const int cache_pos = (layer_idx & 1) ? t : t % SW_WINDOW;
 
         float prod = 0.f;
         if (lane < head_dim) {
-            // Dequantize FP8 key to float
-            const float kf = fp8_e4m3::fp8_e4m3_to_float(k_vec[lane]) * key_scale;
+            float kf;
+            // Use bf16 for first BF16_KEY_TOKENS tokens (higher precision)
+            if (cache_pos < BF16_KEY_TOKENS) {
+                const __hip_bfloat16 *k_vec_bf16 = k_bf16_base +
+                    1LL * cache_pos * kv_dim + 1LL * kv_h * head_dim;
+                kf = __bfloat162float(k_vec_bf16[lane]);
+            } else {
+                // Use FP8 for remaining tokens
+                const uint8_t *k_vec = k_base + 1LL * cache_pos * kv_dim
+                                              + 1LL * kv_h * head_dim;
+                kf = fp8_e4m3::fp8_e4m3_to_float(k_vec[lane]) * key_scale;
+            }
             prod = q_lane * kf;
         }
         float dot = warpReduceSum(prod);  // 64-lane sum
@@ -159,10 +184,20 @@ __global__ void fused_attention_kernel(
         float partial = 0.f;
         for (int w = wid; w < win_core_len; w += WARPS) {
             const int t = win_start + w;
-            const uint8_t *v_vec = v_base + 1LL * ((layer_idx & 1) ? t : t % SW_WINDOW) * kv_dim
-                                          + 1LL * kv_h * head_dim;
-            // Dequantize FP8 value to float
-            const float vf = fp8_e4m3::fp8_e4m3_to_float(v_vec[lane]) * value_scale;
+            const int cache_pos = (layer_idx & 1) ? t : t % SW_WINDOW;
+
+            float vf;
+            // Use bf16 for first BF16_VALUE_TOKENS tokens (higher precision)
+            if (cache_pos < BF16_VALUE_TOKENS) {
+                const __hip_bfloat16 *v_vec_bf16 = v_bf16_base +
+                    1LL * cache_pos * kv_dim + 1LL * kv_h * head_dim;
+                vf = __bfloat162float(v_vec_bf16[lane]);
+            } else {
+                // Use FP8 for remaining tokens
+                const uint8_t *v_vec = v_base + 1LL * cache_pos * kv_dim
+                                              + 1LL * kv_h * head_dim;
+                vf = fp8_e4m3::fp8_e4m3_to_float(v_vec[lane]) * value_scale;
+            }
             partial += (double)s_att[w] * vf;
         }
         s_partials[wid * head_dim + lane] = partial;
@@ -229,8 +264,9 @@ __global__ void compute_kv_cache_scales_kernel(
     }
 }
 
-// === KV cache update kernel (write FP8 E4M3 with dynamic scaling) ===
-__global__ void update_kv_cache_kernel(uint8_t *key_cache, uint8_t *value_cache,
+// === KV cache update kernel (hybrid BF16/FP8 for keys and values) ===
+__global__ void update_kv_cache_kernel(uint8_t *key_cache, __hip_bfloat16 *key_cache_bf16,
+                                       uint8_t *value_cache, __hip_bfloat16 *value_cache_bf16,
                                        const float *k, const float *v,
                                        float *key_cache_scales, float *value_cache_scales,
                                        const int *positions, int batch_size,
@@ -247,20 +283,43 @@ __global__ void update_kv_cache_kernel(uint8_t *key_cache, uint8_t *value_cache,
     if (pos >= seq_len)
         return; // Safety check
 
-    const size_t base = (size_t)batch_idx * batch_kv_stride + layer_kv_offset;
-    const int row = ((layer_idx & 1) ? pos : (pos % SW_WINDOW));
-    const size_t cache_idx = base + (size_t)row * (size_t)kv_dim + (size_t)dim_idx;
+    const int cache_pos = ((layer_idx & 1) ? pos : (pos % SW_WINDOW));
 
-    // Get scale factors for this layer (inverse scale for quantization)
-    float key_inv_scale = 1.0f / key_cache_scales[layer_idx];
-    float value_inv_scale = 1.0f / value_cache_scales[layer_idx];
-
-    // Quantize float to FP8 with scaling
+    // Key value to store
     float key_val = k[1LL*batch_idx * kv_dim + dim_idx];
+
+    // Store keys: first BF16_KEY_TOKENS in bf16, rest in fp8
+    if (cache_pos < BF16_KEY_TOKENS) {
+        // Store in bf16 for higher precision
+        const size_t bf16_idx = 1LL * batch_idx * n_layers * BF16_KEY_TOKENS * kv_dim +
+                               1LL * layer_idx * BF16_KEY_TOKENS * kv_dim +
+                               1LL * cache_pos * kv_dim + dim_idx;
+        key_cache_bf16[bf16_idx] = __float2bfloat16(key_val);
+    } else {
+        // Store in fp8 for memory efficiency
+        const size_t base = (size_t)batch_idx * batch_kv_stride + layer_kv_offset;
+        const size_t cache_idx = base + (size_t)cache_pos * (size_t)kv_dim + (size_t)dim_idx;
+        float key_inv_scale = 1.0f / key_cache_scales[layer_idx];
+        key_cache[cache_idx] = fp8_e4m3::float_to_fp8_e4m3(key_val * key_inv_scale, true);
+    }
+
+    // Value value to store
     float value_val = v[1LL*batch_idx * kv_dim + dim_idx];
 
-    key_cache[cache_idx]   = fp8_e4m3::float_to_fp8_e4m3(key_val * key_inv_scale, true);
-    value_cache[cache_idx] = fp8_e4m3::float_to_fp8_e4m3(value_val * value_inv_scale, true);
+    // Store values: first BF16_VALUE_TOKENS in bf16, rest in fp8
+    if (cache_pos < BF16_VALUE_TOKENS) {
+        // Store in bf16 for higher precision
+        const size_t bf16_idx = 1LL * batch_idx * n_layers * BF16_VALUE_TOKENS * kv_dim +
+                               1LL * layer_idx * BF16_VALUE_TOKENS * kv_dim +
+                               1LL * cache_pos * kv_dim + dim_idx;
+        value_cache_bf16[bf16_idx] = __float2bfloat16(value_val);
+    } else {
+        // Store in fp8 for memory efficiency
+        const size_t base = (size_t)batch_idx * batch_kv_stride + layer_kv_offset;
+        const size_t cache_idx = base + (size_t)cache_pos * (size_t)kv_dim + (size_t)dim_idx;
+        float value_inv_scale = 1.0f / value_cache_scales[layer_idx];
+        value_cache[cache_idx] = fp8_e4m3::float_to_fp8_e4m3(value_val * value_inv_scale, true);
+    }
 }
 
 
