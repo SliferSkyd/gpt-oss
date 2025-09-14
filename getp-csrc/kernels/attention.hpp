@@ -2,6 +2,7 @@
 #include <hip/hip_bf16.h>
 #include "../config.hpp"
 #include "matmul.hpp"
+#include "../memory/fp8_e4m3.hpp"  // FP8 E4M3 conversion utilities
 
 // --- MODIFIED FUSED ATTENTION KERNEL (2-D mapping: lanes x warps) ---
 #ifndef SW_WINDOW
@@ -51,8 +52,10 @@ __device__ inline float blockReduceSum(float v, float *smem) {
 __global__ void fused_attention_kernel(
     float * __restrict__ output,                    // [batch, n_heads, head_dim]
     const float * __restrict__ q,                   // [batch, n_heads * head_dim]
-    const __hip_bfloat16 * __restrict__ key_cache,  // [batch, n_layers, seq_len, kv_dim] (bf16)
-    const __hip_bfloat16 * __restrict__ value_cache,// [batch, n_layers, seq_len, kv_dim] (bf16)
+    const uint8_t * __restrict__ key_cache,         // [batch, n_layers, seq_len, kv_dim] (FP8 E4M3)
+    const uint8_t * __restrict__ value_cache,       // [batch, n_layers, seq_len, kv_dim] (FP8 E4M3)
+    const float * __restrict__ key_cache_scales,    // [n_layers] - FP8 scale factors
+    const float * __restrict__ value_cache_scales,  // [n_layers] - FP8 scale factors
     const __hip_bfloat16 * __restrict__ sinks,      // [n_heads] (already layer-offset on host)
     const float * __restrict__ mask,                // [seq_len, seq_len]
     const int * __restrict__ positions,             // [batch]
@@ -81,10 +84,14 @@ __global__ void fused_attention_kernel(
     const int kv_dim     = head_dim * n_kv_heads;
 
     const float *q_head = q + 1LL * b * n_heads * head_dim + 1LL * h * head_dim;
-    const __hip_bfloat16 *k_base = key_cache   + (size_t)b * batch_kv_stride + layer_kv_offset;
-    const __hip_bfloat16 *v_base = value_cache + (size_t)b * batch_kv_stride + layer_kv_offset;
+    const uint8_t *k_base = key_cache   + (size_t)b * batch_kv_stride + layer_kv_offset;
+    const uint8_t *v_base = value_cache + (size_t)b * batch_kv_stride + layer_kv_offset;
     float *out_head =
         output + 1LL * b * n_heads * head_dim + 1LL * h * head_dim;
+
+    // FP8 scale factors for this layer
+    const float key_scale = key_cache_scales[layer_idx];
+    const float value_scale = value_cache_scales[layer_idx];
 
     // Windowing + capacities
     const bool apply_window = use_sliding_window && ((layer_idx & 1) == 0);
@@ -102,12 +109,13 @@ __global__ void fused_attention_kernel(
     // ---- Pass 1: compute attention scores into s_att[0..win_core_len-1]
     for (int w = wid; w < win_core_len; w += WARPS) {
         const int t = win_start + w;
-        const __hip_bfloat16 *k_vec = k_base + 1LL * ((layer_idx & 1) ? t : t % SW_WINDOW) * kv_dim
+        const uint8_t *k_vec = k_base + 1LL * ((layer_idx & 1) ? t : t % SW_WINDOW) * kv_dim
                                       + 1LL * kv_h * head_dim;
 
         float prod = 0.f;
         if (lane < head_dim) {
-            const float kf = __bfloat162float(k_vec[lane]);
+            // Dequantize FP8 key to float
+            const float kf = fp8_e4m3::fp8_e4m3_to_float(k_vec[lane]) * key_scale;
             prod = q_lane * kf;
         }
         float dot = warpReduceSum(prod);  // 64-lane sum
@@ -151,9 +159,10 @@ __global__ void fused_attention_kernel(
         float partial = 0.f;
         for (int w = wid; w < win_core_len; w += WARPS) {
             const int t = win_start + w;
-            const __hip_bfloat16 *v_vec = v_base + 1LL * ((layer_idx & 1) ? t : t % SW_WINDOW) * kv_dim
+            const uint8_t *v_vec = v_base + 1LL * ((layer_idx & 1) ? t : t % SW_WINDOW) * kv_dim
                                           + 1LL * kv_h * head_dim;
-            const float vf = __bfloat162float(v_vec[lane]);
+            // Dequantize FP8 value to float
+            const float vf = fp8_e4m3::fp8_e4m3_to_float(v_vec[lane]) * value_scale;
             partial += (double)s_att[w] * vf;
         }
         s_partials[wid * head_dim + lane] = partial;
@@ -170,9 +179,60 @@ __global__ void fused_attention_kernel(
 }
 
 
-// === KV cache update kernel (write __hip_bfloat16) ===
-__global__ void update_kv_cache_kernel(__hip_bfloat16 *key_cache, __hip_bfloat16 *value_cache,
+// === Dynamic FP8 scale computation kernel ===
+__global__ void compute_kv_cache_scales_kernel(
+    float *key_scale_out, float *value_scale_out,
+    const float *k, const float *v,
+    int batch_size, int kv_dim, int layer_idx)
+{
+    extern __shared__ float shared_mem[];
+
+    const int tid = threadIdx.x;
+    const int num_elements = batch_size * kv_dim;
+
+    // Find max absolute value for keys
+    float local_key_max = 0.0f;
+    float local_value_max = 0.0f;
+
+    for (int idx = blockIdx.x * blockDim.x + tid; idx < num_elements; idx += gridDim.x * blockDim.x) {
+        local_key_max = fmaxf(local_key_max, fabsf(k[idx]));
+        local_value_max = fmaxf(local_value_max, fabsf(v[idx]));
+    }
+
+    // Reduce within block
+    shared_mem[tid] = local_key_max;
+    shared_mem[tid + blockDim.x] = local_value_max;
+    __syncthreads();
+
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            shared_mem[tid] = fmaxf(shared_mem[tid], shared_mem[tid + stride]);
+            shared_mem[tid + blockDim.x] = fmaxf(shared_mem[tid + blockDim.x], shared_mem[tid + stride + blockDim.x]);
+        }
+        __syncthreads();
+    }
+
+    // Write result (first thread only)
+    if (tid == 0) {
+        float key_max = shared_mem[0];
+        float value_max = shared_mem[blockDim.x];
+
+        // Compute scales to fit in FP8 E4M3 range (with 5% margin)
+        const float target_range = fp8_e4m3::FP8_E4M3_MAX_VALUE * 0.95f;
+
+        // Update scale using atomic max to handle multiple blocks
+        float key_scale = (key_max > 0) ? (key_max / target_range) : 1.0f;
+        float value_scale = (value_max > 0) ? (value_max / target_range) : 1.0f;
+
+        atomicMax((int*)&key_scale_out[layer_idx], __float_as_int(key_scale));
+        atomicMax((int*)&value_scale_out[layer_idx], __float_as_int(value_scale));
+    }
+}
+
+// === KV cache update kernel (write FP8 E4M3 with dynamic scaling) ===
+__global__ void update_kv_cache_kernel(uint8_t *key_cache, uint8_t *value_cache,
                                        const float *k, const float *v,
+                                       float *key_cache_scales, float *value_cache_scales,
                                        const int *positions, int batch_size,
                                        int n_layers, int layer_idx, int seq_len,
                                        int kv_dim, size_t batch_kv_stride, size_t layer_kv_offset)
@@ -191,8 +251,16 @@ __global__ void update_kv_cache_kernel(__hip_bfloat16 *key_cache, __hip_bfloat16
     const int row = ((layer_idx & 1) ? pos : (pos % SW_WINDOW));
     const size_t cache_idx = base + (size_t)row * (size_t)kv_dim + (size_t)dim_idx;
 
-    key_cache[cache_idx]   = __float2bfloat16(k[1LL*batch_idx * kv_dim + dim_idx]);
-    value_cache[cache_idx] = __float2bfloat16(v[1LL*batch_idx * kv_dim + dim_idx]);
+    // Get scale factors for this layer (inverse scale for quantization)
+    float key_inv_scale = 1.0f / key_cache_scales[layer_idx];
+    float value_inv_scale = 1.0f / value_cache_scales[layer_idx];
+
+    // Quantize float to FP8 with scaling
+    float key_val = k[1LL*batch_idx * kv_dim + dim_idx];
+    float value_val = v[1LL*batch_idx * kv_dim + dim_idx];
+
+    key_cache[cache_idx]   = fp8_e4m3::float_to_fp8_e4m3(key_val * key_inv_scale, true);
+    value_cache[cache_idx] = fp8_e4m3::float_to_fp8_e4m3(value_val * value_inv_scale, true);
 }
 
 
