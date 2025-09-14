@@ -164,6 +164,9 @@ typedef struct
     int *local_ids;   // [BATCH_SIZE * K]
     float *local_wts; // [BATCH_SIZE * K]
     int *n_local;     // [BATCH_SIZE]
+    // Add at the end of GPURunState (or anywhere convenient)
+    hipStream_t io_k{nullptr};  // SDMA lane for K
+    hipStream_t io_v{nullptr};  // SDMA lane for V
 } GPURunState;
 
 // CPU buffers for warmup and host-side operations
@@ -322,63 +325,82 @@ static inline void kv_set_window_start(GPUTransformer *gpu_t, int new_start)
     s->kv_row_stride_elems_cur = pos_cap * (size_t)kv_dim;
 }
 
-// Prefetch a whole layer's KV slices for all rows [0..BATCH_SIZE) from host to device.
-static inline void kv_prefetch_layer_full_rows(GPUTransformer *gpu_t, int layer_idx, hipStream_t sIO)
+// ---- Dual-lane prefetch: host -> device (records evtK, evtV) ----
+static inline void kv_prefetch_layer_full_rows_dual(GPUTransformer *gpu_t,
+                                                    int layer_idx,
+                                                    hipEvent_t evtK, hipEvent_t evtV)
 {
     Config *p = &gpu_t->config;
     GPURunState *s = &gpu_t->state;
     CPUBuffers *cpu = &gpu_t->cpu_buffers;
+
     const int kv_dim = p->head_dim * p->n_kv_heads;
     const size_t layer_pos_cap = (size_t)cap_for_layer(p, layer_idx);
-    const size_t width_bytes = layer_pos_cap * (size_t)kv_dim * sizeof(float);
-    if (width_bytes == 0)
+    const size_t width_bytes   = layer_pos_cap * (size_t)kv_dim * sizeof(float);
+    if (width_bytes == 0) {
+        // still record "done" so waits don’t hang
+        HIP_CHECK(hipEventRecord(evtK, s->io_k));
+        HIP_CHECK(hipEventRecord(evtV, s->io_v));
         return;
+    }
 
+    // Freeze pitches/offsets now (window may slide later)
     const size_t host_row_pitch = cpu->kv_row_stride_elems * sizeof(float);
-    const size_t dev_row_pitch = s->kv_row_stride_elems_cur * sizeof(float);
-
+    const size_t dev_row_pitch  = s->kv_row_stride_elems_cur * sizeof(float);
     const size_t host_layer_off = layer_host_elem_offset(p, layer_idx) * sizeof(float);
-    const size_t dev_layer_off = layer_local_elem_offset(p, s, layer_idx) * sizeof(float);
+    const size_t dev_layer_off  = layer_local_elem_offset(p, s, layer_idx) * sizeof(float);
 
-    void *dstK = (void *)((char *)s->key_cache + dev_layer_off);
-    void *srcK = (void *)((char *)cpu->key_cache_host + host_layer_off);
-    void *dstV = (void *)((char *)s->value_cache + dev_layer_off);
-    void *srcV = (void *)((char *)cpu->value_cache_host + host_layer_off);
+    void *dstK = (void*)((char*)s->key_cache   + dev_layer_off);
+    void *srcK = (void*)((char*)cpu->key_cache_host   + host_layer_off);
+    void *dstV = (void*)((char*)s->value_cache + dev_layer_off);
+    void *srcV = (void*)((char*)cpu->value_cache_host + host_layer_off);
 
     HIP_CHECK(hipMemcpy2DAsync(dstK, dev_row_pitch, srcK, host_row_pitch,
-                               width_bytes, BATCH_SIZE, hipMemcpyHostToDevice, sIO));
+                               width_bytes, BATCH_SIZE, hipMemcpyHostToDevice, s->io_k));
     HIP_CHECK(hipMemcpy2DAsync(dstV, dev_row_pitch, srcV, host_row_pitch,
-                               width_bytes, BATCH_SIZE, hipMemcpyHostToDevice, sIO));
+                               width_bytes, BATCH_SIZE, hipMemcpyHostToDevice, s->io_v));
+
+    HIP_CHECK(hipEventRecord(evtK, s->io_k));
+    HIP_CHECK(hipEventRecord(evtV, s->io_v));
 }
 
-// Offload a whole layer's KV slices for all rows [0..BATCH_SIZE) from device to host.
-static inline void kv_offload_layer_full_rows(GPUTransformer *gpu_t, int layer_idx, hipStream_t sIO)
+// ---- Dual-lane offload: device -> host (records evtK, evtV) ----
+static inline void kv_offload_layer_full_rows_dual(GPUTransformer *gpu_t,
+                                                   int layer_idx,
+                                                   hipEvent_t evtK, hipEvent_t evtV)
 {
     Config *p = &gpu_t->config;
     GPURunState *s = &gpu_t->state;
     CPUBuffers *cpu = &gpu_t->cpu_buffers;
+
     const int kv_dim = p->head_dim * p->n_kv_heads;
     const size_t layer_pos_cap = (size_t)cap_for_layer(p, layer_idx);
-    const size_t width_bytes = layer_pos_cap * (size_t)kv_dim * sizeof(float);
-    if (width_bytes == 0)
+    const size_t width_bytes   = layer_pos_cap * (size_t)kv_dim * sizeof(float);
+    if (width_bytes == 0) {
+        HIP_CHECK(hipEventRecord(evtK, s->io_k));
+        HIP_CHECK(hipEventRecord(evtV, s->io_v));
         return;
+    }
 
     const size_t host_row_pitch = cpu->kv_row_stride_elems * sizeof(float);
-    const size_t dev_row_pitch = s->kv_row_stride_elems_cur * sizeof(float);
-
+    const size_t dev_row_pitch  = s->kv_row_stride_elems_cur * sizeof(float);
     const size_t host_layer_off = layer_host_elem_offset(p, layer_idx) * sizeof(float);
-    const size_t dev_layer_off = layer_local_elem_offset(p, s, layer_idx) * sizeof(float);
+    const size_t dev_layer_off  = layer_local_elem_offset(p, s, layer_idx) * sizeof(float);
 
-    void *srcK = (void *)((char *)s->key_cache + dev_layer_off);
-    void *dstK = (void *)((char *)cpu->key_cache_host + host_layer_off);
-    void *srcV = (void *)((char *)s->value_cache + dev_layer_off);
-    void *dstV = (void *)((char *)cpu->value_cache_host + host_layer_off);
+    void *srcK = (void*)((char*)s->key_cache   + dev_layer_off);
+    void *dstK = (void*)((char*)cpu->key_cache_host   + host_layer_off);
+    void *srcV = (void*)((char*)s->value_cache + dev_layer_off);
+    void *dstV = (void*)((char*)cpu->value_cache_host + host_layer_off);
 
     HIP_CHECK(hipMemcpy2DAsync(dstK, host_row_pitch, srcK, dev_row_pitch,
-                               width_bytes, BATCH_SIZE, hipMemcpyDeviceToHost, sIO));
+                               width_bytes, BATCH_SIZE, hipMemcpyDeviceToHost, s->io_k));
     HIP_CHECK(hipMemcpy2DAsync(dstV, host_row_pitch, srcV, dev_row_pitch,
-                               width_bytes, BATCH_SIZE, hipMemcpyDeviceToHost, sIO));
+                               width_bytes, BATCH_SIZE, hipMemcpyDeviceToHost, s->io_v));
+
+    HIP_CHECK(hipEventRecord(evtK, s->io_k));
+    HIP_CHECK(hipEventRecord(evtV, s->io_v));
 }
+
 
 // Memory allocation functions
 void malloc_gpu_run_state(GPURunState *s, Config *p)
@@ -534,6 +556,9 @@ void malloc_gpu_run_state(GPURunState *s, Config *p)
         HIP_CHECK(hipMemcpy(s->mask, h_mask, mask_size, hipMemcpyHostToDevice));
         free(h_mask);
     }
+    // In malloc_gpu_run_state(...)
+    HIP_CHECK(hipStreamCreateWithFlags(&s->io_k, hipStreamNonBlocking));
+    HIP_CHECK(hipStreamCreateWithFlags(&s->io_v, hipStreamNonBlocking));
 }
 
 void malloc_gpu_weights(GPUTransformerWeights *w, Config *p)
@@ -1565,135 +1590,160 @@ void finish(Transformer *transformer, Tokenizer *tokenizer)
     }
 }
 
-// ----------------------------- attention path (unchanged) --------------------------
-// ----------------------------- attention path (unchanged) --------------------------
+
+// ----------------------------- attention path (KV-window aware) --------------------------
 void attention_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size,
                    int row_offset, hipStream_t sAttn)
 {
-    if (batch_size <= 0)
-        return;
+    if (batch_size <= 0) return;
 
     Config *p = &gpu_t->config;
     GPURunState *s = &gpu_t->state;
     GPUTransformerWeights *w = &gpu_t->weights;
 
-    const int H = p->hidden_dim;
+    const int H  = p->hidden_dim;
     const int Hd = p->head_dim;
     const int NA = p->n_attn_heads;
     const int NK = p->n_kv_heads;
-    const int KV = Hd * NK;
-    const int QKV = Hd * (NA + 2 * NK);
 
-    const size_t kv_slice = s->kv_row_stride_elems_cur; // per-row stride in floats for current window
+    const int KV  = Hd * NK;                 // per-token K/V width
+    const int QKV = Hd * (NA + 2 * NK);      // packed Q, K, V width
 
-    const size_t layer_elem_offset = layer_local_elem_offset(p, s, layer_idx);
+    // Per-row stride for the *current* device KV window (already set by forward loop)
+    const size_t kv_row_stride = s->kv_row_stride_elems_cur;          // floats
+    const size_t layer_off_e   = layer_local_elem_offset(p, s, layer_idx); // floats
 
-    float *x_mb = s->x + (size_t)row_offset * H;
-    float *t_mb = s->t + (size_t)row_offset * H;
-    float *tb_mb = s->tb + (size_t)row_offset * (Hd * NA);
-    float *qkv_mb = s->qkv + (size_t)row_offset * QKV;
-    float *q_mb = s->q + (size_t)row_offset * (Hd * NA);
-    float *k_mb = s->k + (size_t)row_offset * KV;
-    float *v_mb = s->v + (size_t)row_offset * KV;
-    int *pos_mb = s->positions + row_offset;
+    // Microbatch base pointers
+    float *x_mb    = s->x    + (size_t)row_offset * H;
+    float *t_mb    = s->t    + (size_t)row_offset * H;
+    float *tb_mb   = s->tb   + (size_t)row_offset * (Hd * NA);
+    float *qkv_mb  = s->qkv  + (size_t)row_offset * QKV;
+    float *q_mb    = s->q    + (size_t)row_offset * (Hd * NA);
+    float *k_mb    = s->k    + (size_t)row_offset * KV;
+    float *v_mb    = s->v    + (size_t)row_offset * KV;
+    int   *pos_mb  = s->positions + row_offset;
 
-    float *key_cache_mb = s->key_cache + (size_t)row_offset * kv_slice;
-    float *value_cache_mb = s->value_cache + (size_t)row_offset * kv_slice;
+    // KV cache row starts for this microbatch (windowed)
+    float *key_cache_mb   = s->key_cache   + (size_t)row_offset * kv_row_stride;
+    float *value_cache_mb = s->value_cache + (size_t)row_offset * kv_row_stride;
 
-    // 1) RMSNorm
+    // 1) Pre-attention RMSNorm
     {
-        // TIMER_BLOCK("rmsnorm_kernel_attention");
         dim3 grid(batch_size), block(THREADS_PER_BLOCK);
         rmsnorm_kernel<<<grid, block, 0, sAttn>>>(t_mb, x_mb,
-                                                  w->rms_attn_w + (size_t)layer_idx * H, batch_size, H);
+            w->rms_attn_w + (size_t)layer_idx * H, batch_size, H);
         HIP_CHECK(hipGetLastError());
     }
-    // 2) QKV
+
+    // 2) Linear: QKV = t_mb * W_qkv
     {
-        const int woff = layer_idx * H * QKV;
+        const size_t woff = (size_t)layer_idx * (size_t)H * (size_t)QKV;
         matmul_mc(qkv_mb, t_mb, w->w_qkv + woff, batch_size, H, QKV, sAttn);
         HIP_CHECK(hipGetLastError());
     }
-    // 3) bias
+
+    // 3) Add QKV bias
     {
-        const int boff = (size_t)layer_idx * QKV;
-        const int elems = batch_size * QKV;
-        if (elems > 0)
-        {
-            // TIMER_BLOCK("add_bias_kernel_attention");
+        const size_t boff  = (size_t)layer_idx * (size_t)QKV;
+        const int    elems = batch_size * QKV;
+        if (elems > 0) {
             dim3 grid((elems + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK);
-            add_bias_kernel<<<grid, THREADS_PER_BLOCK, 0, sAttn>>>(qkv_mb, w->b_qkv + boff, batch_size, QKV);
+            add_bias_kernel<<<grid, THREADS_PER_BLOCK, 0, sAttn>>>(
+                qkv_mb, w->b_qkv + boff, batch_size, QKV);
             HIP_CHECK(hipGetLastError());
         }
     }
-    // 4) split + RoPE
+
+    // 4) Split packed QKV and apply RoPE to Q,K at positions pos_mb
     {
-        // TIMER_BLOCK("launch_split_qkv_apply_rotary_attention");
         launch_split_qkv_apply_rotary(
             qkv_mb, q_mb, k_mb, v_mb,
             s->cos_vals, s->sin_vals, pos_mb,
             batch_size, NA, NK, Hd, sAttn);
         HIP_CHECK(hipGetLastError());
     }
-    // 5) KV cache update
+
+    // 5) Update KV cache (window-aware pitch + per-layer offset)
     {
-        // TIMER_BLOCK("update_kv_cache_kernel_attention");
         dim3 grid(batch_size, (KV + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK);
         dim3 block(1, THREADS_PER_BLOCK);
         update_kv_cache_kernel<<<grid, block, 0, sAttn>>>(
             key_cache_mb, value_cache_mb, k_mb, v_mb, pos_mb,
-            batch_size, p->n_layers, layer_idx, MAX_SEQ_LEN, KV,
-            /* batch_kv_stride = */ kv_slice,
-            /* layer_kv_offset = */ layer_elem_offset);
+            /*batch_size*/ batch_size,
+            /*n_layers*/   p->n_layers,
+            /*layer_idx*/  layer_idx,
+            /*max_seq*/    MAX_SEQ_LEN,
+            /*KV cols*/    KV,
+            /*batch_kv_stride (floats)*/ kv_row_stride,
+            /*layer_kv_offset (floats)*/ layer_off_e);
+        HIP_CHECK(hipGetLastError());
     }
-    // 6) fused attention
+
+    // 6) Fused attention over cached keys/values (sliding window on even layers)
     {
-        // TIMER_BLOCK("fused_attention_kernel_attention");
         const bool apply_window = (p->sliding_window > 0) && ((layer_idx & 1) == 0);
-        constexpr int HOST_WARPSIZE = 64;
+
+        // Dynamic shared memory sizing (Hd-projected Q, per-warp temp, and attention ring buffer)
+        constexpr int HOST_WARPSIZE = 64; // AMD wavefront
         dim3 grid(batch_size, NA);
         dim3 block(256);
-        const int warps = (block.x + HOST_WARPSIZE - 1) / HOST_WARPSIZE;
+        const int  warps  = (block.x + HOST_WARPSIZE - 1) / HOST_WARPSIZE;
         const size_t att_cap = apply_window ? (SW_WINDOW + 1) : MAX_SEQ_LEN;
-        const size_t shmem = (att_cap + (size_t)warps * Hd + warps) * sizeof(float);
+        const size_t shmem =
+            (att_cap + (size_t)warps * (size_t)Hd + (size_t)warps) * sizeof(float);
         assert_smem_or_die(shmem, "fused_attention_kernel");
 
         hipLaunchKernelGGL(fused_attention_kernel, grid, block, shmem, sAttn,
-                           tb_mb, q_mb, key_cache_mb, value_cache_mb,
-                           w->attn_sinks + (size_t)layer_idx * NA,
-                           s->mask, pos_mb, batch_size,
-                           NA, NK, Hd, MAX_SEQ_LEN, p->n_layers, layer_idx,
-                           p->sliding_window > 0,
-                           /* batch_kv_stride = */ kv_slice,
-                           /* layer_kv_offset = */ layer_elem_offset);
-
+            /*out*/        tb_mb,
+            /*Q*/          q_mb,
+            /*K cache*/    key_cache_mb,
+            /*V cache*/    value_cache_mb,
+            /*sinks*/      w->attn_sinks + (size_t)layer_idx * (size_t)NA,
+            /*mask*/       s->mask,           // nullptr if no sliding window
+            /*positions*/  pos_mb,
+            /*B*/          batch_size,
+            /*n_heads*/    NA,
+            /*n_kv*/       NK,
+            /*head_dim*/   Hd,
+            /*max_seq*/    MAX_SEQ_LEN,
+            /*n_layers*/   p->n_layers,
+            /*layer_idx*/  layer_idx,
+            /*use_window*/ (p->sliding_window > 0),
+            /*batch_kv_stride (floats)*/ kv_row_stride,
+            /*layer_kv_offset (floats)*/ layer_off_e);
         HIP_CHECK(hipGetLastError());
     }
-    // 7) fused output projection
-    {
-        // TIMER_BLOCK("fused_output_projection_kernel_optimized_attention");
-        const int Kproj = Hd * NA;
-        const int N = H;
-        const int woff = (size_t)layer_idx * Kproj * H;
-        const int boff = (size_t)layer_idx * H;
 
-        dim3 gridDim((N + BLOCK_N - 1) / BLOCK_N, (batch_size + BLOCK_M - 1) / BLOCK_M);
+    // 7) Fused output projection: x_mb += tb_mb * W_o + b_o
+    {
+        const int Kproj = Hd * NA;
+        const int N     = H;
+
+        const size_t woff = (size_t)layer_idx * (size_t)Kproj * (size_t)H;
+        const size_t boff = (size_t)layer_idx * (size_t)H;
+
+        dim3 gridDim((N + BLOCK_N - 1) / BLOCK_N,
+                     (batch_size + BLOCK_M - 1) / BLOCK_M);
         dim3 blockDim(LANE_PER_WAVE, WAVES_PER_BLOCK);
+
         const int ldA = BLOCK_K + PAD_K_MC;
         const int ldB = BLOCK_K + PAD_K_MC;
         const size_t shmem =
-            sizeof(uint16_t) * (size_t)(2 * BLOCK_M * ldA + 2 * ldB * BLOCK_N);
-        assert_smem_or_die(shmem, "fused_output_projection_kernel_optimized");
+            sizeof(uint16_t) *
+            (size_t)(2 * BLOCK_M * ldA + 2 * ldB * BLOCK_N);
 
+        assert_smem_or_die(shmem, "fused_output_projection_kernel_optimized");
         fused_output_projection_kernel_optimized<<<gridDim, blockDim, shmem, sAttn>>>(
-            s->x + (size_t)row_offset * H, s->tb + (size_t)row_offset * Kproj,
-            w->w_o + woff, w->b_o + boff,
-            /*M=*/batch_size, /*K=*/Kproj, /*N=*/N);
+            /*dst x*/    s->x + (size_t)row_offset * H,
+            /*src tb*/   s->tb + (size_t)row_offset * Kproj,
+            /*W_o*/      w->w_o + woff,
+            /*b_o*/      w->b_o + boff,
+            /*M*/        batch_size,
+            /*K*/        Kproj,
+            /*N*/        N);
         HIP_CHECK(hipGetLastError());
     }
 }
-
-
 
 // Split helpers
 static inline void mlp1_shard(int twoD, int tp_size, int r, int &o_start, int &o_len)
@@ -1808,9 +1858,9 @@ void moe_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size,
     {
         // TIMER_BLOCK("router_topk_softmax_moe");
         matmul_mc(s->router_score_g, s->gather_x_g,
-              w->w_router + (size_t)layer_idx * H * E, Bgrp, H, E, sMoe);
-            }
-    HIP_CHECK(hipGetLastError());
+              w->w_router + (size_t)layer_idx * H * E, Bgrp, H, E, sMoe);        
+        HIP_CHECK(hipGetLastError());
+    }
     {
         const int elems = Bgrp * E;
         if (elems > 0)
@@ -2089,48 +2139,52 @@ int *forward_batch_gpu(GPUTransformer *gpu_t, int *tokens, int batch_size)
     GPURunState *s = &gpu_t->state;
     GPUTransformerWeights *w = &gpu_t->weights;
     CPUBuffers *cpu_buf = &gpu_t->cpu_buffers;
+
     const int H = p->hidden_dim;
     const int B = batch_size;
-    if (B <= 0)
-        return cpu_buf->current_tokens;
+    if (B <= 0) return cpu_buf->current_tokens;
 
-    // streams
-    hipStream_t attn_stream = nullptr, moe_stream = nullptr, io_stream = nullptr;
+    // Compute streams
+    hipStream_t attn_stream = nullptr, moe_stream = nullptr;
     HIP_CHECK(hipStreamCreateWithFlags(&attn_stream, hipStreamNonBlocking));
     HIP_CHECK(hipStreamCreateWithFlags(&moe_stream, hipStreamNonBlocking));
-    HIP_CHECK(hipStreamCreateWithFlags(&io_stream, hipStreamNonBlocking));
 
-    // microbatching — keep your MB exactly (no TP-capping inside attention)
+    // Dual-lane KV events (K and V copy lanes on s->io_k / s->io_v)
+    auto make_evt_nv = []() {
+        hipEvent_t e = nullptr;
+        HIP_CHECK(hipEventCreateWithFlags(&e, hipEventDisableTiming));
+        return e;
+    };
+    hipEvent_t evt_kv_ready_K = make_evt_nv();
+    hipEvent_t evt_kv_ready_V = make_evt_nv();
+    hipEvent_t evt_kv_off_K   = make_evt_nv();
+    hipEvent_t evt_kv_off_V   = make_evt_nv();
+
+    // Microbatching (keep your MB policy)
     const int MB = (BATCH_SIZE <= B) ? BATCH_SIZE : B;
     const int NUM_MB = (B + MB - 1) / MB;
 
-    // per-microbatch events
-    auto make_evt = []()
-    {
+    auto make_evt = []() {
         hipEvent_t e = nullptr;
         HIP_CHECK(hipEventCreateWithFlags(&e, hipEventDisableTiming));
         return e;
     };
     std::vector<hipEvent_t> evt_attn_done(NUM_MB);
     std::vector<hipEvent_t> evt_moe_done_prev(NUM_MB), evt_moe_done_cur(NUM_MB);
-    hipEvent_t evt_kv_ready = make_evt();
-    hipEvent_t evt_kv_offloaded = make_evt();
-    for (int i = 0; i < NUM_MB; ++i)
-    {
-        evt_attn_done[i] = make_evt();
+    for (int i = 0; i < NUM_MB; ++i) {
+        evt_attn_done[i]     = make_evt();
         evt_moe_done_prev[i] = make_evt();
-        evt_moe_done_cur[i] = make_evt();
+        evt_moe_done_cur[i]  = make_evt();
     }
 
     // H2D tokens + positions
     h2d_copy(s->current_tokens, tokens, (size_t)B * sizeof(int), attn_stream);
     h2d_copy(s->positions, cpu_buf->positions, (size_t)B * sizeof(int), attn_stream);
 
-    // embeddings on attn_stream
+    // Embeddings on attn_stream
     {
         const int elems = B * H;
-        if (elems > 0)
-        {
+        if (elems > 0) {
             dim3 grid((elems + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK);
             copy_embeddings_kernel<<<grid, THREADS_PER_BLOCK, 0, attn_stream>>>(
                 s->x, w->token_embedding_table, s->current_tokens, B, H);
@@ -2138,93 +2192,95 @@ int *forward_batch_gpu(GPUTransformer *gpu_t, int *tokens, int batch_size)
         }
     }
 
-    // pipelined schedule across layers and microbatches
+    // Pipeline across layers and microbatches
     int last_prefetched_layer = -1;
-    for (int l = 0; l < p->n_layers; ++l)
-    {
-        // Ensure device KV window covers this layer, then prefetch it if not already prefetched
-        if (l < s->kv_win_start || l >= s->kv_win_start + s->kv_win_len_cur)
-        {
+
+    for (int l = 0; l < p->n_layers; ++l) {
+        // Ensure device KV window covers this layer; prefetch if needed
+        if (l < s->kv_win_start || l >= s->kv_win_start + s->kv_win_len_cur) {
             kv_set_window_start(gpu_t, l);
         }
-        if (last_prefetched_layer != l)
-        {
-            kv_prefetch_layer_full_rows(gpu_t, l, io_stream);
-            HIP_CHECK(hipEventRecord(evt_kv_ready, io_stream));
+        if (last_prefetched_layer != l) {
+            // Starts dual H2D prefetches on s->io_k / s->io_v and records evt_kv_ready_{K,V}
+            kv_prefetch_layer_full_rows_dual(gpu_t, l, evt_kv_ready_K, evt_kv_ready_V);
             last_prefetched_layer = l;
         }
+
         int mb_idx = 0;
-        for (int row = 0; row < B; row += MB, ++mb_idx)
-        {
+        for (int row = 0; row < B; row += MB, ++mb_idx) {
             const int bs = std::min(MB, B - row);
-            const int i = mb_idx;
+            const int i  = mb_idx;
 
-            // cross-layer dep: Attention(l,i) waits MoE(l-1,i)
-            if (l > 0)
+            // Cross-layer dep: Attention(l,i) waits MoE(l-1,i)
+            if (l > 0) {
                 HIP_CHECK(hipStreamWaitEvent(attn_stream, evt_moe_done_prev[i], 0));
-            if (i == 0)
-                HIP_CHECK(hipStreamWaitEvent(attn_stream, evt_kv_ready, 0));
+            }
+            // First microbatch must also wait on KV prefetch readiness (both lanes)
+            if (i == 0) {
+                HIP_CHECK(hipStreamWaitEvent(attn_stream, evt_kv_ready_K, 0));
+                HIP_CHECK(hipStreamWaitEvent(attn_stream, evt_kv_ready_V, 0));
+            }
 
-            // Attn(l,i)
+            // Attention(l, i) on attn_stream
             attention_gpu(gpu_t, l, bs, /*row_offset=*/row, attn_stream);
             HIP_CHECK(hipEventRecord(evt_attn_done[i], attn_stream));
 
-            // MoE(l,i-1) on the separate stream
-            if (i > 0)
-            {
+            // MoE(l, i-1) on moe_stream (overlaps)
+            if (i > 0) {
                 const int prev_row = row - MB;
-                const int prev_bs = std::min(MB, B - prev_row);
+                const int prev_bs  = std::min(MB, B - prev_row);
                 HIP_CHECK(hipStreamWaitEvent(moe_stream, evt_attn_done[i - 1], 0));
                 moe_gpu(gpu_t, l, prev_bs, /*row_offset=*/prev_row, moe_stream);
                 HIP_CHECK(hipEventRecord(evt_moe_done_cur[i - 1], moe_stream));
             }
         }
 
-        // drain last microbatch for this layer
+        // Drain last microbatch MoE for this layer
         {
-            const int i_last = NUM_MB - 1;
-            const int row_last = i_last * MB;
+            const int i_last  = NUM_MB - 1;
+            const int row_last= i_last * MB;
             const int bs_last = std::min(MB, B - row_last);
-            if (bs_last > 0)
-            {
+            if (bs_last > 0) {
                 HIP_CHECK(hipStreamWaitEvent(moe_stream, evt_attn_done[i_last], 0));
                 moe_gpu(gpu_t, l, bs_last, /*row_offset=*/row_last, moe_stream);
                 HIP_CHECK(hipEventRecord(evt_moe_done_cur[i_last], moe_stream));
             }
         }
-        // Offload updated layer-l KV to host while MoE runs
+
+        // Offload updated KV for layer l to host while MoE runs (dual lanes)
         {
             const int i_last = NUM_MB - 1;
-            HIP_CHECK(hipStreamWaitEvent(io_stream, evt_attn_done[i_last], 0));
-            kv_offload_layer_full_rows(gpu_t, l, io_stream);
-            HIP_CHECK(hipEventRecord(evt_kv_offloaded, io_stream));
+            // Ensure attention wrote KV before we offload
+            HIP_CHECK(hipStreamWaitEvent(s->io_k, evt_attn_done[i_last], 0));
+            HIP_CHECK(hipStreamWaitEvent(s->io_v, evt_attn_done[i_last], 0));
+            kv_offload_layer_full_rows_dual(gpu_t, l, evt_kv_off_K, evt_kv_off_V);
         }
-        // Prefetch next layer if any (may slide window)
-        if (l + 1 < p->n_layers)
-        {
-            if (l + 1 < s->kv_win_start || l + 1 >= s->kv_win_start + s->kv_win_len_cur)
-            {
+
+        // Prefetch next layer l+1 (may slide window)
+        if (l + 1 < p->n_layers) {
+            if (l + 1 < s->kv_win_start || l + 1 >= s->kv_win_start + s->kv_win_len_cur) {
                 kv_set_window_start(gpu_t, l + 1);
             }
-            kv_prefetch_layer_full_rows(gpu_t, l + 1, io_stream);
-            HIP_CHECK(hipEventRecord(evt_kv_ready, io_stream));
+            kv_prefetch_layer_full_rows_dual(gpu_t, l + 1, evt_kv_ready_K, evt_kv_ready_V);
             last_prefetched_layer = l + 1;
         }
-        // make next layer depend on current layer's MoE-done (per microbatch)
+
+        // Next layer’s attention will wait on evt_moe_done_prev (per MB)
         std::swap(evt_moe_done_prev, evt_moe_done_cur);
-        for (int i = 0; i < NUM_MB; ++i)
-        {
+        for (int i = 0; i < NUM_MB; ++i) {
             HIP_CHECK(hipEventDestroy(evt_moe_done_cur[i]));
-            evt_moe_done_cur[i] = make_evt();
+            evt_moe_done_cur[i] = make_evt(); // reset for next iteration
         }
     }
 
-    // sync compute streams before head
+    // Sync compute streams before head
     HIP_CHECK(hipStreamSynchronize(attn_stream));
     HIP_CHECK(hipStreamSynchronize(moe_stream));
-    HIP_CHECK(hipStreamSynchronize(io_stream));
+    // Ensure any pending offloads completed
+    HIP_CHECK(hipEventSynchronize(evt_kv_off_K));
+    HIP_CHECK(hipEventSynchronize(evt_kv_off_V));
 
-    // final norm + head on default stream
+    // Final norm + head on default stream
     {
         dim3 grid(B), block(THREADS_PER_BLOCK);
         rmsnorm_kernel<<<grid, block>>>(s->x, s->x, w->rms_out_w, B, H);
@@ -2242,18 +2298,18 @@ int *forward_batch_gpu(GPUTransformer *gpu_t, int *tokens, int batch_size)
     // D2H tokens
     d2h_copy(cpu_buf->current_tokens, s->current_tokens, (size_t)B * sizeof(int), 0);
 
-    // cleanup
-    for (int i = 0; i < NUM_MB; ++i)
-    {
+    // Cleanup
+    for (int i = 0; i < NUM_MB; ++i) {
         HIP_CHECK(hipEventDestroy(evt_attn_done[i]));
         HIP_CHECK(hipEventDestroy(evt_moe_done_prev[i]));
         HIP_CHECK(hipEventDestroy(evt_moe_done_cur[i]));
     }
-    HIP_CHECK(hipEventDestroy(evt_kv_ready));
-    HIP_CHECK(hipEventDestroy(evt_kv_offloaded));
+    HIP_CHECK(hipEventDestroy(evt_kv_ready_K));
+    HIP_CHECK(hipEventDestroy(evt_kv_ready_V));
+    HIP_CHECK(hipEventDestroy(evt_kv_off_K));
+    HIP_CHECK(hipEventDestroy(evt_kv_off_V));
     HIP_CHECK(hipStreamDestroy(attn_stream));
     HIP_CHECK(hipStreamDestroy(moe_stream));
-    HIP_CHECK(hipStreamDestroy(io_stream));
 
     return cpu_buf->current_tokens;
 }
