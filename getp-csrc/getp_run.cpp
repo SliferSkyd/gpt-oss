@@ -928,6 +928,18 @@ static void convert_all_scales_to_f32(GPUTransformerWeights* w, Config* p, hipSt
     HIP_CHECK(hipStreamSynchronize(stream));
     printf("[MXFP4] Converted %zu MLP1 + %zu MLP2 scale blocks to f32\n",
            total_blocks_mlp1, total_blocks_mlp2);
+
+    // Free the e8m0 scales after conversion to f32 - they're no longer needed
+    if (w->w_mlp1_scales) {
+        HIP_CHECK(hipFree(w->w_mlp1_scales));
+        w->w_mlp1_scales = nullptr;
+        printf("[Memory] Freed w_mlp1_scales (e8m0)\n");
+    }
+    if (w->w_mlp2_scales) {
+        HIP_CHECK(hipFree(w->w_mlp2_scales));
+        w->w_mlp2_scales = nullptr;
+        printf("[Memory] Freed w_mlp2_scales (e8m0)\n");
+    }
 }
 
 
@@ -1272,10 +1284,10 @@ void build_gpu_transformer(GPUTransformer *gpu_t, Transformer *cpu_t)
     gpu_t->config = cpu_t->config;
 
     malloc_gpu_weights(&gpu_t->weights, &gpu_t->config);
+    copy_weights_to_gpu(cpu_t, &gpu_t->weights);
     malloc_gpu_run_state(&gpu_t->state, &gpu_t->config);
     malloc_cpu_buffers(&gpu_t->cpu_buffers, &gpu_t->config);
 
-    copy_weights_to_gpu(cpu_t, &gpu_t->weights);
 }
 
 void warm_up(Transformer *transformer, Tokenizer *tokenizer)
