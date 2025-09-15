@@ -9,13 +9,7 @@
 #define SW_WINDOW 128
 #endif
 
-#ifndef BF16_KEY_TOKENS
-#define BF16_KEY_TOKENS 128
-#endif
 
-#ifndef BF16_VALUE_TOKENS
-#define BF16_VALUE_TOKENS 128
-#endif
 
 // ===== warp/block reductions (HIP-safe) =====
 __device__ inline float warpReduceMax(float v) {

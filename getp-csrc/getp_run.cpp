@@ -2108,7 +2108,7 @@ static inline void clear_kv_cache_for_slot(GPURunState *s, const Config *p, int 
         return;
 
     const int kv_dim = p->head_dim * p->n_kv_heads;
-    const size_t elem_bytes = sizeof(float);
+    const size_t elem_bytes = sizeof(uint8_t);  // FP8 cache uses 1 byte per element
 
     const int even_cap = (p->sliding_window > 0 ? SW_WINDOW : MAX_SEQ_LEN);
 

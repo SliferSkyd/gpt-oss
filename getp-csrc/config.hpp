@@ -1,6 +1,6 @@
 #pragma once
 
-#define BATCH_SIZE 16LL
+#define BATCH_SIZE 768LL
 #define THREADS_PER_BLOCK 256
 #define WARP_SIZE 64
 
@@ -9,3 +9,12 @@
 #define MAX_GPUS 8
 
 #define TENSOR_PARALLEL_SIZE 2   // change as you like
+
+
+#ifndef BF16_KEY_TOKENS
+#define BF16_KEY_TOKENS 64
+#endif
+
+#ifndef BF16_VALUE_TOKENS
+#define BF16_VALUE_TOKENS 64
+#endif
