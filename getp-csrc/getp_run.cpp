@@ -72,7 +72,7 @@ typedef struct
     uint8_t *w_mlp1_scales, *w_mlp2_scales; // n/32 bytes (e8m0 per block)
     __hip_bfloat16 *b_mlp1, *b_mlp2;
     // GPUTransformerWeights (add two pointers)
-    float *w_mlp1_scales_f32, *w_mlp2_scales_f32; // one float per 32 elems
+    __hip_bfloat16 *w_mlp1_scales_bf16, *w_mlp2_scales_bf16; // one bf16 per 32 elems
 
     // Output weights
     __hip_bfloat16 *out; // (vocab_size, hidden_dim)
@@ -486,8 +486,8 @@ void malloc_gpu_weights(GPUTransformerWeights *w, Config *p)
     const size_t mlp1_loc_blocks = (mlp1_loc_elems + 31) / 32;
     const size_t mlp2_loc_blocks = (mlp2_loc_elems + 31) / 32;
 
-    HIP_CHECK(hipMalloc((void **)&w->w_mlp1_scales_f32, mlp1_loc_blocks * sizeof(float)));
-    HIP_CHECK(hipMalloc((void **)&w->w_mlp2_scales_f32, mlp2_loc_blocks * sizeof(float)));
+    HIP_CHECK(hipMalloc((void **)&w->w_mlp1_scales_bf16, mlp1_loc_blocks * sizeof(__hip_bfloat16)));
+    HIP_CHECK(hipMalloc((void **)&w->w_mlp2_scales_bf16, mlp2_loc_blocks * sizeof(__hip_bfloat16)));
 
     // Biases unchanged (BF16)
     const size_t b1_local = (size_t)p->n_layers * (size_t)E * (size_t)Oloc; // [L, E, Oloc]
@@ -523,6 +523,24 @@ static inline void launch_e8m0_to_f32(const uint8_t* e8, float* f, size_t n,
     const int T = 256;
     dim3 grid((int)((n + T - 1) / T));
     e8m0_to_f32_kernel<<<grid, T, 0, s>>>(e8, f, n);
+    HIP_CHECK(hipGetLastError());
+}
+
+__global__ void e8m0_to_bf16_kernel(const uint8_t* __restrict__ e8,
+                                    __hip_bfloat16* __restrict__ bf16, size_t nblocks) {
+    size_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < nblocks) {
+        // X = 2^(e8-127) via bit-cast exponent (fast!)
+        float f = __uint_as_float(uint32_t(e8[i]) << 23);
+        bf16[i] = __float2bfloat16(f);
+    }
+}
+static inline void launch_e8m0_to_bf16(const uint8_t* e8, __hip_bfloat16* bf16, size_t n,
+                                       hipStream_t s=0) {
+    if (!n) return;
+    const int T = 256;
+    dim3 grid((int)((n + T - 1) / T));
+    e8m0_to_bf16_kernel<<<grid, T, 0, s>>>(e8, bf16, n);
     HIP_CHECK(hipGetLastError());
 }
 
@@ -907,8 +925,8 @@ static void convert_all_scales_to_f32(GPUTransformerWeights* w, Config* p, hipSt
     const size_t seg1_blocks_loc = ((size_t)Oloc * (size_t)H + 31) / 32;
     const size_t total_blocks_mlp1 = (size_t)L * (size_t)E * seg1_blocks_loc;
     if (total_blocks_mlp1) {
-        launch_e8m0_to_f32(w->w_mlp1_scales, w->w_mlp1_scales_f32,
-                           total_blocks_mlp1, stream);
+        launch_e8m0_to_bf16(w->w_mlp1_scales, w->w_mlp1_scales_bf16,
+                            total_blocks_mlp1, stream);
     }
 
     // ---- MLP2: row-parallel on input (D) ----
@@ -921,12 +939,12 @@ static void convert_all_scales_to_f32(GPUTransformerWeights* w, Config* p, hipSt
     const size_t seg2_blocks_loc = ((size_t)H * (size_t)Kloc + 31) / 32;
     const size_t total_blocks_mlp2 = (size_t)L * (size_t)E * seg2_blocks_loc;
     if (total_blocks_mlp2) {
-        launch_e8m0_to_f32(w->w_mlp2_scales, w->w_mlp2_scales_f32,
-                           total_blocks_mlp2, stream);
+        launch_e8m0_to_bf16(w->w_mlp2_scales, w->w_mlp2_scales_bf16,
+                            total_blocks_mlp2, stream);
     }
 
     HIP_CHECK(hipStreamSynchronize(stream));
-    printf("[MXFP4] Converted %zu MLP1 + %zu MLP2 scale blocks to f32\n",
+    printf("[MXFP4] Converted %zu MLP1 + %zu MLP2 scale blocks to bf16\n",
            total_blocks_mlp1, total_blocks_mlp2);
 
     // Free the e8m0 scales after conversion to f32 - they're no longer needed
@@ -1814,7 +1832,7 @@ int o_len = 0;
     const size_t layer_sc_off   = (size_t)layer_idx * (size_t)E * seg1_blocks_loc;
 
     const uint8_t        *W1_packed_layer = w->w_mlp1_mxfp4 + layer_pack_off;
-    const float        *S1_layer        = w->w_mlp1_scales_f32 + layer_sc_off;
+    const __hip_bfloat16 *S1_layer        = w->w_mlp1_scales_bf16 + layer_sc_off;
 
     dim3 grid((o_len + BLOCK_N_MLP - 1) / BLOCK_N_MLP, cur_tiles);
     dim3 block(LANE_PER_WAVE, WAVES_PER_BLOCK_MLP);
@@ -1880,7 +1898,7 @@ const int Dloc = o_len / 2;
     const size_t layer_sc_off   = (size_t)layer_idx * (size_t)E * seg2_blocks_loc;
 
     const uint8_t        *W2_packed_layer = w->w_mlp2_mxfp4 + layer_pack_off; // local shard
-    const float        *S2_layer        = w->w_mlp2_scales_f32 + layer_sc_off;  // local shard
+    const __hip_bfloat16 *S2_layer        = w->w_mlp2_scales_bf16 + layer_sc_off;  // local shard
     const __hip_bfloat16 *b2s             = w->b_mlp2 + (size_t)layer_idx * (size_t)E * (size_t)H;
 
     dim3 grid((H + BLOCK_N_MLP - 1) / BLOCK_N_MLP, cur_tiles);

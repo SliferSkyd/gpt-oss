@@ -1,6 +1,6 @@
 #pragma once
 
-#define BATCH_SIZE 896LL
+#define BATCH_SIZE 1024LL
 #define THREADS_PER_BLOCK 256
 #define WARP_SIZE 64
 
