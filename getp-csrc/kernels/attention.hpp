@@ -1,9 +1,25 @@
 #include <hip/hip_runtime.h>
 #include <hip/hip_bf16.h>
+#include <cmath>
+#include <cfloat>
 
-// --- MODIFIED FUSED ATTENTION KERNEL (KV cache in __hip_bfloat16) ---
+// === Tunables ===
 #ifndef SW_WINDOW
 #define SW_WINDOW 128
+#endif
+
+// Softmax shift (phi). Start conservatively; you can tighten later.
+#ifndef SOFTMAX_PHI
+#define SOFTMAX_PHI 8.0f
+#endif
+
+// If any score - phi exceeds this, we fallback to exact max (avoid exp overflow / bad scaling)
+#ifndef SOFTMAX_PHI_OVERFLOW_GUARD
+#define SOFTMAX_PHI_OVERFLOW_GUARD 80.0f
+#endif
+
+#ifndef SOFTMAX_EPS
+#define SOFTMAX_EPS 1e-9f
 #endif
 
 // ===== warp/block reductions (HIP-safe) =====
@@ -17,170 +33,317 @@ __device__ inline float warpReduceSum(float v) {
         v += __shfl_down(v, off);
     return v;
 }
-__device__ inline float blockReduceMax(float v, float *smem) {
+__device__ inline float blockReduceMax(float v, float *shared_mem) {
     int lane = threadIdx.x & (warpSize - 1);
     int wid  = threadIdx.x >> (__ffs(warpSize) - 1); // warp id
     v = warpReduceMax(v);
-    if (lane == 0) smem[wid] = v;
+    if (lane == 0) shared_mem[wid] = v;
     __syncthreads();
     float out = -INFINITY;
-    if (threadIdx.x < (blockDim.x + warpSize - 1) / warpSize) out = smem[lane];
+    if (threadIdx.x < (blockDim.x + warpSize - 1) / warpSize) out = shared_mem[lane];
     __syncthreads();
     out = warpReduceMax(out);
-    if (lane == 0 && wid == 0) smem[0] = out;
+    if (lane == 0 && wid == 0) shared_mem[0] = out;
     __syncthreads();
-    return smem[0];
+    return shared_mem[0];
 }
-__device__ inline float blockReduceSum(float v, float *smem) {
+__device__ inline float blockReduceSum(float v, float *shared_mem) {
     int lane = threadIdx.x & (warpSize - 1);
     int wid  = threadIdx.x >> (__ffs(warpSize) - 1);
     v = warpReduceSum(v);
-    if (lane == 0) smem[wid] = v;
+    if (lane == 0) shared_mem[wid] = v;
     __syncthreads();
     float out = 0.f;
-    if (threadIdx.x < (blockDim.x + warpSize - 1) / warpSize) out = smem[lane];
+    if (threadIdx.x < (blockDim.x + warpSize - 1) / warpSize) out = shared_mem[lane];
     __syncthreads();
     out = warpReduceSum(out);
-    if (lane == 0 && wid == 0) smem[0] = out;
+    if (lane == 0 && wid == 0) shared_mem[0] = out;
     __syncthreads();
-    return smem[0];
+    return shared_mem[0];
 }
 
-__global__ void fused_attention_kernel(
-    float * __restrict__ output,                    // [batch, n_heads, head_dim]
-    const float * __restrict__ q,                   // [batch, n_heads * head_dim]
-    const __hip_bfloat16 * __restrict__ key_cache,  // [batch, n_layers, seq_len, kv_dim] (bf16)
-    const __hip_bfloat16 * __restrict__ value_cache,// [batch, n_layers, seq_len, kv_dim] (bf16)
-    const __hip_bfloat16 * __restrict__ sinks,      // [n_heads] (already layer-offset on host)
-    const float * __restrict__ mask,                // [seq_len, seq_len]
-    const int * __restrict__ positions,             // [batch]
+// ================================================================
+// Fused Attention (decode) — Tiled K/V + Streaming Softmax (bf16 KV)
+// - Packs kv_mul heads per block for GQA reuse
+// - Vectorized 16B loads (8×bf16) → unpack → float tiles in LDS
+// - Sliding-window on even layers (mod SW_WINDOW)
+// - Keeps SOFTMAX_PHI as a define (not used in streaming path)
+// - Interface matches your current callsite arguments
+// ================================================================
+
+#include <hip/hip_runtime.h>
+#include <hip/hip_bfloat16.h>
+#include <float.h>
+#include <stdint.h>
+
+#ifndef SW_WINDOW
+#define SW_WINDOW 128
+#endif
+#ifndef SOFTMAX_PHI
+#define SOFTMAX_PHI 0.0f
+#endif
+#ifndef SOFTMAX_EPS
+#define SOFTMAX_EPS 1e-6f
+#endif
+
+// Enable the fast online/streaming softmax
+#ifndef SOFTMAX_USE_ONLINE
+#define SOFTMAX_USE_ONLINE 1
+#endif
+
+// ----------------- Warp helpers -----------------
+__device__ inline float warp_reduce_sum(float v) {
+  for (int off = warpSize >> 1; off > 0; off >>= 1) v += __shfl_down(v, off);
+  return v;
+}
+
+// ----------------- 16B bf16 loader + unpack -----------------
+struct u128 { uint4 v; }; // 16 bytes
+
+__device__ inline u128 gload_bf16x8(const __hip_bfloat16 *ptr) {
+  u128 out;
+  out.v = *reinterpret_cast<const uint4*>(ptr); // expect 16B alignment
+  return out;
+}
+
+__device__ inline void unpack_bf16x8_to_f32(
+    const u128 &src,
+    float &f0,float &f1,float &f2,float &f3,
+    float &f4,float &f5,float &f6,float &f7)
+{
+  const uint32_t *p32 = reinterpret_cast<const uint32_t*>(&src.v);
+  uint32_t w0 = p32[0], w1 = p32[1], w2 = p32[2], w3 = p32[3];
+  uint16_t b0 =  w0        & 0xFFFFu;
+  uint16_t b1 = (w0 >> 16) & 0xFFFFu;
+  uint16_t b2 =  w1        & 0xFFFFu;
+  uint16_t b3 = (w1 >> 16) & 0xFFFFu;
+  uint16_t b4 =  w2        & 0xFFFFu;
+  uint16_t b5 = (w2 >> 16) & 0xFFFFu;
+  uint16_t b6 =  w3        & 0xFFFFu;
+  uint16_t b7 = (w3 >> 16) & 0xFFFFu;
+
+  f0 = __bfloat162float(*reinterpret_cast<const __hip_bfloat16*>(&b0));
+  f1 = __bfloat162float(*reinterpret_cast<const __hip_bfloat16*>(&b1));
+  f2 = __bfloat162float(*reinterpret_cast<const __hip_bfloat16*>(&b2));
+  f3 = __bfloat162float(*reinterpret_cast<const __hip_bfloat16*>(&b3));
+  f4 = __bfloat162float(*reinterpret_cast<const __hip_bfloat16*>(&b4));
+  f5 = __bfloat162float(*reinterpret_cast<const __hip_bfloat16*>(&b5));
+  f6 = __bfloat162float(*reinterpret_cast<const __hip_bfloat16*>(&b6));
+  f7 = __bfloat162float(*reinterpret_cast<const __hip_bfloat16*>(&b7));
+}
+
+// ================================================================
+// Kernel: packs kv_mul heads per block for K/V tile reuse
+// Grid: (x=n_kv_heads, y=batch_size)
+// Block: (x=64 lanes, y=kv_mul warps), total = 64*kv_mul threads
+// Shared: 2 * tile_t * head_dim * sizeof(float)
+// ================================================================
+__global__ __launch_bounds__(512)
+void fused_attention_kernel( // <-- keep your original symbol name
+    float * __restrict__ output,                    // [B, H, D]
+    const float * __restrict__ q,                   // [B, H, D]
+    const __hip_bfloat16 * __restrict__ key_cache,  // [B, L, T, KV] (bf16)
+    const __hip_bfloat16 * __restrict__ value_cache,// [B, L, T, KV] (bf16)
+    const __hip_bfloat16 * __restrict__ sinks,      // [H] (bf16, layer-offset)
+    const float * __restrict__ mask,                // unused
+    const int * __restrict__ seq_lengths,           // [B]
     int batch_size, int n_heads, int n_kv_heads, int head_dim,
     int seq_len, int n_layers, int layer_idx,
-    bool use_sliding_window, size_t batch_kv_stride, size_t layer_kv_offset)
-{
-    extern __shared__ float s_sh[];  // layout later
+    bool use_sliding_window,
+    size_t batch_kv_stride, size_t layer_kv_offset,
+    int tile_t                                       // cooperative tile length
+) {
+  const int kv_h  = blockIdx.x;
+  const int b     = blockIdx.y;
+  const int warp  = threadIdx.y;           // 0..kv_mul-1
+  const int lane  = threadIdx.x;           // 0..63
+  const int kv_mul = blockDim.y;
+  const int h     = kv_h * kv_mul + warp;
 
-    const int b   = blockIdx.x;
-    const int h   = blockIdx.y;
-    const int tid = threadIdx.x;
+  if (b >= batch_size || kv_h >= n_kv_heads || warp >= kv_mul || h >= n_heads)
+    return;
 
-    if (b >= batch_size || h >= n_heads) return;
+  // decode step for this batch
+  const int pos = seq_lengths[b];
 
-    // Wave bookkeeping
-    const int WARP  = warpSize;                            // 64 on AMD, 32 on NV
-    const int WARPS = (blockDim.x + WARP - 1) / WARP;
-    const int lane  = tid & (WARP - 1);
-    const int wid   = tid >> (__ffs(WARP) - 1);
+  // sliding window on even layers
+  int t_start = 0;
+  if (use_sliding_window && ((layer_idx & 1) == 0)) {
+    t_start = max(0, pos - (SW_WINDOW - 1));
+  }
+  const int n_steps = pos - t_start + 1; // core tokens (sink handled after)
 
-    // Pointers / shapes
-    const int pos        = positions[b];
-    const int gqa_ratio  = n_heads / n_kv_heads;
-    const int kv_h       = h / gqa_ratio;
-    const int kv_dim     = head_dim * n_kv_heads;
+  const int kv_dim    = head_dim * n_kv_heads;
+  const int gqa_ratio = n_heads / n_kv_heads;
+  // sanity: ensure mapping is consistent
+  if ((h / gqa_ratio) != kv_h) return;
 
-    const float *q_head = q + 1LL * b * n_heads * head_dim + 1LL * h * head_dim;
-    const __hip_bfloat16 *k_base = key_cache   + (size_t)b * batch_kv_stride + layer_kv_offset;
-    const __hip_bfloat16 *v_base = value_cache + (size_t)b * batch_kv_stride + layer_kv_offset;
-    float *out_head =
-        output + 1LL * b * n_heads * head_dim + 1LL * h * head_dim;
+  // base pointers (b, layer)
+  const __hip_bfloat16 * __restrict__ k_base_layer =
+      key_cache   + (size_t)b * batch_kv_stride + layer_kv_offset;
+  const __hip_bfloat16 * __restrict__ v_base_layer =
+      value_cache + (size_t)b * batch_kv_stride + layer_kv_offset;
 
-    // Windowing + capacities
-    const bool apply_window = use_sliding_window && ((layer_idx & 1) == 0);
-    const int  win_start    = apply_window ? max(0, pos - (SW_WINDOW - 1)) : 0;
-    const int  win_core_len = pos - win_start + 1;                  // tokens before sink
-    const int  att_cap      = apply_window ? (SW_WINDOW + 1) : seq_len; // <= host reserve
-    float *s_att      = s_sh;                                       // [att_cap]
-    float *s_partials = s_att + att_cap;                            // [WARPS * head_dim]
-    float *s_reduce   = s_partials + WARPS * head_dim;              // [WARPS]
+  // per-kv head base (avoid recomputing kv_h * head_dim)
+  const __hip_bfloat16 * __restrict__ k_head_base = k_base_layer + (size_t)kv_h * head_dim;
+  const __hip_bfloat16 * __restrict__ v_head_base = v_base_layer + (size_t)kv_h * head_dim;
+
+  // query lane value
+  const float * __restrict__ q_head =
+      q + (size_t)b * n_heads * head_dim + (size_t)h * head_dim;
+  const float qi = (lane < head_dim) ? q_head[lane] : 0.0f;
+
+  // shared tiles (float)
+  extern __shared__ float shared_mem[];
+  float *sK = shared_mem;
+  float *sV = shared_mem + (size_t)tile_t * head_dim;
+  const int width = head_dim;
+
+#if SOFTMAX_USE_ONLINE
+  float out_i = 0.0f;         // running output dim for this lane
+  float m = -INFINITY;    // running max for logits
+  float l = 0.0f;             // running denominator
+#endif
+
+  // 2D cooperative loader indexing
+  const int threads_total = blockDim.x * blockDim.y;          // 64 * kv_mul
+  const int tid2D         = threadIdx.y * blockDim.x + lane;  // 0..threads_total-1
+
+  // Tile over time
+  for (int base = 0; base < n_steps; base += tile_t) {
+    const int cur = min(tile_t, n_steps - base);
+
+    // Vectorized part: 8×bf16 per 16B transaction
+    const int vec8 = head_dim / 8;
+    const int elems_vec8 = cur * vec8;
+
+    for (int e8 = tid2D; e8 < elems_vec8; e8 += threads_total) {
+      const int tloc = e8 / vec8;              // 0..cur-1
+      const int i8   = (e8 - tloc * vec8) * 8; // starting dim (multiple of 8)
+
+      const int t_abs = t_start + base + tloc;
+      const int tw    = ((layer_idx & 1) == 0) ? (t_abs % SW_WINDOW) : t_abs;
+
+      const __hip_bfloat16 *k_ptr = k_head_base + (size_t)tw * kv_dim + i8;
+      const __hip_bfloat16 *v_ptr = v_head_base + (size_t)tw * kv_dim + i8;
+
+      // 1×16B global loads
+      u128 k128 = gload_bf16x8(k_ptr);
+      u128 v128 = gload_bf16x8(v_ptr);
+
+      float kf0,kf1,kf2,kf3,kf4,kf5,kf6,kf7;
+      float vf0,vf1,vf2,vf3,vf4,vf5,vf6,vf7;
+      unpack_bf16x8_to_f32(k128, kf0,kf1,kf2,kf3,kf4,kf5,kf6,kf7);
+      unpack_bf16x8_to_f32(v128, vf0,vf1,vf2,vf3,vf4,vf5,vf6,vf7);
+
+      float * __restrict__ k_row = sK + (size_t)tloc * width;
+      float * __restrict__ v_row = sV + (size_t)tloc * width;
+
+      // contiguous shared writes
+      k_row[i8+0]=kf0; k_row[i8+1]=kf1; k_row[i8+2]=kf2; k_row[i8+3]=kf3;
+      k_row[i8+4]=kf4; k_row[i8+5]=kf5; k_row[i8+6]=kf6; k_row[i8+7]=kf7;
+
+      v_row[i8+0]=vf0; v_row[i8+1]=vf1; v_row[i8+2]=vf2; v_row[i8+3]=vf3;
+      v_row[i8+4]=vf4; v_row[i8+5]=vf5; v_row[i8+6]=vf6; v_row[i8+7]=vf7;
+    }
+
+    // Tail if head_dim % 8 != 0
+    const int tail = head_dim - vec8 * 8;
+    if (tail) {
+      const int elems_tail = cur * tail;
+      for (int et = tid2D; et < elems_tail; et += threads_total) {
+        const int tloc = et / tail;
+        const int io   = (et - tloc * tail) + vec8 * 8;
+
+        const int t_abs = t_start + base + tloc;
+        const int tw    = ((layer_idx & 1) == 0) ? (t_abs % SW_WINDOW) : t_abs;
+
+        const __hip_bfloat16 *k_ptr = k_head_base + (size_t)tw * kv_dim + io;
+        const __hip_bfloat16 *v_ptr = v_head_base + (size_t)tw * kv_dim + io;
+
+        float kf = __bfloat162float(*k_ptr);
+        float vf = __bfloat162float(*v_ptr);
+        sK[(size_t)tloc * width + io] = kf;
+        sV[(size_t)tloc * width + io] = vf;
+      }
+    }
+
+    __syncthreads();
+
+    // ---- Consume the tile with streaming softmax ----
+#if SOFTMAX_USE_ONLINE
     const float inv_sqrt_d = rsqrtf((float)head_dim);
+    for (int t = 0; t < cur; ++t) {
+      float part = (lane < head_dim) ? (qi * sK[(size_t)t * width + lane]) : 0.0f;
+      part = warp_reduce_sum(part);          // dot(q, k_t)
 
-    // Fast path: one lane per head-dim element
-    const float q_lane = (lane < head_dim) ? q_head[lane] : 0.0f;
+      float e = 0.f, alpha = 0.f;
+      if (lane == 0) {
+        float s     = part * inv_sqrt_d;
+        float m_new = fmaxf(m, s);
+        alpha       = __expf(m - m_new);
+        e           = __expf(s - m_new);
+        l           = l * alpha + e;
+        m           = m_new;
+      }
+      e     = __shfl(e, 0);
+      alpha = __shfl(alpha, 0);
 
-    // ---- Pass 1: compute attention scores into s_att[0..win_core_len-1]
-    for (int w = wid; w < win_core_len; w += WARPS) {
-        const int t = win_start + w;
-        const __hip_bfloat16 *k_vec = k_base + 1LL * ((layer_idx & 1) ? t : t % SW_WINDOW) * kv_dim
-                                      + 1LL * kv_h * head_dim;
-
-        float prod = 0.f;
-        if (lane < head_dim) {
-            const float kf = __bfloat162float(k_vec[lane]);
-            prod = q_lane * kf;
-        }
-        float dot = warpReduceSum(prod);  // 64-lane sum
-        if (lane == 0) {
-            float acc = (double)dot * inv_sqrt_d;
-            if (apply_window) {
-                acc += mask[1LL * pos * seq_len + t];
-            }
-            s_att[w] = acc;
-        }
+      if (lane < head_dim) {
+        float v = sV[(size_t)t * width + lane];
+        out_i = fmaf(e, v, alpha * out_i);   // out = alpha*out + e*v
+      }
     }
+#else
+    // (Optional) two-pass fixed-phi path, not shown to keep code compact
+    // You can keep your old two-pass if needed.
+#endif
+
     __syncthreads();
+  }
 
-    // Append sink (if any) after the core window
-    int softmax_len = win_core_len;
-    if (pos + 1 < seq_len) {
-        if (tid == 0) s_att[softmax_len] = __bfloat162float(sinks[h]);
-        softmax_len += 1;
-    }
-    __syncthreads();
+  // ---- Sink update & write out ----
+#if SOFTMAX_USE_ONLINE
+  float alpha_sink = 0.f, l_final = 0.f;
+  if (lane == 0) {
+    float s_sink = __bfloat162float(sinks[h]);
+    float m_new  = fmaxf(m, s_sink);
+    float alpha  = __expf(m - m_new);
+    float e      = __expf(s_sink - m_new);
+    l            = l * alpha + e;
+    m            = m_new;
+    alpha_sink   = alpha;
+    l_final      = l;
+  }
+  alpha_sink = __shfl(alpha_sink, 0);
+  l_final    = __shfl(l_final, 0);
 
-    // ---- Softmax over s_att[0..softmax_len-1]
-    float tmax = -INFINITY;
-    for (int i = tid; i < softmax_len; i += blockDim.x) tmax = fmaxf(tmax, s_att[i]);
-    const float max_val = blockReduceMax(tmax, s_reduce);
-
-    float tsum = 0.f;
-    for (int i = tid; i < softmax_len; i += blockDim.x) {
-        float v = expf(s_att[i] - max_val);
-        s_att[i] = v;
-        tsum += v;
-    }
-    const float sum_val = blockReduceSum(tsum, s_reduce);
-    const float inv_sum = 1.f / (sum_val + 1e-9f);
-
-    for (int i = tid; i < softmax_len; i += blockDim.x) s_att[i] *= inv_sum;
-    __syncthreads();
-
-    // ---- Pass 2: V-weighted sum over the core window (exclude optional sink)
-    if (lane < head_dim) {
-        float partial = 0.f;
-        for (int w = wid; w < win_core_len; w += WARPS) {
-            const int t = win_start + w;
-            const __hip_bfloat16 *v_vec = v_base + 1LL * ((layer_idx & 1) ? t : t % SW_WINDOW) * kv_dim
-                                          + 1LL * kv_h * head_dim;
-            const float vf = __bfloat162float(v_vec[lane]);
-            partial += (double)s_att[w] * vf;
-        }
-        s_partials[wid * head_dim + lane] = partial;
-    }
-    __syncthreads();
-
-    // Cross-warp reduce the partial output vectors (one lane per dim)
-    if (wid == 0 && lane < head_dim) {
-        float acc = 0.f;
-        #pragma unroll
-        for (int w = 0; w < WARPS; ++w) acc += s_partials[w * head_dim + lane];
-        out_head[lane] = acc;
-    }
+  if (lane < head_dim) {
+    float out_norm = (alpha_sink * out_i) / (l_final + SOFTMAX_EPS);
+    float * __restrict__ out_head =
+        output + (size_t)b * n_heads * head_dim + (size_t)h * head_dim;
+    out_head[lane] = out_norm;
+  }
+#else
+  // If using fixed-phi path, normalize accordingly (omitted)
+#endif
 }
+
 
 // === KV cache update kernel (write __hip_bfloat16) ===
 __global__ void update_kv_cache_kernel(__hip_bfloat16 *key_cache, __hip_bfloat16 *value_cache,
                                        const float *k, const float *v,
-                                       const int *positions, int batch_size,
+                                       const int *seq_lengths, int batch_size,
                                        int n_layers, int layer_idx, int seq_len,
                                        int kv_dim, size_t batch_kv_stride, size_t layer_kv_offset)
 {
     size_t batch_idx = blockIdx.x;
-    size_t dim_idx = 1LL * blockIdx.y * blockDim.y + threadIdx.y;
+    size_t dim_idx   = 1LL * blockIdx.y * blockDim.y + threadIdx.y;
 
     if (batch_idx >= (size_t)batch_size || dim_idx >= (size_t)kv_dim)
         return;
 
-    int pos = positions[batch_idx];
+    int pos = seq_lengths[batch_idx];
     if (pos >= seq_len)
         return; // Safety check
 

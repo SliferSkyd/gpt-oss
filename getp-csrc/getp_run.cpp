@@ -1045,24 +1045,58 @@ void attention_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size,
     }
     // 6) fused attention
     {
-        TIMER_BLOCK("fused_attention_kernel");
-        const bool apply_window = (p->sliding_window > 0) && ((layer_idx & 1) == 0);
-        constexpr int HOST_WARPSIZE = 64;
-        dim3 grid(batch_size, NA);
-        dim3 block(256);
-        const int warps = (block.x + HOST_WARPSIZE - 1) / HOST_WARPSIZE;
-        const size_t att_cap = apply_window ? (SW_WINDOW + 1) : MAX_SEQ_LEN;
-        const size_t shmem = (att_cap + (size_t)warps * Hd + warps) * sizeof(float);
-        assert_smem_or_die(shmem, "fused_attention_kernel");
+        TIMER_BLOCK("fused_attention_kernel_streaming");
 
-        hipLaunchKernelGGL(fused_attention_kernel, grid, block, shmem, sAttn,
-                           tb_mb, q_mb, key_cache_mb, value_cache_mb,
-                           w->attn_sinks + (size_t)layer_idx * NA,
-                           s->mask, pos_mb, batch_size,
-                           NA, NK, Hd, MAX_SEQ_LEN, p->n_layers, layer_idx,
-                           p->sliding_window > 0,
-                           /* batch_kv_stride = */ layers_capacity * (size_t)KV,
-                           /* layer_kv_offset = */ layer_elem_offset);
+        const int B  = batch_size;
+        const int H  = NA;        // n_attn_heads
+        const int NKv= NK;        // n_kv_heads
+        const int D  = Hd;
+
+        // Heads per KV head (GQA)
+        const int kv_mul = H / NKv;
+
+        // --- Choose tile_t so that 2*T*D*4 <= 64 KiB (MI250 LDS per block) ---
+        const size_t LDS_LIMIT = 64ull * 1024ull;               // 65,536 bytes
+        const size_t per_row   = (size_t)2 * (size_t)D * sizeof(float);
+        int T = 64;                                             // target
+        if (per_row * (size_t)T > LDS_LIMIT) {
+            T = (int)(LDS_LIMIT / per_row);                     // floor
+            if (T < 1) T = 1;
+            // round T down to a friendly small multiple
+            if (T >= 64)      T = 64;
+            else if (T >= 48) T = 48;
+            else if (T >= 32) T = 32;
+            else if (T >= 16) T = 16;
+            else if (T >= 8)  T = 8;
+            else if (T >= 4)  T = 4;
+            else              T = 1;
+        }
+
+        // --- Block shape: 64 lanes × warps_y (<= 16 → 1024 threads max) ---
+        const int warps_y_cap = 16;                   // 64*16 = 1024 threads
+        const int warps_y     = std::min(kv_mul, warps_y_cap);
+        dim3 block(64, warps_y);
+
+        // Grid: (kv heads, batch)
+        dim3 grid(NKv, B);
+
+        // Request dynamic shared mem for two float tiles: K and V
+        const size_t shmem = (size_t)2 * (size_t)T * (size_t)D * sizeof(float);
+        assert_smem_or_die(shmem, "fused_attention_kernel_streaming");
+
+        hipLaunchKernelGGL(
+            fused_attention_kernel, // same symbol
+            grid, block, shmem, sAttn,
+            tb_mb, q_mb, key_cache_mb, value_cache_mb,
+            w->attn_sinks + (size_t)layer_idx * NA,
+            s->mask, pos_mb,
+            batch_size, NA, NKv, Hd,
+            MAX_SEQ_LEN, p->n_layers, layer_idx,
+            p->sliding_window > 0,
+            /* batch_kv_stride = */ layers_capacity * (size_t)KV,
+            /* layer_kv_offset = */ layer_elem_offset,
+            /* tile_t = */ T
+        );
 
         HIP_CHECK(hipGetLastError());
     }
