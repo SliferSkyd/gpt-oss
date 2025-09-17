@@ -22,8 +22,8 @@ KV cache size per batch: 13824 MB
 Weights copied. w_qkv and out are transposed in-place on GPU ([K,N] layout).
 Weights copied. w_qkv and out are transposed in-place on GPU ([K,N] layout).
 
-warm up elapsed time(s): 33.704000
+warm up elapsed time(s): 362.146000
 
-elapsed time(s): 795.293000, achieved throughput TPS (tok/s): 2595.975320
+elapsed time(s): 680.838000, achieved throughput TPS (tok/s): 3032.382153
 
-finish elapsed time(s): 0.018000
+finish elapsed time(s): 0.011000

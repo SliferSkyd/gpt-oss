@@ -1320,7 +1320,7 @@ void moe_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size,
 
         mlp1<16,16,16,  /*WAVES_M,N,K*/ 2,4,2,
             /*TW_M,TW_N*/ 1,1,
-            /*PAD_K*/ 0>(
+            /*PAD_K*/ 8>(
             s->mlp1_out_g, s->expert_input_buffer_g, W1,
             s->d_expert_offsets, s->d_expert_counts,
             s->d_tile2expert_g, s->d_tile2local_g,
@@ -1366,7 +1366,7 @@ void moe_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size,
         
         mlp2<16,16,16,  /*WAVES_M,N,K*/ 2,4,2,
             /*TW_M,TW_N*/ 1,1,
-            /*PAD_K*/ 0>(
+            /*PAD_K*/ 8>(
                 s->expert_output_partial_g, s->gate_up_g, W2, b2s,
                            s->d_expert_offsets, s->d_expert_counts,
                            s->d_tile2expert_g, s->d_tile2local_g,
