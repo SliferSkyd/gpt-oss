@@ -69,7 +69,7 @@ __global__ void softmax_kernel(float *x, int batch_size, int size)
 
 
 
-__global__ void softmax_kernel_variable_len(float *x, const int *positions,
+__global__ void softmax_kernel_variable_len(float *x, const int *seq_lengths,
                                             int batch_size, int n_heads, int max_seq_len)
 {
     // Each block processes one head for one batch item
@@ -80,7 +80,7 @@ __global__ void softmax_kernel_variable_len(float *x, const int *positions,
     if (batch_idx >= batch_size)
         return;
 
-    int pos = positions[batch_idx];
+    int pos = seq_lengths[batch_idx];
     int size = pos + 2; // Real size including the attention sink
 
     float *batch_head_x = x + (batch_idx * n_heads + head_idx) * max_seq_len;

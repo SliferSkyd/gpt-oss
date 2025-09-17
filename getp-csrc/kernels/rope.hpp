@@ -3,7 +3,7 @@
 #include "../config.hpp"
 
 __global__ void apply_rotary_emb_kernel(float *x, const float *cos_vals, const float *sin_vals,
-                                        const int *positions, int batch_size,
+                                        const int *seq_lengths, int batch_size,
                                         int n_heads, int head_dim)
 {
     size_t batch_idx = blockIdx.x;
@@ -17,7 +17,7 @@ __global__ void apply_rotary_emb_kernel(float *x, const float *cos_vals, const f
     if (dim_idx >= half)
         return;
 
-    int pos = positions[batch_idx];
+    int pos = seq_lengths[batch_idx];
     float *x_batch = x + batch_idx * n_heads * head_dim;
     const float *cos_pos = cos_vals + pos * half;
     const float *sin_pos = sin_vals + pos * half;
@@ -43,7 +43,7 @@ __global__ void split_qkv_apply_rotary_kernel_vec(
     float* __restrict__ v,
     const float* __restrict__ cos_vals,   // [*, D/2]
     const float* __restrict__ sin_vals,   // [*, D/2]
-    const int*   __restrict__ positions,  // [B]
+    const int*   __restrict__ seq_lengths,  // [B]
     int B, int Hq, int Hkv, int D)
 {
     // Requirements:
@@ -69,7 +69,7 @@ __global__ void split_qkv_apply_rotary_kernel_vec(
             size_t r   = i - h * total_v;
             size_t b   = r / Dv_half;
             size_t dv  = r - b * Dv_half;          // vector index along half
-            int    pos = positions[b];
+            int    pos = seq_lengths[b];
             size_t d   = dv * V;                    // scalar index into half
 
             const float* __restrict__ src0 = qkv + b*stride + q_off + h*(size_t)D + d;         // first half
@@ -115,7 +115,7 @@ __global__ void split_qkv_apply_rotary_kernel_vec(
             size_t r   = i - h * total_v;
             size_t b   = r / Dv_half;
             size_t dv  = r - b * Dv_half;
-            int    pos = positions[b];
+            int    pos = seq_lengths[b];
             size_t d   = dv * V;
 
             const float* __restrict__ src0 = qkv + b*stride + k_off + h*(size_t)D + d;
@@ -173,7 +173,7 @@ __global__ void split_qkv_apply_rotary_kernel_vec(
 // Dispatcher: prefer float4, then float2, else scalar
 inline void launch_split_qkv_apply_rotary(
     const float* qkv, float* q, float* k, float* v,
-    const float* cos_vals, const float* sin_vals, const int* positions,
+    const float* cos_vals, const float* sin_vals, const int* seq_lengths,
     int B, int Hq, int Hkv, int D,
     hipStream_t stream = 0)
 {
@@ -189,16 +189,16 @@ inline void launch_split_qkv_apply_rotary(
         size_t grid = ((work/4) + block - 1) / block; if (!grid) grid = 1;
         hipLaunchKernelGGL(split_qkv_apply_rotary_kernel_vec<4>,
             dim3((unsigned)grid), dim3(block), 0, stream,
-            qkv, q, k, v, cos_vals, sin_vals, positions, B, Hq, Hkv, D);
+            qkv, q, k, v, cos_vals, sin_vals, seq_lengths, B, Hq, Hkv, D);
     } else if ((D % 2) == 0) {
         size_t grid = ((work/2) + block - 1) / block; if (!grid) grid = 1;
         hipLaunchKernelGGL(split_qkv_apply_rotary_kernel_vec<2>,
             dim3((unsigned)grid), dim3(block), 0, stream,
-            qkv, q, k, v, cos_vals, sin_vals, positions, B, Hq, Hkv, D);
+            qkv, q, k, v, cos_vals, sin_vals, seq_lengths, B, Hq, Hkv, D);
     } else {
         size_t grid = ( work     + block - 1) / block; if (!grid) grid = 1;
         hipLaunchKernelGGL(split_qkv_apply_rotary_kernel_vec<1>,
             dim3((unsigned)grid), dim3(block), 0, stream,
-            qkv, q, k, v, cos_vals, sin_vals, positions, B, Hq, Hkv, D);
+            qkv, q, k, v, cos_vals, sin_vals, seq_lengths, B, Hq, Hkv, D);
     }
 }
