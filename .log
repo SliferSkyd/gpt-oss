@@ -1,1 +1,2 @@
-srun: error: MV-DZ-MI250-02: task 0: Segmentation fault (core dumped)
+srun: job 52364 queued and waiting for resources
+srun: Job allocation 52364 has been revoked

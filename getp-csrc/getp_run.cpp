@@ -1004,7 +1004,7 @@ void attention_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size,
         const int woff = layer_idx * H * QKV;
         matmul<
             /*WM,WN,WK*/ 16,16,16,
-            /*WAVES_M,N,K*/ 2,4,2,
+            /*WAVES_M,N,K*/ 4,4,2,
             /*TW_M,TW_N*/ 1,1,
             /*PAD_K*/ 8,
             /*FUSED*/ false
@@ -1110,7 +1110,7 @@ void attention_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size,
 
         matmul<
             16,16,16,
-            2,4,2,
+            4,4,2,
             1,1,
             8,
             /*FUSED*/ true
@@ -1232,7 +1232,7 @@ void moe_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size,
         TIMER_BLOCK("matmul_mc_router");
         matmul<
             16,16,16,
-            2,4,2,
+            4,4,2,
             1,1,
             8,
             /*FUSED*/ false
@@ -1344,7 +1344,7 @@ void moe_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size,
         const size_t seg1_loc = (size_t)o_len * H; // per-expert stride in local shard
         const __hip_bfloat16 *W1 = w->w_mlp1 + (size_t)layer_idx * (size_t)E * seg1_loc;
 
-        mlp1<16,16,16,  /*WAVES_M,N,K*/ 2,4,2,
+        mlp1<16,16,16,  /*WAVES_M,N,K*/ 4,4,2,
             /*TW_M,TW_N*/ 1,1,
             /*PAD_K*/ 8>(
             s->mlp1_out_g, s->expert_input_buffer_g, W1,
@@ -1390,7 +1390,7 @@ void moe_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size,
         const __hip_bfloat16 *W2 = w->w_mlp2 + (size_t)layer_idx * (size_t)E * seg2_loc;
         const __hip_bfloat16 *b2s = w->b_mlp2 + (size_t)layer_idx * (size_t)E * H;
         
-        mlp2<16,16,16,  /*WAVES_M,N,K*/ 2,4,2,
+        mlp2<16,16,16,  /*WAVES_M,N,K*/ 4,4,2,
             /*TW_M,TW_N*/ 1,1,
             /*PAD_K*/ 8>(
                 s->expert_output_partial_g, s->gate_up_g, W2, b2s,
@@ -1586,7 +1586,7 @@ int *forward_batch_gpu(GPUTransformer *gpu_t, int *tokens, int batch_size)
     {
         matmul<
             16,16,16,
-            2,4,2,
+            4,4,2,
             1,1,
             8,
             false>(s->logits, s->x, w->out, B, H, p->vocab_size);
@@ -1616,6 +1616,7 @@ int *forward_batch_gpu(GPUTransformer *gpu_t, int *tokens, int batch_size)
 // Replace previous clear_kv_cache_for_slot kernel with host memset version
 static inline void clear_kv_cache_for_slot(GPURunState *s, const Config *p, int slot)
 {
+    return;
     if (slot < 0 || slot >= BATCH_SIZE)
         return;
 
@@ -1837,38 +1838,6 @@ long long continuous_batching_inference(Tokenizer *tokenizer,
         }
     }
 
-    int max_steps = gpu_transformers[0]->config.seq_len;
-    Config *p0 = gpu_transformers[0] ? &gpu_transformers[0]->config : nullptr;
-
-    // Print all results
-    for (int req_idx = 0; req_idx < requests->num_reqs; req_idx++)
-    {
-        const char *input_seq = get_str_req_ptr(requests, req_idx);
-        int *output_tokens = get_tok_gen_ptr(requests, req_idx);
-
-        safe_printf(input_seq);
-        printf("!");
-
-        int *temp_tokens = (int *)malloc((MAX_SEQ_LEN + 3) * sizeof(int));
-        int temp_len;
-        encode(tokenizer, input_seq, -1, -1, temp_tokens, &temp_len, p0->initial_context_length);
-        int prev_token = temp_tokens[temp_len - 1];
-        free(temp_tokens);
-
-        for (int i = 0; i < max_steps; ++i)
-        {
-            int token = output_tokens[i];
-            if (token == -1)
-                break;
-            const char *piece = decode_piece(tokenizer, prev_token, token);
-            safe_printf(piece);
-            prev_token = token;
-        }
-        printf("\n");
-    }
-    fflush(stdout);
-
-    write_profile_info();
     return total_tokens_generated;
 }
 
