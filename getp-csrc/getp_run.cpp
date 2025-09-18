@@ -1766,12 +1766,13 @@ int o_len = 0;
     dim3 grid((o_len + BLOCK_N_MLP - 1) / BLOCK_N_MLP, cur_tiles);
     dim3 block(LANE_PER_WAVE, WAVES_PER_BLOCK_MLP);
 
-    const int ldA = BLOCK_K_MLP + PAD_K_MC;
-    const int ldB = BLOCK_K_MLP + PAD_K_MC;
+    const int ldA = BLOCK_K_MLP + PAD_K_MLP;
+    const int ldB = BLOCK_K_MLP + PAD_K_MLP;
     const size_t shmem =
-        sizeof(float) * (size_t)(2 * BLOCK_M_MLP * ldA +   // sA0, sA1
-                                 2 * ldB * BLOCK_N_MLP +   // sB0, sB1
-                                 BLOCK_M_MLP * BLOCK_N_MLP); // (spill)
+        sizeof(uint16_t) * (size_t)(
+            2 * BLOCK_M_MLP * ldA +      // sA0, sA1
+            2 * ldB * BLOCK_N_MLP        // sB0, sB1
+        );
 
     assert_smem_or_die(shmem, "grouped_mlp1_mxfp4_kernel(TP)");
     hipLaunchKernelGGL(grouped_mlp1_mxfp4_kernel, grid, block, shmem, sMoe,
@@ -1833,11 +1834,13 @@ const int Dloc = o_len / 2;
     dim3 grid((H + BLOCK_N_MLP - 1) / BLOCK_N_MLP, cur_tiles);
     dim3 block(LANE_PER_WAVE, WAVES_PER_BLOCK_MLP);
 
-    const int ldA = BLOCK_K_MLP + PAD_K_MC;
-    const int ldB = BLOCK_K_MLP + PAD_K_MC;
+    const int ldA = BLOCK_K_MLP + PAD_K_MLP;
+    const int ldB = BLOCK_K_MLP + PAD_K_MLP;
     const size_t shmem =
-        sizeof(float) * (size_t)(2 * BLOCK_M_MLP * ldA +   // sA0, sA1
-                                 2 * ldB * BLOCK_N_MLP);   // sB0, sB1
+    sizeof(uint16_t) * (size_t)(
+        2 * BLOCK_M_MLP * ldA +      // sA0, sA1
+        2 * ldB * BLOCK_N_MLP        // sB0, sB1
+    );
 
     assert_smem_or_die(shmem, "grouped_mlp2_mxfp4_bias_kernel(TP)");
     hipLaunchKernelGGL(grouped_mlp2_mxfp4_bias_kernel, grid, block, shmem, sMoe,

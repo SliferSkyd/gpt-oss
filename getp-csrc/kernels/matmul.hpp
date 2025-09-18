@@ -20,7 +20,7 @@
 #endif
 
 #ifndef WAVES_M
-#define WAVES_M 1
+#define WAVES_M 4
 #endif
 #ifndef WAVES_N
 #define WAVES_N 4
@@ -243,7 +243,7 @@ __device__ inline void copy_B_tile_vec(uint32_t* __restrict__ dst_u32,
 
 // ===== Optional tiny LDS padding to cut bank conflicts =====
 #ifndef PAD_K_MC
-#define PAD_K_MC 0   // try 2 or 8 if you observe LDS conflicts; must be even
+#define PAD_K_MC 8   // try 2 or 8 if you observe LDS conflicts; must be even
 #endif
 static_assert((BLOCK_K % 2) == 0, "BLOCK_K must be even (packs 2×bf16).");
 static_assert((PAD_K_MC % 2) == 0, "PAD_K_MC must be even (u32 pair addressing).");

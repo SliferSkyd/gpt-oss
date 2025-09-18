@@ -485,7 +485,7 @@ __device__ inline void store_c_tile_addbias(
 #endif
 
 #ifndef WAVES_K_MLP
-#define WAVES_K_MLP 1
+#define WAVES_K_MLP 2
 #endif
 
 static_assert(WM == 16 && WN == 16 && WK == 16, "This MFMA microkernel assumes 16x16x16 bf16 tiles.");
