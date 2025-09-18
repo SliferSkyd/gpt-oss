@@ -1080,12 +1080,16 @@ void attention_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size,
         // Grid: (kv heads, batch)
         dim3 grid(NKv, B);
 
-        // Request dynamic shared mem for two float tiles: K and V
-        const size_t shmem = (size_t)2 * (size_t)T * (size_t)D * sizeof(float);
-        assert_smem_or_die(shmem, "fused_attention_kernel_streaming");
+        // fused_attention_kernel_optimized_3 uses:
+        // - PADDED_HEAD_DIM = 72 (64 + 8 padding to avoid bank conflicts)
+        // - __hip_bfloat16 for shared memory (not float)
+        // Calculate shared memory to match what the kernel actually uses
+        const size_t PADDED_HEAD_DIM = 72;
+        const size_t shmem = (size_t)2 * (size_t)T * PADDED_HEAD_DIM * sizeof(__hip_bfloat16);
+        assert_smem_or_die(shmem, "fused_attention_kernel_optimized_3");
 
         hipLaunchKernelGGL(
-            fused_attention_kernel_optimized, // same symbol
+            fused_attention_kernel_optimized_3,
             grid, block, shmem, sAttn,
             tb_mb, q_mb, key_cache_mb, value_cache_mb,
             w->attn_sinks + (size_t)layer_idx * NA,

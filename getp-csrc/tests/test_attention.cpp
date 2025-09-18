@@ -200,7 +200,7 @@ static void launch_optimized(
 
   // TODO: swap to your optimized kernel symbol once you have it:
   hipLaunchKernelGGL(
-    fused_attention_kernel_optimized_2, // placeholder: same as baseline
+    fused_attention_kernel_optimized_3, // placeholder: same as baseline
     grid, block, shmem, stream,
     out, q, key_cache, value_cache,
     sinks, mask, seq_lengths,
