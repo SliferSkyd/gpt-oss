@@ -992,7 +992,7 @@ void attention_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size,
 
     // 1) RMSNorm
     {
-        TIMER_BLOCK("rmsnorm_kernel_attention");
+        // TIMER_BLOCK("rmsnorm_kernel_attention");
         dim3 grid(batch_size), block(THREADS_PER_BLOCK);
         rmsnorm_kernel<<<grid, block, 0, sAttn>>>(t_mb, x_mb,
                                                   w->rms_attn_w + (size_t)layer_idx * H, batch_size, H);
@@ -1000,7 +1000,7 @@ void attention_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size,
     }
     // 2) QKV
     {
-        TIMER_BLOCK("matmul_mc_attention");
+        // TIMER_BLOCK("matmul_mc_attention");
         const int woff = layer_idx * H * QKV;
         matmul<
             /*WM,WN,WK*/ 16,16,16,
@@ -1013,7 +1013,7 @@ void attention_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size,
     }
     // 3) bias
     {
-        TIMER_BLOCK("add_bias_kernel_attention");
+        // TIMER_BLOCK("add_bias_kernel_attention");
         const int boff = (size_t)layer_idx * QKV;
         const int elems = batch_size * QKV;
         if (elems > 0)
@@ -1025,7 +1025,7 @@ void attention_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size,
     }
     // 4) split + RoPE
     {
-        TIMER_BLOCK("launch_split_qkv_apply_rotary");
+        // TIMER_BLOCK("launch_split_qkv_apply_rotary");
         launch_split_qkv_apply_rotary(
             qkv_mb, q_mb, k_mb, v_mb,
             s->cos_vals, s->sin_vals, pos_mb,
@@ -1034,7 +1034,7 @@ void attention_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size,
     }
     // 5) KV cache update
     {
-        TIMER_BLOCK("update_kv_cache_kernel");
+        // TIMER_BLOCK("update_kv_cache_kernel");
         dim3 grid(batch_size, (KV + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK);
         dim3 block(1, THREADS_PER_BLOCK);
         update_kv_cache_kernel<<<grid, block, 0, sAttn>>>(
@@ -1044,8 +1044,8 @@ void attention_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size,
             /* layer_kv_offset = */ layer_elem_offset);
     }
     // 6) fused attention
-    {
-        TIMER_BLOCK("fused_attention_kernel_streaming");
+     {
+        // TIMER_BLOCK("fused_attention_kernel_streaming");
 
         const int B  = batch_size;
         const int H  = NA;        // n_attn_heads
@@ -1080,12 +1080,16 @@ void attention_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size,
         // Grid: (kv heads, batch)
         dim3 grid(NKv, B);
 
-        // Request dynamic shared mem for two float tiles: K and V
-        const size_t shmem = (size_t)2 * (size_t)T * (size_t)D * sizeof(float);
-        assert_smem_or_die(shmem, "fused_attention_kernel_streaming");
+        // fused_attention_kernel_optimized_3 uses:
+        // - PADDED_HEAD_DIM = 72 (64 + 8 padding to avoid bank conflicts)
+        // - __hip_bfloat16 for shared memory (not float)
+        // Calculate shared memory to match what the kernel actually uses
+        const size_t PADDED_HEAD_DIM = 72;
+        const size_t shmem = (size_t)2 * (size_t)T * PADDED_HEAD_DIM * sizeof(__hip_bfloat16);
+        assert_smem_or_die(shmem, "fused_attention_kernel_optimized_3");
 
         hipLaunchKernelGGL(
-            fused_attention_kernel, // same symbol
+            fused_attention_kernel_optimized_3,
             grid, block, shmem, sAttn,
             tb_mb, q_mb, key_cache_mb, value_cache_mb,
             w->attn_sinks + (size_t)layer_idx * NA,
@@ -1102,7 +1106,7 @@ void attention_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size,
     }
     // 7) fused output projection
     {
-        TIMER_BLOCK("fused_output_projection_kernel_optimized");
+        // TIMER_BLOCK("fused_output_projection_kernel_optimized");
         const int Kproj = Hd * NA;
         const int N = H;
         const int woff = (size_t)layer_idx * Kproj * H;
@@ -1179,7 +1183,7 @@ void moe_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size,
 
     // 0) RMSNorm on local MB: t = RMS(x, w_ffn)
     {
-        TIMER_BLOCK("rmsnorm_kernel_moe");
+        // TIMER_BLOCK("rmsnorm_kernel_moe");
         float *x_mb = s->x + (size_t)row_offset * H;
         float *t_mb = s->t + (size_t)row_offset * H;
         dim3 grid(bs_local), block(THREADS_PER_BLOCK);
@@ -1194,7 +1198,7 @@ void moe_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size,
 
     // 1) ALL-GATHER normalized inputs across TP into gather_x_g[Bgrp,H]
     {
-        TIMER_BLOCK("moe_allgather");
+        // TIMER_BLOCK("moe_allgather");
         // self copy
         float *dst_self = s->gather_x_g + (size_t)rank_in_group * bs_local * H;
         float *src_self = s->t + (size_t)row_offset * H;
@@ -1229,7 +1233,7 @@ void moe_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size,
     }
     tp_group_barrier(tp);
     {    
-        TIMER_BLOCK("matmul_mc_router");
+        // TIMER_BLOCK("matmul_mc_router");
         matmul<
             16,16,16,
             4,4,2,
@@ -1243,7 +1247,7 @@ void moe_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size,
     }
     
     {
-        TIMER_BLOCK("route_select_softmax_fused");
+        // TIMER_BLOCK("route_select_softmax_fused");
         if (Bgrp > 0 && E > 0)
         {
             run_route_select_softmax_fused(
@@ -1260,7 +1264,7 @@ void moe_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size,
     // 3) Count tokens per expert (order-independent atomics OK), build offsets host-side
     HIP_CHECK(hipMemsetAsync(s->d_expert_counts, 0, E * sizeof(int), sMoe));
     {
-        TIMER_BLOCK("count_tokens_per_expert_kernel");
+        // TIMER_BLOCK("count_tokens_per_expert_kernel");
         dim3 grid((Bgrp + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK);
         count_tokens_per_expert_kernel<<<grid, THREADS_PER_BLOCK, 0, sMoe>>>(
             s->topk_i_g, s->d_expert_counts, Bgrp, K);
@@ -1310,7 +1314,7 @@ void moe_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size,
     // 4) FUSED deterministic routing + packing (no atomics)
     if (total_tokens > 0)
     {
-        TIMER_BLOCK("route_and_pack_fused_kernel");
+        // TIMER_BLOCK("route_and_pack_fused_kernel");
         int threads = 1;
         while (threads < Bgrp)
             threads <<= 1;
@@ -1335,7 +1339,7 @@ void moe_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size,
     // 5) MLP1 (column-parallel on O=2D): local shard
     int o_len = 0;
     {
-        TIMER_BLOCK("MLP1");
+        // TIMER_BLOCK("MLP1");
         const int twoD = 2 * D;
         const int base = twoD / TP;
         const int rem = twoD % TP;
@@ -1356,7 +1360,7 @@ void moe_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size,
     // 6) SwiGLU + bias for local columns -> gate_up_g with Dloc = o_len/2
     const int Dloc = o_len / 2;
     {
-        TIMER_BLOCK("SwiGLU + bias");
+        // TIMER_BLOCK("SwiGLU + bias");
         const __hip_bfloat16 *b1 = w->b_mlp1 + (size_t)layer_idx * (size_t)E * (size_t)o_len;
 
         const size_t work = (size_t)total_tokens * Dloc;
@@ -1373,7 +1377,7 @@ void moe_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size,
 
     // 7) MLP2 (row-parallel on input D) (+bias H full, pre-scaled by 1/TP)
     {
-        TIMER_BLOCK("MLP2");
+        // TIMER_BLOCK("MLP2");
         int i_len, i_start;
         {
             const int base = D / TP, rem = D % TP;
@@ -1406,7 +1410,7 @@ void moe_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size,
 
     // 8) Emulate ALL-REDUCE across TP on [total_tokens, H]
     {
-        TIMER_BLOCK("moe_allreduce");
+        // TIMER_BLOCK("moe_allreduce");
         const size_t bytes = (size_t)total_tokens * H * sizeof(float);
         const size_t span = (size_t)total_tokens * H;
 
@@ -1448,7 +1452,7 @@ void moe_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size,
 
     // 9) Reduce over experts back to tokens (union) -> e_agg_g[Bgrp,H]
     {
-        TIMER_BLOCK("reduce_tokenwise_expert_outputs");
+        // TIMER_BLOCK("reduce_tokenwise_expert_outputs");
         const int threads = 256;
         dim3 grid(Bgrp, (H + threads - 1) / threads);
         reduce_tokenwise_expert_outputs<<<grid, threads, 0, sMoe>>>(
@@ -1459,7 +1463,7 @@ void moe_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size,
 
     // 10) Scatter owner rows back to this rank and residual-add into x
     {
-        TIMER_BLOCK("scatter_add_moe_output");
+        // TIMER_BLOCK("scatter_add_moe_output");
         float *x_mb = s->x + (size_t)row_offset * H;
         float *src_owner = s->e_agg_g + (size_t)rank_in_group * bs_local * H;
         const int elems = bs_local * H;
