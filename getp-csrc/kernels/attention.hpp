@@ -8,6 +8,8 @@
 #define SW_WINDOW 128
 #endif
 
+#define ATTN_UNROLL_FACTOR 8
+
 // ===== warp/block reductions (HIP-safe) =====
 __device__ inline float warpReduceMax(float v) {
     for (int off = warpSize >> 1; off > 0; off >>= 1)
@@ -356,3 +358,258 @@ void fused_output_projection_kernel_optimized(
     if (interior) store_and_fuse_tile<true >(C, bias, acc, M, N, m0, n0, wave_m, wave_n, lane);
     else          store_and_fuse_tile<false>(C, bias, acc, M, N, m0, n0, wave_m, wave_n, lane);
 }
+
+
+
+#include <hip/hip_runtime.h>
+#include <hip/hip_bfloat16.h>
+#include <float.h>
+#include <stdint.h>
+
+#ifndef SW_WINDOW
+#define SW_WINDOW 128
+#endif
+#ifndef SOFTMAX_PHI
+#define SOFTMAX_PHI 0.0f
+#endif
+#ifndef SOFTMAX_EPS
+#define SOFTMAX_EPS 1e-6f
+#endif
+
+// Enable the fast online/streaming softmax
+#ifndef SOFTMAX_USE_ONLINE
+#define SOFTMAX_USE_ONLINE 1
+#endif
+
+// ----------------- Warp helpers -----------------
+__device__ inline float warp_reduce_sum(float v) {
+  for (int off = warpSize >> 1; off > 0; off >>= 1) v += __shfl_down(v, off);
+  return v;
+}
+
+// ----------------- 16B bf16 loader + unpack -----------------
+struct u128 { uint4 v; }; // 16 bytes
+
+__device__ inline u128 gload_bf16x8(const __hip_bfloat16 *ptr) {
+  u128 out;
+  out.v = *reinterpret_cast<const uint4*>(ptr); // expect 16B alignment
+  return out;
+}
+
+__device__ inline void unpack_bf16x8_to_f32(
+    const u128 &src,
+    float &f0,float &f1,float &f2,float &f3,
+    float &f4,float &f5,float &f6,float &f7)
+{
+  const uint32_t *p32 = reinterpret_cast<const uint32_t*>(&src.v);
+  uint32_t w0 = p32[0], w1 = p32[1], w2 = p32[2], w3 = p32[3];
+  uint16_t b0 =  w0        & 0xFFFFu;
+  uint16_t b1 = (w0 >> 16) & 0xFFFFu;
+  uint16_t b2 =  w1        & 0xFFFFu;
+  uint16_t b3 = (w1 >> 16) & 0xFFFFu;
+  uint16_t b4 =  w2        & 0xFFFFu;
+  uint16_t b5 = (w2 >> 16) & 0xFFFFu;
+  uint16_t b6 =  w3        & 0xFFFFu;
+  uint16_t b7 = (w3 >> 16) & 0xFFFFu;
+
+  f0 = __bfloat162float(*reinterpret_cast<const __hip_bfloat16*>(&b0));
+  f1 = __bfloat162float(*reinterpret_cast<const __hip_bfloat16*>(&b1));
+  f2 = __bfloat162float(*reinterpret_cast<const __hip_bfloat16*>(&b2));
+  f3 = __bfloat162float(*reinterpret_cast<const __hip_bfloat16*>(&b3));
+  f4 = __bfloat162float(*reinterpret_cast<const __hip_bfloat16*>(&b4));
+  f5 = __bfloat162float(*reinterpret_cast<const __hip_bfloat16*>(&b5));
+  f6 = __bfloat162float(*reinterpret_cast<const __hip_bfloat16*>(&b6));
+  f7 = __bfloat162float(*reinterpret_cast<const __hip_bfloat16*>(&b7));
+}
+
+
+// ====================================================================================
+// Kernel implementing Idea 1 (Loop Padding) & Idea 3 (Bank Conflict Avoidance)
+//
+// Grid: (x=n_kv_heads, y=batch_size)
+// Block: (x=64 lanes, y=kv_mul warps), total = 64*kv_mul threads
+// Shared: 2 * tile_t * PADDED_HEAD_DIM * sizeof(__hip_bfloat16)
+// ====================================================================================
+__global__ __launch_bounds__(512)
+void fused_attention_kernel_optimized_3(
+    float * __restrict__ output,              // [B, H, D]
+    const float * __restrict__ q,              // [B, H, D]
+    const __hip_bfloat16 * __restrict__ key_cache,   // [B, L, T, KV] (bf16)
+    const __hip_bfloat16 * __restrict__ value_cache, // [B, L, T, KV] (bf16)
+    const __hip_bfloat16 * __restrict__ sinks,     // [H] (bf16, layer-offset)
+    const float * __restrict__ mask,              // unused
+    const int * __restrict__ seq_lengths,       // [B]
+    int batch_size, int n_heads, int n_kv_heads, int head_dim,
+    int seq_len, int n_layers, int layer_idx,
+    bool use_sliding_window,
+    size_t batch_kv_stride, size_t layer_kv_offset,
+    int tile_t
+) {
+  const int kv_h  = blockIdx.x;
+  const int b     = blockIdx.y;
+  const int warp  = threadIdx.y;    // 0..kv_mul-1
+  const int lane  = threadIdx.x;    // 0..63
+  const int kv_mul = blockDim.y;
+  const int h     = kv_h * kv_mul + warp;
+
+  if (b >= batch_size || kv_h >= n_kv_heads || warp >= kv_mul || h >= n_heads)
+    return;
+
+  const int pos = seq_lengths[b];
+
+  int t_start = 0;
+  if (use_sliding_window && ((layer_idx & 1) == 0)) {
+    t_start = max(0, pos - (SW_WINDOW - 1));
+  }
+  const int n_steps = pos - t_start + 1;
+
+  const int kv_dim    = head_dim * n_kv_heads;
+  const int gqa_ratio = n_heads / n_kv_heads;
+  if ((h / gqa_ratio) != kv_h) return;
+
+  const __hip_bfloat16 * __restrict__ k_base_layer =
+      key_cache   + (size_t)b * batch_kv_stride + layer_kv_offset;
+  const __hip_bfloat16 * __restrict__ v_base_layer =
+      value_cache + (size_t)b * batch_kv_stride + layer_kv_offset;
+
+  const __hip_bfloat16 * __restrict__ k_head_base = k_base_layer + (size_t)kv_h * head_dim;
+  const __hip_bfloat16 * __restrict__ v_head_base = v_base_layer + (size_t)kv_h * head_dim;
+
+  const float * __restrict__ q_head =
+      q + (size_t)b * n_heads * head_dim + (size_t)h * head_dim;
+  const float qi = q_head[lane];
+
+  // IDEA 3: Add padding to shared memory width to avoid bank conflicts.
+  // 64 (head_dim) + 8 (padding) = 72. Accessing s[t*72+lane] and s[t*72+lane+32]
+  // will now fall into different memory banks.
+  // NOTE: The host must launch the kernel with increased shared memory:
+  // shmem = 2 * tile_t * PADDED_HEAD_DIM * sizeof(__hip_bfloat16)
+  constexpr int PADDED_HEAD_DIM = 72;
+
+  extern __shared__ __hip_bfloat16 shared_mem_bf16[];
+  __hip_bfloat16 *sK = shared_mem_bf16;
+  __hip_bfloat16 *sV = shared_mem_bf16 + (size_t)tile_t * PADDED_HEAD_DIM;
+  
+  float out_i = 0.0f;
+  float m = -INFINITY;
+  float l = 0.0f;
+
+  const int threads_total = blockDim.x * blockDim.y;
+  const int tid2D         = threadIdx.y * blockDim.x + lane;
+
+  for (int base = 0; base < n_steps; base += tile_t) {
+    const int cur = min(tile_t, n_steps - base);
+
+    // Cooperative loading from global to shared memory (bfloat16)
+    // Since head_dim (64) is a multiple of 8, the tail-loading loop is removed.
+    const int vec8 = head_dim / 8;
+    const int elems_vec8 = cur * vec8;
+    for (int e8 = tid2D; e8 < elems_vec8; e8 += threads_total) {
+      const int tloc = e8 / vec8;
+      const int i8   = (e8 - tloc * vec8) * 8;
+      const int t_abs = t_start + base + tloc;
+      const int tw    = ((layer_idx & 1) == 0) ? (t_abs % SW_WINDOW) : t_abs;
+      const __hip_bfloat16 *k_ptr = k_head_base + (size_t)tw * kv_dim + i8;
+      const __hip_bfloat16 *v_ptr = v_head_base + (size_t)tw * kv_dim + i8;
+
+      *reinterpret_cast<u128*>(sK + (size_t)tloc * PADDED_HEAD_DIM + i8) = gload_bf16x8(k_ptr);
+      *reinterpret_cast<u128*>(sV + (size_t)tloc * PADDED_HEAD_DIM + i8) = gload_bf16x8(v_ptr);
+    }
+    __syncthreads();
+
+    const float inv_sqrt_d = rsqrtf((float)head_dim);
+
+    // IDEA 1: The computation loop is now unified. The separate tail loop is removed.
+    // Padding is handled inside by masking scores for out-of-bounds steps to -inf.
+    // NOTE: Must check bounds to avoid reading uninitialized shared memory
+    for (int t = 0; t < cur; t += ATTN_UNROLL_FACTOR) {
+      // Safe loads with bounds checking - use 0 for out-of-bounds elements
+      float k0_i = (t+0 < cur) ? __bfloat162float(sK[(size_t)(t+0)*PADDED_HEAD_DIM+lane]) : 0.0f;
+      float k1_i = (t+1 < cur) ? __bfloat162float(sK[(size_t)(t+1)*PADDED_HEAD_DIM+lane]) : 0.0f;
+      float k2_i = (t+2 < cur) ? __bfloat162float(sK[(size_t)(t+2)*PADDED_HEAD_DIM+lane]) : 0.0f;
+      float k3_i = (t+3 < cur) ? __bfloat162float(sK[(size_t)(t+3)*PADDED_HEAD_DIM+lane]) : 0.0f;
+      float k4_i = (t+4 < cur) ? __bfloat162float(sK[(size_t)(t+4)*PADDED_HEAD_DIM+lane]) : 0.0f;
+      float k5_i = (t+5 < cur) ? __bfloat162float(sK[(size_t)(t+5)*PADDED_HEAD_DIM+lane]) : 0.0f;
+      float k6_i = (t+6 < cur) ? __bfloat162float(sK[(size_t)(t+6)*PADDED_HEAD_DIM+lane]) : 0.0f;
+      float k7_i = (t+7 < cur) ? __bfloat162float(sK[(size_t)(t+7)*PADDED_HEAD_DIM+lane]) : 0.0f;
+
+      float v0_i = (t+0 < cur) ? __bfloat162float(sV[(size_t)(t+0)*PADDED_HEAD_DIM+lane]) : 0.0f;
+      float v1_i = (t+1 < cur) ? __bfloat162float(sV[(size_t)(t+1)*PADDED_HEAD_DIM+lane]) : 0.0f;
+      float v2_i = (t+2 < cur) ? __bfloat162float(sV[(size_t)(t+2)*PADDED_HEAD_DIM+lane]) : 0.0f;
+      float v3_i = (t+3 < cur) ? __bfloat162float(sV[(size_t)(t+3)*PADDED_HEAD_DIM+lane]) : 0.0f;
+      float v4_i = (t+4 < cur) ? __bfloat162float(sV[(size_t)(t+4)*PADDED_HEAD_DIM+lane]) : 0.0f;
+      float v5_i = (t+5 < cur) ? __bfloat162float(sV[(size_t)(t+5)*PADDED_HEAD_DIM+lane]) : 0.0f;
+      float v6_i = (t+6 < cur) ? __bfloat162float(sV[(size_t)(t+6)*PADDED_HEAD_DIM+lane]) : 0.0f;
+      float v7_i = (t+7 < cur) ? __bfloat162float(sV[(size_t)(t+7)*PADDED_HEAD_DIM+lane]) : 0.0f;
+
+      float s0 = warp_reduce_sum(qi * k0_i); float s1 = warp_reduce_sum(qi * k1_i);
+      float s2 = warp_reduce_sum(qi * k2_i); float s3 = warp_reduce_sum(qi * k3_i);
+      float s4 = warp_reduce_sum(qi * k4_i); float s5 = warp_reduce_sum(qi * k5_i);
+      float s6 = warp_reduce_sum(qi * k6_i); float s7 = warp_reduce_sum(qi * k7_i);
+
+      float p0, p1, p2, p3, p4, p5, p6, p7, alpha, beta;
+      if (lane == 0) {
+        // IDEA 1: Mask scores from padded steps before softmax.
+        s0 = ((t + 0) < cur) ? s0 * inv_sqrt_d : -INFINITY;
+        s1 = ((t + 1) < cur) ? s1 * inv_sqrt_d : -INFINITY;
+        s2 = ((t + 2) < cur) ? s2 * inv_sqrt_d : -INFINITY;
+        s3 = ((t + 3) < cur) ? s3 * inv_sqrt_d : -INFINITY;
+        s4 = ((t + 4) < cur) ? s4 * inv_sqrt_d : -INFINITY;
+        s5 = ((t + 5) < cur) ? s5 * inv_sqrt_d : -INFINITY;
+        s6 = ((t + 6) < cur) ? s6 * inv_sqrt_d : -INFINITY;
+        s7 = ((t + 7) < cur) ? s7 * inv_sqrt_d : -INFINITY;
+
+        float m_tile = s0;
+        m_tile = fmaxf(m_tile, s1); m_tile = fmaxf(m_tile, s2); m_tile = fmaxf(m_tile, s3);
+        m_tile = fmaxf(m_tile, s4); m_tile = fmaxf(m_tile, s5); m_tile = fmaxf(m_tile, s6);
+        m_tile = fmaxf(m_tile, s7);
+
+        float m_old = m;
+        m = fmaxf(m_old, m_tile);
+        alpha = __expf(m_old - m);
+        beta  = __expf(m_tile - m);
+
+        p0 = __expf(s0 - m_tile); p1 = __expf(s1 - m_tile);
+        p2 = __expf(s2 - m_tile); p3 = __expf(s3 - m_tile);
+        p4 = __expf(s4 - m_tile); p5 = __expf(s5 - m_tile);
+        p6 = __expf(s6 - m_tile); p7 = __expf(s7 - m_tile);
+        
+        l = l * alpha + (p0 + p1 + p2 + p3 + p4 + p5 + p6 + p7) * beta;
+      }
+
+      alpha = __shfl(alpha, 0); beta  = __shfl(beta, 0);
+      p0 = __shfl(p0, 0); p1 = __shfl(p1, 0); p2 = __shfl(p2, 0); p3 = __shfl(p3, 0);
+      p4 = __shfl(p4, 0); p5 = __shfl(p5, 0); p6 = __shfl(p6, 0); p7 = __shfl(p7, 0);
+
+      out_i = out_i * alpha + (
+            fmaf(p0, v0_i, fmaf(p1, v1_i, fmaf(p2, v2_i, fmaf(p3, v3_i, 
+            fmaf(p4, v4_i, fmaf(p5, v5_i, fmaf(p6, v6_i, p7 * v7_i)))))))
+      ) * beta;
+    }
+    __syncthreads();
+  }
+
+  // Sink update & write out
+  float alpha_sink = 0.f, l_final = 0.f;
+  if (lane == 0) {
+    float s_sink = __bfloat162float(sinks[h]);
+    float m_new  = fmaxf(m, s_sink);
+    float alpha  = __expf(m - m_new);
+    float e      = __expf(s_sink - m_new);
+    l            = l * alpha + e;
+    alpha_sink   = alpha;
+    l_final      = l;
+  }
+  alpha_sink = __shfl(alpha_sink, 0);
+  l_final    = __shfl(l_final, 0);
+
+  if (lane < head_dim) {
+    float out_norm = (alpha_sink * out_i) / (l_final + 1e-6f);
+    float * __restrict__ out_head =
+        output + (size_t)b * n_heads * head_dim + (size_t)h * head_dim;
+    out_head[lane] = out_norm;
+  }
+}
+
+
+

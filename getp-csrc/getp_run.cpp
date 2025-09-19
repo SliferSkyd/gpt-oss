@@ -33,7 +33,8 @@
 
 #include <chrono>
 
-long long get_time_msec() {
+long long get_time_msec()
+{
     auto now = std::chrono::high_resolution_clock::now();
     auto duration = now.time_since_epoch();
     return std::chrono::duration_cast<std::chrono::milliseconds>(duration).count();
@@ -56,7 +57,7 @@ typedef struct
     __hip_bfloat16 *rms_out_w;  // (hidden_dim,)
 
     // Attention weights
-     __hip_bfloat16 *w_qkv;      // (n_layers, head_dim * (n_attn_heads + 2 * n_kv_heads), hidden_dim)
+    __hip_bfloat16 *w_qkv;      // (n_layers, head_dim * (n_attn_heads + 2 * n_kv_heads), hidden_dim)
     __hip_bfloat16 *b_qkv;      // (n_layers, head_dim * (n_attn_heads + 2 * n_kv_heads))
     __hip_bfloat16 *w_o;        // (n_layers, hidden_dim, head_dim * n_attn_heads)
     __hip_bfloat16 *b_o;        // (n_layers, hidden_dim)
@@ -68,7 +69,7 @@ typedef struct
 
     // MoE weights now use MXFP4 quantization
     // MoE weights (pure BF16 now)
-    uint8_t *w_mlp1_mxfp4, *w_mlp2_mxfp4; // packed n/2 bytes
+    uint8_t *w_mlp1_mxfp4, *w_mlp2_mxfp4;   // packed n/2 bytes
     uint8_t *w_mlp1_scales, *w_mlp2_scales; // n/32 bytes (e8m0 per block)
     __hip_bfloat16 *b_mlp1, *b_mlp2;
     // GPUTransformerWeights (add two pointers)
@@ -105,11 +106,11 @@ typedef struct
     float *sin_vals; // (head_dim/2, seq_len)
 
     // === legacy MoE (kept for shared kernels/utilities) ===
-    float *router_score;         // (batch_size, n_experts)
+    float *router_score; // (batch_size, n_experts)
 
     // Persistent routing buffers
-    int *d_expert_counts;    // (n_experts)
-    int *d_expert_offsets;   // (n_experts)
+    int *d_expert_counts;  // (n_experts)
+    int *d_expert_offsets; // (n_experts)
 
     // === NEW: TP-union MoE buffers (per rank) ===
     // union batch (within a TP group) = Bgrp_max = TENSOR_PARALLEL_SIZE * BATCH_SIZE
@@ -294,7 +295,7 @@ void malloc_gpu_run_state(GPURunState *s, Config *p)
     HIP_CHECK(hipMalloc((void **)&s->d_expert_offsets, E * sizeof(int)));
 
     int total_mtiles = BATCH_SIZE * K;
-   
+
     // KV cache
     HIP_CHECK(hipMalloc((void **)&s->key_cache, kv_cache_size));
     HIP_CHECK(hipMalloc((void **)&s->value_cache, kv_cache_size));
@@ -341,7 +342,7 @@ void malloc_gpu_run_state(GPURunState *s, Config *p)
     // Since each token selects K experts, max tokens per expert is min(pairs_max, Bgrp_max * K)
     // But to be safe, we assume worst-case distribution
     int max_tiles_per_expert = (pairs_max + BLOCK_M_MLP - 1) / BLOCK_M_MLP;
-    s->cap_tiles = max_tiles_per_expert * 4;  // 4x safety factor for worst-case distribution
+    s->cap_tiles = max_tiles_per_expert * 4; // 4x safety factor for worst-case distribution
     HIP_CHECK(hipMalloc((void **)&s->d_tile2expert_g, s->cap_tiles * sizeof(int)));
     HIP_CHECK(hipMalloc((void **)&s->d_tile2local_g, s->cap_tiles * sizeof(int)));
 
@@ -438,16 +439,16 @@ void malloc_gpu_weights(GPUTransformerWeights *w, Config *p)
 
     // ===== MXFP4 MoE weights (sharded, compact local layouts) =====
     // Local logical sizes
-    const size_t mlp1_loc_elems = (size_t)p->n_layers * (size_t)E * (size_t)Oloc * (size_t)H;   // [L, E, Oloc, H]
-    const size_t mlp2_loc_elems = (size_t)p->n_layers * (size_t)E * (size_t)H * (size_t)Kloc;   // [L, E, H, Kloc]
+    const size_t mlp1_loc_elems = (size_t)p->n_layers * (size_t)E * (size_t)Oloc * (size_t)H; // [L, E, Oloc, H]
+    const size_t mlp2_loc_elems = (size_t)p->n_layers * (size_t)E * (size_t)H * (size_t)Kloc; // [L, E, H, Kloc]
 
     // Packed bytes: nibbles => n/2 (round up)
     const size_t mlp1_loc_packed_bytes = (mlp1_loc_elems + 1) / 2;
     const size_t mlp2_loc_packed_bytes = (mlp2_loc_elems + 1) / 2;
 
     // Scale bytes: one E8M0 per 32 elements (round up)
-    const size_t mlp1_loc_scale_bytes  = (mlp1_loc_elems + 31) / 32;
-    const size_t mlp2_loc_scale_bytes  = (mlp2_loc_elems + 31) / 32;
+    const size_t mlp1_loc_scale_bytes = (mlp1_loc_elems + 31) / 32;
+    const size_t mlp2_loc_scale_bytes = (mlp2_loc_elems + 31) / 32;
 
     // Allocate MXFP4 packed + scales
     HIP_CHECK(hipMalloc((void **)&w->w_mlp1_mxfp4, mlp1_loc_packed_bytes * sizeof(uint8_t)));
@@ -466,13 +467,12 @@ void malloc_gpu_weights(GPUTransformerWeights *w, Config *p)
     const size_t b1_local = (size_t)p->n_layers * (size_t)E * (size_t)Oloc; // [L, E, Oloc]
     HIP_CHECK(hipMalloc((void **)&w->b_mlp1, b1_local * sizeof(__hip_bfloat16)));
 
-    const size_t b2_full  = (size_t)p->n_layers * (size_t)E * (size_t)H;    // [L, E, H]
+    const size_t b2_full = (size_t)p->n_layers * (size_t)E * (size_t)H; // [L, E, H]
     HIP_CHECK(hipMalloc((void **)&w->b_mlp2, b2_full * sizeof(__hip_bfloat16)));
 
     HIP_CHECK(hipMalloc((void **)&w->out, p->hidden_dim * p->vocab_size * sizeof(__hip_bfloat16)));
     HIP_CHECK(hipMalloc((void **)&w->attn_sinks, p->n_layers * p->n_attn_heads * sizeof(__hip_bfloat16)));
 }
-
 
 static inline void convert_float_array_to_bfloat16_scaled(const float *src, __hip_bfloat16 *dst, size_t n, float scale)
 {
@@ -482,32 +482,36 @@ static inline void convert_float_array_to_bfloat16_scaled(const float *src, __hi
     convert_float_array_to_bfloat16(tmp.data(), dst, n);
 }
 
-__global__ void e8m0_to_f32_kernel(const uint8_t* __restrict__ e8,
-                                   float* __restrict__ f, size_t nblocks) {
+__global__ void e8m0_to_f32_kernel(const uint8_t *__restrict__ e8,
+                                   float *__restrict__ f, size_t nblocks)
+{
     size_t i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < nblocks) {
+    if (i < nblocks)
+    {
         // X = 2^(e8-127) via bit-cast exponent (fast!)
         f[i] = __uint_as_float(uint32_t(e8[i]) << 23);
     }
 }
-static inline void launch_e8m0_to_f32(const uint8_t* e8, float* f, size_t n,
-                                      hipStream_t s=0) {
-    if (!n) return;
+static inline void launch_e8m0_to_f32(const uint8_t *e8, float *f, size_t n,
+                                      hipStream_t s = 0)
+{
+    if (!n)
+        return;
     const int T = 256;
     dim3 grid((int)((n + T - 1) / T));
     e8m0_to_f32_kernel<<<grid, T, 0, s>>>(e8, f, n);
     HIP_CHECK(hipGetLastError());
 }
 
-
 static void streaming_quantize_copy_mxfp4_cpu_to_gpu(
-    const float* __restrict__ src,
+    const float *__restrict__ src,
     size_t src_elems,
-    uint8_t* __restrict__ dst_packed_dev,
-    uint8_t* __restrict__ dst_scales_dev,
+    uint8_t *__restrict__ dst_packed_dev,
+    uint8_t *__restrict__ dst_scales_dev,
     hipStream_t /*unused_stream_ok*/)
 {
-    if (src_elems == 0) return;
+    if (src_elems == 0)
+        return;
 
     // Work in 32-sized blocks
     const size_t TOTAL_BLOCKS = (src_elems + 31) / 32;
@@ -519,7 +523,7 @@ static void streaming_quantize_copy_mxfp4_cpu_to_gpu(
     // ---- Tunables (MI250X-friendly) ----
     // 128–256 MiB chunks usually win on big models + 2 GPUs.
     const size_t CAP_HOST_STAGE_BYTES = (size_t)(256ULL << 20); // 256 MiB
-    const size_t CAP_DEV_STAGE_BYTES  = (size_t)(256ULL << 20); // 256 MiB
+    const size_t CAP_DEV_STAGE_BYTES = (size_t)(256ULL << 20);  // 256 MiB
     // Stay well below free to leave headroom for other allocations
     const size_t DEV_LIMIT = (free_b > (size_t)(2ULL << 30)) ? (size_t)(free_b / 6) : (size_t)(128ULL << 20);
     const size_t STAGE_BYTES = std::min({CAP_HOST_STAGE_BYTES, CAP_DEV_STAGE_BYTES, DEV_LIMIT});
@@ -527,34 +531,36 @@ static void streaming_quantize_copy_mxfp4_cpu_to_gpu(
     // Compute block count per chunk
     const size_t BYTES_PER_BLOCK = 32 * sizeof(float);
     size_t chunk_blocks = STAGE_BYTES / BYTES_PER_BLOCK;
-    if (chunk_blocks == 0) chunk_blocks = 16384; // 2 MB minimum
-    if (chunk_blocks > TOTAL_BLOCKS) chunk_blocks = TOTAL_BLOCKS;
-    const size_t chunk_elems  = chunk_blocks * 32;
-    const size_t chunk_bytes  = chunk_elems * sizeof(float);
+    if (chunk_blocks == 0)
+        chunk_blocks = 16384; // 2 MB minimum
+    if (chunk_blocks > TOTAL_BLOCKS)
+        chunk_blocks = TOTAL_BLOCKS;
+    const size_t chunk_elems = chunk_blocks * 32;
+    const size_t chunk_bytes = chunk_elems * sizeof(float);
 
     // ---- Streams & events ----
     hipStream_t copy_stream, compute_stream;
-    HIP_CHECK(hipStreamCreateWithFlags(&copy_stream,    hipStreamNonBlocking));
+    HIP_CHECK(hipStreamCreateWithFlags(&copy_stream, hipStreamNonBlocking));
     HIP_CHECK(hipStreamCreateWithFlags(&compute_stream, hipStreamNonBlocking));
 
     hipEvent_t copy_done[2], compute_done[2];
-    HIP_CHECK(hipEventCreateWithFlags(&copy_done[0],    hipEventDisableTiming));
-    HIP_CHECK(hipEventCreateWithFlags(&copy_done[1],    hipEventDisableTiming));
+    HIP_CHECK(hipEventCreateWithFlags(&copy_done[0], hipEventDisableTiming));
+    HIP_CHECK(hipEventCreateWithFlags(&copy_done[1], hipEventDisableTiming));
     HIP_CHECK(hipEventCreateWithFlags(&compute_done[0], hipEventDisableTiming));
     HIP_CHECK(hipEventCreateWithFlags(&compute_done[1], hipEventDisableTiming));
 
     // ---- Host pinned staging (double buffer) ----
-    void*  h_stage_raw[2] = {nullptr, nullptr};
-    float* h_stage[2]     = {nullptr, nullptr};
+    void *h_stage_raw[2] = {nullptr, nullptr};
+    float *h_stage[2] = {nullptr, nullptr};
     HIP_CHECK(hipHostMalloc(&h_stage_raw[0], chunk_bytes, hipHostMallocPortable));
     HIP_CHECK(hipHostMalloc(&h_stage_raw[1], chunk_bytes, hipHostMallocPortable));
-    h_stage[0] = reinterpret_cast<float*>(h_stage_raw[0]);
-    h_stage[1] = reinterpret_cast<float*>(h_stage_raw[1]);
+    h_stage[0] = reinterpret_cast<float *>(h_stage_raw[0]);
+    h_stage[1] = reinterpret_cast<float *>(h_stage_raw[1]);
 
     // ---- Device staging (double buffer) ----
-    float* d_stage[2] = {nullptr, nullptr};
-    HIP_CHECK(hipMalloc((void**)&d_stage[0], chunk_bytes));
-    HIP_CHECK(hipMalloc((void**)&d_stage[1], chunk_bytes));
+    float *d_stage[2] = {nullptr, nullptr};
+    HIP_CHECK(hipMalloc((void **)&d_stage[0], chunk_bytes));
+    HIP_CHECK(hipMalloc((void **)&d_stage[1], chunk_bytes));
 
     // Kernel launch config
     constexpr int BLOCK_THREADS = 256;
@@ -575,9 +581,9 @@ static void streaming_quantize_copy_mxfp4_cpu_to_gpu(
     while (blocks_done < TOTAL_BLOCKS)
     {
         double start_time = get_time_msec();
-        const size_t elem_off   = blocks_done * 32;
+        const size_t elem_off = blocks_done * 32;
         const size_t this_elems = std::min(chunk_elems, src_elems - elem_off);
-        const size_t this_blocks= (this_elems + 31) / 32;
+        const size_t this_blocks = (this_elems + 31) / 32;
         const size_t this_bytes = this_elems * sizeof(float);
 
         // Start H2D for current ping buffer
@@ -588,7 +594,8 @@ static void streaming_quantize_copy_mxfp4_cpu_to_gpu(
         // While copy ping is in flight, prepare the NEXT chunk into the other host buffer (pong)
         const int pong = ping ^ 1;
         const size_t next_elem_off = elem_off + this_elems;
-        if (next_elem_off < src_elems) {
+        if (next_elem_off < src_elems)
+        {
             const size_t next_elems = std::min(chunk_elems, src_elems - next_elem_off);
             // CPU memcpy to pinned host buffer (overlaps with SDMA H2D + prior compute)
             memcpy(h_stage[pong], src + next_elem_off, next_elems * sizeof(float));
@@ -603,13 +610,13 @@ static void streaming_quantize_copy_mxfp4_cpu_to_gpu(
         const size_t global_block0 = blocks_done;
 
         hipLaunchKernelGGL((quantize_pack_mxfp4_block32_kernel<BLOCK_THREADS>),
-            grid, block, shmem_bytes, compute_stream,
-            d_stage[ping],
-            this_blocks,
-            global_block0,
-            dst_packed_dev,
-            dst_scales_dev,
-            src_elems);
+                           grid, block, shmem_bytes, compute_stream,
+                           d_stage[ping],
+                           this_blocks,
+                           global_block0,
+                           dst_packed_dev,
+                           dst_scales_dev,
+                           src_elems);
         HIP_CHECK(hipGetLastError());
         HIP_CHECK(hipEventRecord(compute_done[ping], compute_stream));
 
@@ -626,7 +633,7 @@ static void streaming_quantize_copy_mxfp4_cpu_to_gpu(
         double gb = (double)this_bytes / (1024.0 * 1024.0 * 1024.0);
         printf("[streaming quantize] chunk %5zu blocks, %6.2f ms, %5.2f GB/s\n",
                this_blocks, dt, gb / (dt * 0.001));
-        
+
         fflush(stdout);
     }
 
@@ -646,44 +653,53 @@ static void streaming_quantize_copy_mxfp4_cpu_to_gpu(
     HIP_CHECK(hipStreamDestroy(compute_stream));
 }
 
-static inline long long tick_msec() {
+static inline long long tick_msec()
+{
     using namespace std::chrono;
     return duration_cast<milliseconds>(high_resolution_clock::now().time_since_epoch()).count();
 }
 
-static size_t getenv_stage_mb_or(const char* name, size_t def_mb) {
-    const char* s = std::getenv(name);
-    if (!s) return def_mb;
+static size_t getenv_stage_mb_or(const char *name, size_t def_mb)
+{
+    const char *s = std::getenv(name);
+    if (!s)
+        return def_mb;
     long v = std::strtol(s, nullptr, 10);
-    if (v <= 0) return def_mb;
+    if (v <= 0)
+        return def_mb;
     return (size_t)v;
 }
 
 // Parallel pack of rows from src (pageable) into a pinned tile.
 // Each row copies 'row_len' floats starting every 'row_stride' floats.
 // Work is split into N threads on whole-row boundaries.
-static void pack_rows_mt(float* __restrict__ dst,
-                         const float* __restrict__ src_base,
+static void pack_rows_mt(float *__restrict__ dst,
+                         const float *__restrict__ src_base,
                          size_t start_row,
                          size_t n_rows,
                          size_t row_stride,
                          size_t row_len,
                          int n_threads)
 {
-    if (n_rows == 0) return;
-    if (n_threads < 2) {
+    if (n_rows == 0)
+        return;
+    if (n_threads < 2)
+    {
         // single-thread fallback
-        const float* src = src_base + start_row * row_stride;
-        for (size_t r = 0; r < n_rows; ++r) {
+        const float *src = src_base + start_row * row_stride;
+        for (size_t r = 0; r < n_rows; ++r)
+        {
             memcpy(dst + r * row_len, src + r * row_stride, row_len * sizeof(float));
         }
         return;
     }
 
-    auto worker = [&](size_t r0, size_t r1) {
-        const float* src = src_base + (start_row + r0) * row_stride;
-        float* out       = dst + r0 * row_len;
-        for (size_t r = r0; r < r1; ++r) {
+    auto worker = [&](size_t r0, size_t r1)
+    {
+        const float *src = src_base + (start_row + r0) * row_stride;
+        float *out = dst + r0 * row_len;
+        for (size_t r = r0; r < r1; ++r)
+        {
             memcpy(out, src, row_len * sizeof(float));
             src += row_stride;
             out += row_len;
@@ -694,31 +710,34 @@ static void pack_rows_mt(float* __restrict__ dst,
     std::vector<std::thread> th;
     th.reserve(n_threads);
     size_t r = 0;
-    for (int t = 0; t < n_threads && r < n_rows; ++t) {
+    for (int t = 0; t < n_threads && r < n_rows; ++t)
+    {
         size_t r1 = std::min(n_rows, r + chunk);
         th.emplace_back(worker, r, r1);
         r = r1;
     }
-    for (auto& tt : th) tt.join();
+    for (auto &tt : th)
+        tt.join();
 }
 
 static void streaming_quantize_copy_mxfp4_cpu_to_gpu_strided(
-    const float* __restrict__ src_base, // host pageable
+    const float *__restrict__ src_base, // host pageable
     size_t rows,                        // #segments to gather
     size_t row_stride,                  // in floats
     size_t row_len,                     // in floats
-    uint8_t* __restrict__ dst_packed_dev,
-    uint8_t* __restrict__ dst_scales_dev,
+    uint8_t *__restrict__ dst_packed_dev,
+    uint8_t *__restrict__ dst_scales_dev,
     hipStream_t /*unused_stream_ok*/ = nullptr)
 {
-    if (rows == 0 || row_len == 0) return;
+    if (rows == 0 || row_len == 0)
+        return;
 
     // === Tile size heuristics ===
     size_t free_b = 0, total_b = 0;
     (void)hipMemGetInfo(&free_b, &total_b);
 
     // env knob (MB)
-    const size_t ENV_MB = getenv_stage_mb_or("MXFP4_STAGE_MB", /*default*/1024);
+    const size_t ENV_MB = getenv_stage_mb_or("MXFP4_STAGE_MB", /*default*/ 1024);
     const size_t CAP_HOST_STAGE_BYTES = ENV_MB * (size_t)(1ULL << 20); // MB -> bytes
     // Leave headroom in VRAM; if low, cap to free/4
     const size_t DEV_LIMIT = (free_b > (size_t)(4ULL << 30)) ? (size_t)(free_b / 4) : (size_t)(256ULL << 20);
@@ -726,8 +745,10 @@ static void streaming_quantize_copy_mxfp4_cpu_to_gpu_strided(
 
     const size_t BYTES_PER_ROW = row_len * sizeof(float);
     size_t tile_rows = STAGE_BYTES / std::max<size_t>(BYTES_PER_ROW, 1);
-    if (tile_rows == 0)   tile_rows = 1;
-    if (tile_rows > rows) tile_rows = rows;
+    if (tile_rows == 0)
+        tile_rows = 1;
+    if (tile_rows > rows)
+        tile_rows = rows;
 
     const size_t tile_elems = tile_rows * row_len;
     const size_t tile_bytes = tile_elems * sizeof(float);
@@ -738,21 +759,24 @@ static void streaming_quantize_copy_mxfp4_cpu_to_gpu_strided(
     HIP_CHECK(hipStreamCreateWithFlags(&s_comp, hipStreamNonBlocking));
 
     hipEvent_t e_copy[3], e_comp[3];
-    for (int i = 0; i < 3; ++i) {
+    for (int i = 0; i < 3; ++i)
+    {
         HIP_CHECK(hipEventCreateWithFlags(&e_copy[i], hipEventDisableTiming));
         HIP_CHECK(hipEventCreateWithFlags(&e_comp[i], hipEventDisableTiming));
     }
 
     // === Triple host pinned + device staging ===
-    void*  h_stage_raw[3] = {nullptr, nullptr, nullptr};
-    float* h_stage[3]     = {nullptr, nullptr, nullptr};
-    for (int i = 0; i < 3; ++i) {
+    void *h_stage_raw[3] = {nullptr, nullptr, nullptr};
+    float *h_stage[3] = {nullptr, nullptr, nullptr};
+    for (int i = 0; i < 3; ++i)
+    {
         HIP_CHECK(hipHostMalloc(&h_stage_raw[i], tile_bytes, hipHostMallocPortable));
-        h_stage[i] = reinterpret_cast<float*>(h_stage_raw[i]);
+        h_stage[i] = reinterpret_cast<float *>(h_stage_raw[i]);
     }
-    float* d_stage[3] = {nullptr, nullptr, nullptr};
-    for (int i = 0; i < 3; ++i) {
-        HIP_CHECK(hipMalloc((void**)&d_stage[i], tile_bytes));
+    float *d_stage[3] = {nullptr, nullptr, nullptr};
+    for (int i = 0; i < 3; ++i)
+    {
+        HIP_CHECK(hipMalloc((void **)&d_stage[i], tile_bytes));
     }
 
     // === Kernel config ===
@@ -771,18 +795,20 @@ static void streaming_quantize_copy_mxfp4_cpu_to_gpu_strided(
 
     // Pre-pack first two tiles so that copy+compute can overlap ASAP
     const size_t warm_tiles = std::min<size_t>(2, (rows + tile_rows - 1) / tile_rows);
-    for (size_t w = 0; w < warm_tiles; ++w) {
+    for (size_t w = 0; w < warm_tiles; ++w)
+    {
         const size_t r0 = rows_done + w * tile_rows;
         const size_t rN = std::min(tile_rows, rows - r0);
         pack_rows_mt(h_stage[(buf + w) % 3], src_base, r0, rN, row_stride, row_len, n_threads);
     }
 
-    while (rows_done < rows) {
+    while (rows_done < rows)
+    {
         const long long t0 = tick_msec();
 
         const size_t r_this = std::min(tile_rows, rows - rows_done);
-        const size_t this_elems  = r_this * row_len;
-        const size_t this_bytes  = this_elems * sizeof(float);
+        const size_t this_elems = r_this * row_len;
+        const size_t this_bytes = this_elems * sizeof(float);
         const size_t this_blocks = (this_elems + 31) / 32;
 
         // ---- H2D on current buffer ----
@@ -792,14 +818,16 @@ static void streaming_quantize_copy_mxfp4_cpu_to_gpu_strided(
 
         // ---- Pack the next tile (in parallel) while copy/compute overlap ----
         const size_t r_next0 = rows_done + r_this;
-        if (r_next0 < rows) {
+        if (r_next0 < rows)
+        {
             const size_t r_nextN = std::min(tile_rows, rows - r_next0);
             const int next_buf = (buf + 1) % 3;
             const long long tp0 = tick_msec();
             pack_rows_mt(h_stage[next_buf], src_base, r_next0, r_nextN, row_stride, row_len, n_threads);
             const long long tp1 = tick_msec();
             // (Optional) keep this lightweight; detailed per-tile print below
-            (void)tp0; (void)tp1;
+            (void)tp0;
+            (void)tp1;
         }
 
         // ---- Compute when H2D is done ----
@@ -812,19 +840,19 @@ static void streaming_quantize_copy_mxfp4_cpu_to_gpu_strided(
 
         const long long tc0 = tick_msec();
         hipLaunchKernelGGL((quantize_pack_mxfp4_block32_kernel<BLOCK_THREADS>),
-            grid, block, shmem_bytes, s_comp,
-            d_stage[buf],
-            this_blocks,
-            global_block0,
-            dst_packed_dev,
-            dst_scales_dev,
-            rows * row_len); // shard_elems
+                           grid, block, shmem_bytes, s_comp,
+                           d_stage[buf],
+                           this_blocks,
+                           global_block0,
+                           dst_packed_dev,
+                           dst_scales_dev,
+                           rows * row_len); // shard_elems
         HIP_CHECK(hipGetLastError());
         HIP_CHECK(hipEventRecord(e_comp[buf], s_comp));
 
         // ---- Advance ----
         blocks_done += this_blocks;
-        rows_done   += r_this;
+        rows_done += r_this;
 
         // ---- Optional: detailed per-tile timing (pack/H2D/ker) ----
         HIP_CHECK(hipEventSynchronize(e_comp[buf]));
@@ -832,7 +860,7 @@ static void streaming_quantize_copy_mxfp4_cpu_to_gpu_strided(
 
         // We can approximate H2D+kernel time as (t3 - t0) minus pack time of the next tile,
         // but to keep overhead low, we report wall time and effective "GB/s on bytes moved".
-        const double gb = (double)this_bytes / (1024.0*1024.0*1024.0);
+        const double gb = (double)this_bytes / (1024.0 * 1024.0 * 1024.0);
         const double ms = (double)(t3 - t0);
         printf("[streaming quantize strided] tile %5zu rows, %7.2f ms, %7.2f GB/s\n",
                r_this, ms, (ms > 0.0 ? gb * 1000.0 / ms : 0.0));
@@ -845,7 +873,8 @@ static void streaming_quantize_copy_mxfp4_cpu_to_gpu_strided(
     HIP_CHECK(hipStreamSynchronize(s_copy));
     HIP_CHECK(hipStreamSynchronize(s_comp));
 
-    for (int i = 0; i < 3; ++i) {
+    for (int i = 0; i < 3; ++i)
+    {
         HIP_CHECK(hipFree(d_stage[i]));
         HIP_CHECK(hipHostFree(h_stage_raw[i]));
         HIP_CHECK(hipEventDestroy(e_copy[i]));
@@ -858,7 +887,8 @@ static void streaming_quantize_copy_mxfp4_cpu_to_gpu_strided(
 // Convert device-side E8M0 scale bytes into float multipliers.
 // Each block of 32 MXFP4 weights has one scale byte (E8M0).
 // The f32 expansion is stored in gpu_weights->w_mlp{1,2}_scales_f32.
-static void convert_all_scales_to_f32(GPUTransformerWeights* w, Config* p, hipStream_t stream=0) {
+static void convert_all_scales_to_f32(GPUTransformerWeights *w, Config *p, hipStream_t stream = 0)
+{
     int dev = 0;
     HIP_CHECK(hipGetDevice(&dev));
     const int TP = TENSOR_PARALLEL_SIZE;
@@ -874,12 +904,13 @@ static void convert_all_scales_to_f32(GPUTransformerWeights* w, Config* p, hipSt
     {
         const int twoD = 2 * D;
         const int base = twoD / TP, rem = twoD % TP;
-        Oloc   = base + (rank < rem ? 1 : 0);
+        Oloc = base + (rank < rem ? 1 : 0);
         Ostart = rank * base + (rank < rem ? rank : rem);
     }
     const size_t seg1_blocks_loc = ((size_t)Oloc * (size_t)H + 31) / 32;
     const size_t total_blocks_mlp1 = (size_t)L * (size_t)E * seg1_blocks_loc;
-    if (total_blocks_mlp1) {
+    if (total_blocks_mlp1)
+    {
         launch_e8m0_to_f32(w->w_mlp1_scales, w->w_mlp1_scales_f32,
                            total_blocks_mlp1, stream);
     }
@@ -888,12 +919,13 @@ static void convert_all_scales_to_f32(GPUTransformerWeights* w, Config* p, hipSt
     int Istart, Kloc;
     {
         const int base = D / TP, rem = D % TP;
-        Kloc   = base + (rank < rem ? 1 : 0);
+        Kloc = base + (rank < rem ? 1 : 0);
         Istart = rank * base + (rank < rem ? rank : rem);
     }
     const size_t seg2_blocks_loc = ((size_t)H * (size_t)Kloc + 31) / 32;
     const size_t total_blocks_mlp2 = (size_t)L * (size_t)E * seg2_blocks_loc;
-    if (total_blocks_mlp2) {
+    if (total_blocks_mlp2)
+    {
         launch_e8m0_to_f32(w->w_mlp2_scales, w->w_mlp2_scales_f32,
                            total_blocks_mlp2, stream);
     }
@@ -902,7 +934,6 @@ static void convert_all_scales_to_f32(GPUTransformerWeights* w, Config* p, hipSt
     printf("[MXFP4] Converted %zu MLP1 + %zu MLP2 scale blocks to f32\n",
            total_blocks_mlp1, total_blocks_mlp2);
 }
-
 
 void copy_weights_to_gpu(Transformer *transformer, GPUTransformerWeights *gpu_weights)
 {
@@ -997,7 +1028,7 @@ void copy_weights_to_gpu(Transformer *transformer, GPUTransformerWeights *gpu_we
         const int rank = dev % TP;
 
         // Stick to whichever name your Config uses
-        const int H = p->hidden_dim ;
+        const int H = p->hidden_dim;
         const int D = p->intermediate_dim;
         const int E = p->n_experts;
         const int L = p->n_layers;
@@ -1007,16 +1038,16 @@ void copy_weights_to_gpu(Transformer *transformer, GPUTransformerWeights *gpu_we
         {
             const int twoD = 2 * D;
             const int base = twoD / TP;
-            const int rem  = twoD % TP;
-            Oloc   = base + (rank < rem ? 1 : 0);
+            const int rem = twoD % TP;
+            Oloc = base + (rank < rem ? 1 : 0);
             Ostart = rank * base + (rank < rem ? rank : rem);
         }
         // Row-parallel shard for MLP2 (input D)
         int Kloc, Istart;
         {
             const int base = D / TP;
-            const int rem  = D % TP;
-            Kloc   = base + (rank < rem ? 1 : 0);
+            const int rem = D % TP;
+            Kloc = base + (rank < rem ? 1 : 0);
             Istart = rank * base + (rank < rem ? rank : rem);
         }
 
@@ -1027,9 +1058,10 @@ void copy_weights_to_gpu(Transformer *transformer, GPUTransformerWeights *gpu_we
             const size_t packed_per_layer = (elems_per_layer_shard + 1) / 2;
             const size_t scales_per_layer = (elems_per_layer_shard + 31) / 32;
 
-            for (int l = 0; l < L; ++l) {
+            for (int l = 0; l < L; ++l)
+            {
                 // Base of this layer’s experts block
-                const float* layer_base = w->w_mlp1 + (size_t)l * (size_t)E * per_exp_elems;
+                const float *layer_base = w->w_mlp1 + (size_t)l * (size_t)E * per_exp_elems;
 
                 // Gather across experts: rows=E, row_stride=per_exp_elems, row_len=Oloc*H,
                 // and start inside each expert at offset Ostart*H.
@@ -1043,16 +1075,15 @@ void copy_weights_to_gpu(Transformer *transformer, GPUTransformerWeights *gpu_we
                     /*stream*/ nullptr);
 
                 // ---- Debug first element (L=0, e=0, o=0, h=0 local) ----
-                if (l == 0) {
-                    const float cpu_v0 = *(w->w_mlp1 + (size_t)0 /*L*/ * (size_t)E * per_exp_elems
-                                                        + (size_t)0 /*e*/ * per_exp_elems
-                                                        + (size_t)Ostart * (size_t)H + 0);
+                if (l == 0)
+                {
+                    const float cpu_v0 = *(w->w_mlp1 + (size_t)0 /*L*/ * (size_t)E * per_exp_elems + (size_t)0 /*e*/ * per_exp_elems + (size_t)Ostart * (size_t)H + 0);
                     uint8_t h_byte = 0, h_scale = 127;
-                    HIP_CHECK(hipMemcpy(&h_byte,  gpu_weights->w_mlp1_mxfp4, 1, hipMemcpyDeviceToHost));
+                    HIP_CHECK(hipMemcpy(&h_byte, gpu_weights->w_mlp1_mxfp4, 1, hipMemcpyDeviceToHost));
                     HIP_CHECK(hipMemcpy(&h_scale, gpu_weights->w_mlp1_scales, 1, hipMemcpyDeviceToHost));
                     const uint8_t nib0 = (h_byte & 0x0F);
-                    const float   X    = ldexpf(1.0f, (int)h_scale - 127);
-                    const float   deq  = MXFP4_LUT_CPU[nib0] * X;
+                    const float X = ldexpf(1.0f, (int)h_scale - 127);
+                    const float deq = MXFP4_LUT_CPU[nib0] * X;
                     printf("[MXFP4][TP][MLP1] First elem: CPU=%g nib=%u e8m0=%u deq=%g\n",
                            (double)cpu_v0, (unsigned)nib0, (unsigned)h_scale, (double)deq);
                 }
@@ -1063,9 +1094,11 @@ void copy_weights_to_gpu(Transformer *transformer, GPUTransformerWeights *gpu_we
                 const size_t segb_full = (size_t)(2 * D);
                 __hip_bfloat16 *staging_b = (__hip_bfloat16 *)malloc((size_t)Oloc * sizeof(__hip_bfloat16));
                 size_t dev_off = 0;
-                for (int l = 0; l < L; ++l) {
+                for (int l = 0; l < L; ++l)
+                {
                     const float *base = w->b_mlp1 + (size_t)l * (size_t)E * segb_full;
-                    for (int e = 0; e < E; ++e) {
+                    for (int e = 0; e < E; ++e)
+                    {
                         convert_float_array_to_bfloat16(base + (size_t)e * segb_full + (size_t)Ostart,
                                                         staging_b, (size_t)Oloc);
                         HIP_CHECK(hipMemcpy(gpu_weights->b_mlp1 + dev_off,
@@ -1080,13 +1113,14 @@ void copy_weights_to_gpu(Transformer *transformer, GPUTransformerWeights *gpu_we
 
         // ===== MLP2: [L, E, H, D] =====
         {
-            const size_t per_exp_elems = (size_t)H * (size_t)D;       // CPU stride per expert
+            const size_t per_exp_elems = (size_t)H * (size_t)D; // CPU stride per expert
             const size_t elems_per_layer_shard = (size_t)E * (size_t)H * (size_t)Kloc;
             const size_t packed_per_layer = (elems_per_layer_shard + 1) / 2;
             const size_t scales_per_layer = (elems_per_layer_shard + 31) / 32;
 
-            for (int l = 0; l < L; ++l) {
-                const float* layer_base = w->w_mlp2 + (size_t)l * (size_t)E * per_exp_elems;
+            for (int l = 0; l < L; ++l)
+            {
+                const float *layer_base = w->w_mlp2 + (size_t)l * (size_t)E * per_exp_elems;
 
                 // Treat all (E*H) rows as back-to-back with row_stride=D; slice Kloc cols starting at Istart.
                 streaming_quantize_copy_mxfp4_cpu_to_gpu_strided(
@@ -1099,17 +1133,15 @@ void copy_weights_to_gpu(Transformer *transformer, GPUTransformerWeights *gpu_we
                     /*stream*/ nullptr);
 
                 // ---- Debug first element (L=0, e=0, h=0, k=0 local) ----
-                if (l == 0) {
-                    const float cpu_v0 = *(w->w_mlp2 + (size_t)0 /*L*/ * (size_t)E * per_exp_elems
-                                                        + (size_t)0 /*e*/ * per_exp_elems
-                                                        + (size_t)0 /*h*/ * (size_t)D
-                                                        + (size_t)Istart);
+                if (l == 0)
+                {
+                    const float cpu_v0 = *(w->w_mlp2 + (size_t)0 /*L*/ * (size_t)E * per_exp_elems + (size_t)0 /*e*/ * per_exp_elems + (size_t)0 /*h*/ * (size_t)D + (size_t)Istart);
                     uint8_t h_byte = 0, h_scale = 127;
-                    HIP_CHECK(hipMemcpy(&h_byte,  gpu_weights->w_mlp2_mxfp4, 1, hipMemcpyDeviceToHost));
+                    HIP_CHECK(hipMemcpy(&h_byte, gpu_weights->w_mlp2_mxfp4, 1, hipMemcpyDeviceToHost));
                     HIP_CHECK(hipMemcpy(&h_scale, gpu_weights->w_mlp2_scales, 1, hipMemcpyDeviceToHost));
                     const uint8_t nib0 = (h_byte & 0x0F);
-                    const float   X    = ldexpf(1.0f, (int)h_scale - 127);
-                    const float   deq  = MXFP4_LUT_CPU[nib0] * X;
+                    const float X = ldexpf(1.0f, (int)h_scale - 127);
+                    const float deq = MXFP4_LUT_CPU[nib0] * X;
                     printf("[MXFP4][TP][MLP2] First elem: CPU=%g nib=%u e8m0=%u deq=%g\n",
                            (double)cpu_v0, (unsigned)nib0, (unsigned)h_scale, (double)deq);
                 }
@@ -1119,8 +1151,10 @@ void copy_weights_to_gpu(Transformer *transformer, GPUTransformerWeights *gpu_we
             {
                 const float invTP = 1.0f / (float)TP;
                 __hip_bfloat16 *staging_b = (__hip_bfloat16 *)malloc((size_t)H * sizeof(__hip_bfloat16));
-                for (int l = 0; l < L; ++l) {
-                    for (int e = 0; e < E; ++e) {
+                for (int l = 0; l < L; ++l)
+                {
+                    for (int e = 0; e < E; ++e)
+                    {
                         const float *base = w->b_mlp2 + ((size_t)l * (size_t)E + (size_t)e) * (size_t)H;
                         convert_float_array_to_bfloat16_scaled(base, staging_b, (size_t)H, invTP);
                         const size_t dev_off = ((size_t)l * (size_t)E + (size_t)e) * (size_t)H;
@@ -1137,10 +1171,6 @@ void copy_weights_to_gpu(Transformer *transformer, GPUTransformerWeights *gpu_we
 
     printf("Weights copied (TP optimized): per-layer strided-gather tiling for MLP1/MLP2, biases BF16.\n");
 }
-
-
-
-
 
 void malloc_cpu_buffers(CPUBuffers *cpu_buf, Config *p)
 {
@@ -1489,24 +1519,91 @@ void attention_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size,
     }
     // 6) fused attention
     {
-        // TIMER_BLOCK("fused_attention_kernel_attention");
-        const bool apply_window = (p->sliding_window > 0) && ((layer_idx & 1) == 0);
-        constexpr int HOST_WARPSIZE = 64;
-        dim3 grid(batch_size, NA);
-        dim3 block(256);
-        const int warps = (block.x + HOST_WARPSIZE - 1) / HOST_WARPSIZE;
-        const size_t att_cap = apply_window ? (SW_WINDOW + 1) : MAX_SEQ_LEN;
-        const size_t shmem = (att_cap + (size_t)warps * Hd + warps) * sizeof(float);
-        assert_smem_or_die(shmem, "fused_attention_kernel");
+        const int B = batch_size;
+        const int H = NA;   // n_attn_heads
+        const int NKv = NK; // n_kv_heads
+        const int D = Hd;
 
-        hipLaunchKernelGGL(fused_attention_kernel, grid, block, shmem, sAttn,
-                           tb_mb, q_mb, key_cache_mb, value_cache_mb,
-                           w->attn_sinks + (size_t)layer_idx * NA,
-                           s->mask, pos_mb, batch_size,
-                           NA, NK, Hd, MAX_SEQ_LEN, p->n_layers, layer_idx,
-                           p->sliding_window > 0,
-                           /* batch_kv_stride = */ layers_capacity * (size_t)KV,
-                           /* layer_kv_offset = */ layer_elem_offset);
+        // GQA ratio: heads per KV head
+        const int kv_mul = H / NKv;
+
+        // SW cap: even layers use sliding window, odd layers use full length (cap@112)
+        const int sw_cap = (p->sliding_window > 0 && ((layer_idx & 1) == 0))
+                               ? SW_WINDOW
+                               : 112;
+
+        // Target the tuned winner, but respect the SW cap
+        int T = std::min(48, sw_cap);
+
+        // Block/grid mapping identical to launch_optimized:
+        // 64 lanes × kv_mul warps = 512 threads (for kv_mul=8)
+        dim3 block(64, kv_mul, 1);
+        dim3 grid(NKv, B, 1);
+
+        // Shared memory footprint must match the kernel:
+        // 2 * tile_t * PADDED_HEAD_DIM * sizeof(storage_type)
+        constexpr int PADDED_HEAD_DIM = 72;
+
+        size_t shmem =
+#if defined(OPT_STORE_SHARED_AS_F32) && OPT_STORE_SHARED_AS_F32
+            (size_t)2 * (size_t)T * (size_t)PADDED_HEAD_DIM * sizeof(float);
+#else
+            (size_t)2 * (size_t)T * (size_t)PADDED_HEAD_DIM * sizeof(__hip_bfloat16);
+#endif
+
+        // Cap tile_t against device max dynamic shared memory, like launch_optimized
+        auto get_max_dyn_shmem = []() -> size_t
+        {
+            int dev = 0, basic = 0;
+            HIP_CHECK(hipGetDevice(&dev));
+            hipError_t st = hipDeviceGetAttribute(
+                &basic, hipDeviceAttributeMaxSharedMemoryPerBlock, dev);
+            if (st != hipSuccess || basic <= 0)
+                basic = 64 * 1024; // safe fallback
+            return (size_t)basic;
+        };
+
+        const size_t max_dyn = get_max_dyn_shmem();
+        if (max_dyn > 0 && shmem > max_dyn)
+        {
+            // Compute max tile that fits and clamp T
+            int max_tile =
+#if defined(OPT_STORE_SHARED_AS_F32) && OPT_STORE_SHARED_AS_F32
+                (int)(max_dyn / (2 * PADDED_HEAD_DIM * sizeof(float)));
+#else
+                (int)(max_dyn / (2 * PADDED_HEAD_DIM * sizeof(__hip_bfloat16)));
+#endif
+            max_tile = std::max(1, std::min(max_tile, sw_cap));
+            T = std::min(T, max_tile);
+
+            // Recompute shmem with the clamped T
+            shmem =
+#if defined(OPT_STORE_SHARED_AS_F32) && OPT_STORE_SHARED_AS_F32
+                (size_t)2 * (size_t)T * (size_t)PADDED_HEAD_DIM * sizeof(float);
+#else
+                (size_t)2 * (size_t)T * (size_t)PADDED_HEAD_DIM * sizeof(__hip_bfloat16);
+#endif
+        }
+
+        // Request dynamic LDS (ignore return; not required on all stacks)
+        (void)hipFuncSetAttribute(
+            (const void *)fused_attention_kernel_optimized_3,
+            hipFuncAttributeMaxDynamicSharedMemorySize,
+            (int)shmem);
+
+        hipLaunchKernelGGL(
+            fused_attention_kernel_optimized_3,
+            grid, block, shmem, sAttn,
+            tb_mb, q_mb, key_cache_mb, value_cache_mb,
+            w->attn_sinks + (size_t)layer_idx * NA,
+            s->mask, pos_mb,
+            batch_size, NA, NKv, Hd,
+            MAX_SEQ_LEN, p->n_layers, layer_idx,
+            p->sliding_window > 0,
+            /* batch_kv_stride = */ layers_capacity * (size_t)KV,
+            /* layer_kv_offset = */ layer_elem_offset,
+            /* tile_t = */ T // == 48 unless clamped by caps above
+        );
 
         HIP_CHECK(hipGetLastError());
     }
@@ -1533,8 +1630,6 @@ void attention_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size,
         HIP_CHECK(hipGetLastError());
     }
 }
-
-
 
 // Split helpers
 static inline void mlp1_shard(int twoD, int tp_size, int r, int &o_start, int &o_len)
@@ -1649,8 +1744,8 @@ void moe_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size,
     {
         // TIMER_BLOCK("router_topk_softmax_moe");
         matmul_mc(s->router_score_g, s->gather_x_g,
-              w->w_router + (size_t)layer_idx * H * E, Bgrp, H, E, sMoe);
-            }
+                  w->w_router + (size_t)layer_idx * H * E, Bgrp, H, E, sMoe);
+    }
     HIP_CHECK(hipGetLastError());
     {
         const int elems = Bgrp * E;
@@ -1743,117 +1838,116 @@ void moe_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size,
     }
 
     // 5) MLP1 (column-parallel on O=2D): local shard, MXFP4
-int o_len = 0;
-{
-    // TIMER_BLOCK("mlp1_mxfp4_moe");
-    const int twoD = 2 * D;
-    const int base = twoD / TP;
-    const int rem  = twoD % TP;
-    o_len = base + (rank_in_group < rem ? 1 : 0);
+    int o_len = 0;
+    {
+        // TIMER_BLOCK("mlp1_mxfp4_moe");
+        const int twoD = 2 * D;
+        const int base = twoD / TP;
+        const int rem = twoD % TP;
+        o_len = base + (rank_in_group < rem ? 1 : 0);
 
-    // Local-shard MXFP4 segment sizes: N=o_len, K=H
-    const size_t seg1_elems_loc        = (size_t)o_len * (size_t)H;
-    const size_t seg1_packed_bytes_loc = (seg1_elems_loc + 1) / 2;   // 2×4-bit packed
-    const size_t seg1_blocks_loc       = (seg1_elems_loc + 31) / 32; // per-32 elems scale
+        // Local-shard MXFP4 segment sizes: N=o_len, K=H
+        const size_t seg1_elems_loc = (size_t)o_len * (size_t)H;
+        const size_t seg1_packed_bytes_loc = (seg1_elems_loc + 1) / 2; // 2×4-bit packed
+        const size_t seg1_blocks_loc = (seg1_elems_loc + 31) / 32;     // per-32 elems scale
 
-    // Per-layer bases for *local shard* (weights for this rank are pre-sharded)
-    const size_t layer_pack_off = (size_t)layer_idx * (size_t)E * seg1_packed_bytes_loc;
-    const size_t layer_sc_off   = (size_t)layer_idx * (size_t)E * seg1_blocks_loc;
+        // Per-layer bases for *local shard* (weights for this rank are pre-sharded)
+        const size_t layer_pack_off = (size_t)layer_idx * (size_t)E * seg1_packed_bytes_loc;
+        const size_t layer_sc_off = (size_t)layer_idx * (size_t)E * seg1_blocks_loc;
 
-    const uint8_t        *W1_packed_layer = w->w_mlp1_mxfp4 + layer_pack_off;
-    const float        *S1_layer        = w->w_mlp1_scales_f32 + layer_sc_off;
+        const uint8_t *W1_packed_layer = w->w_mlp1_mxfp4 + layer_pack_off;
+        const float *S1_layer = w->w_mlp1_scales_f32 + layer_sc_off;
 
-    dim3 grid((o_len + BLOCK_N_MLP - 1) / BLOCK_N_MLP, cur_tiles);
-    dim3 block(LANE_PER_WAVE, WAVES_PER_BLOCK_MLP);
+        dim3 grid((o_len + BLOCK_N_MLP - 1) / BLOCK_N_MLP, cur_tiles);
+        dim3 block(LANE_PER_WAVE, WAVES_PER_BLOCK_MLP);
 
-    const int ldA = BLOCK_K_MLP + PAD_K_MLP;
-    const int ldB = BLOCK_K_MLP + PAD_K_MLP;
-    const size_t shmem =
-        sizeof(uint16_t) * (size_t)(
-            2 * BLOCK_M_MLP * ldA +      // sA0, sA1
-            2 * ldB * BLOCK_N_MLP        // sB0, sB1
-        );
+        const int ldA = BLOCK_K_MLP + PAD_K_MLP;
+        const int ldB = BLOCK_K_MLP + PAD_K_MLP;
+        const size_t shmem =
+            sizeof(uint16_t) * (size_t)(2 * BLOCK_M_MLP * ldA + // sA0, sA1
+                                        2 * ldB * BLOCK_N_MLP   // sB0, sB1
+                               );
 
-    assert_smem_or_die(shmem, "grouped_mlp1_mxfp4_kernel(TP)");
-    hipLaunchKernelGGL(grouped_mlp1_mxfp4_kernel, grid, block, shmem, sMoe,
-                       s->mlp1_out_g,              // [total_tokens, o_len] float
-                       s->expert_input_buffer_g,   // [total_tokens, H]     float
-                       W1_packed_layer,            // packed MXFP4 (local shard)
-                       S1_layer,                   // e8m0 scales (local shard)
-                       s->d_expert_offsets, s->d_expert_counts,
-                       s->d_tile2expert_g, s->d_tile2local_g,
-                       E, /*K=*/H, /*N=*/o_len);
-    HIP_CHECK(hipGetLastError());
-}
-
-// 6) SwiGLU + bias for local columns -> gate_up_g with Dloc = o_len/2
-const int Dloc = o_len / 2;
-{
-    // TIMER_BLOCK("swiglu_epilogue_moe");
-    // b_mlp1 is sharded the same as o_len
-    const __hip_bfloat16 *b1 = w->b_mlp1 + (size_t)layer_idx * (size_t)E * (size_t)o_len;
-
-    const size_t work = (size_t)total_tokens * Dloc;
-    if (work > 0) {
-        const int T = 256;
-        dim3 grid2((int)((work + T - 1) / T)), block2(T);
-        bias_swiglu_epilogue_kernel<<<grid2, block2, 0, sMoe>>>(
-            s->mlp1_out_g, b1,
-            s->d_expert_offsets, s->d_expert_counts, E,
-            s->gate_up_g, /*D=*/Dloc, total_tokens, p->swiglu_limit, 1.702f);
+        assert_smem_or_die(shmem, "grouped_mlp1_mxfp4_kernel(TP)");
+        hipLaunchKernelGGL(grouped_mlp1_mxfp4_kernel, grid, block, shmem, sMoe,
+                           s->mlp1_out_g,            // [total_tokens, o_len] float
+                           s->expert_input_buffer_g, // [total_tokens, H]     float
+                           W1_packed_layer,          // packed MXFP4 (local shard)
+                           S1_layer,                 // e8m0 scales (local shard)
+                           s->d_expert_offsets, s->d_expert_counts,
+                           s->d_tile2expert_g, s->d_tile2local_g,
+                           E, /*K=*/H, /*N=*/o_len);
         HIP_CHECK(hipGetLastError());
     }
-}
 
-// 7) MLP2 (row-parallel on input D) (+bias H full, pre-scaled by 1/TP), MXFP4
-{
-    // TIMER_BLOCK("mlp2_mxfp4_moe");
-    int i_len, i_start;
+    // 6) SwiGLU + bias for local columns -> gate_up_g with Dloc = o_len/2
+    const int Dloc = o_len / 2;
     {
-        const int base = D / TP, rem = D % TP;
-        i_len   = base + (rank_in_group < rem ? 1 : 0);
-        i_start = rank_in_group * base + (rank_in_group < rem ? rank_in_group : rem);
+        // TIMER_BLOCK("swiglu_epilogue_moe");
+        // b_mlp1 is sharded the same as o_len
+        const __hip_bfloat16 *b1 = w->b_mlp1 + (size_t)layer_idx * (size_t)E * (size_t)o_len;
+
+        const size_t work = (size_t)total_tokens * Dloc;
+        if (work > 0)
+        {
+            const int T = 256;
+            dim3 grid2((int)((work + T - 1) / T)), block2(T);
+            bias_swiglu_epilogue_kernel<<<grid2, block2, 0, sMoe>>>(
+                s->mlp1_out_g, b1,
+                s->d_expert_offsets, s->d_expert_counts, E,
+                s->gate_up_g, /*D=*/Dloc, total_tokens, p->swiglu_limit, 1.702f);
+            HIP_CHECK(hipGetLastError());
+        }
     }
-    if (i_len != Dloc) {
-        fprintf(stderr, "MLP2 shard mismatch: i_len=%d vs Dloc=%d\n", i_len, Dloc);
-        abort();
+
+    // 7) MLP2 (row-parallel on input D) (+bias H full, pre-scaled by 1/TP), MXFP4
+    {
+        // TIMER_BLOCK("mlp2_mxfp4_moe");
+        int i_len, i_start;
+        {
+            const int base = D / TP, rem = D % TP;
+            i_len = base + (rank_in_group < rem ? 1 : 0);
+            i_start = rank_in_group * base + (rank_in_group < rem ? rank_in_group : rem);
+        }
+        if (i_len != Dloc)
+        {
+            fprintf(stderr, "MLP2 shard mismatch: i_len=%d vs Dloc=%d\n", i_len, Dloc);
+            abort();
+        }
+
+        // Local-shard MXFP4 segment sizes: N=H, K=i_len
+        const size_t seg2_elems_loc = (size_t)H * (size_t)i_len;
+        const size_t seg2_packed_bytes_loc = (seg2_elems_loc + 1) / 2;
+        const size_t seg2_blocks_loc = (seg2_elems_loc + 31) / 32;
+
+        const size_t layer_pack_off = (size_t)layer_idx * (size_t)E * seg2_packed_bytes_loc;
+        const size_t layer_sc_off = (size_t)layer_idx * (size_t)E * seg2_blocks_loc;
+
+        const uint8_t *W2_packed_layer = w->w_mlp2_mxfp4 + layer_pack_off; // local shard
+        const float *S2_layer = w->w_mlp2_scales_f32 + layer_sc_off;       // local shard
+        const __hip_bfloat16 *b2s = w->b_mlp2 + (size_t)layer_idx * (size_t)E * (size_t)H;
+
+        dim3 grid((H + BLOCK_N_MLP - 1) / BLOCK_N_MLP, cur_tiles);
+        dim3 block(LANE_PER_WAVE, WAVES_PER_BLOCK_MLP);
+
+        const int ldA = BLOCK_K_MLP + PAD_K_MLP;
+        const int ldB = BLOCK_K_MLP + PAD_K_MLP;
+        const size_t shmem =
+            sizeof(uint16_t) * (size_t)(2 * BLOCK_M_MLP * ldA + // sA0, sA1
+                                        2 * ldB * BLOCK_N_MLP   // sB0, sB1
+                               );
+
+        assert_smem_or_die(shmem, "grouped_mlp2_mxfp4_bias_kernel(TP)");
+        hipLaunchKernelGGL(grouped_mlp2_mxfp4_bias_kernel, grid, block, shmem, sMoe,
+                           s->expert_output_partial_g, // [total_tokens, H] float (partial)
+                           s->gate_up_g,               // [total_tokens, i_len] float
+                           W2_packed_layer, S2_layer,  // MXFP4 local shard
+                           b2s,                        // bf16 bias [E,H]
+                           s->d_expert_offsets, s->d_expert_counts,
+                           s->d_tile2expert_g, s->d_tile2local_g,
+                           E, /*K=*/i_len, /*N=*/H);
+        HIP_CHECK(hipGetLastError());
     }
-
-    // Local-shard MXFP4 segment sizes: N=H, K=i_len
-    const size_t seg2_elems_loc        = (size_t)H * (size_t)i_len;
-    const size_t seg2_packed_bytes_loc = (seg2_elems_loc + 1) / 2;
-    const size_t seg2_blocks_loc       = (seg2_elems_loc + 31) / 32;
-
-    const size_t layer_pack_off = (size_t)layer_idx * (size_t)E * seg2_packed_bytes_loc;
-    const size_t layer_sc_off   = (size_t)layer_idx * (size_t)E * seg2_blocks_loc;
-
-    const uint8_t        *W2_packed_layer = w->w_mlp2_mxfp4 + layer_pack_off; // local shard
-    const float        *S2_layer        = w->w_mlp2_scales_f32 + layer_sc_off;  // local shard
-    const __hip_bfloat16 *b2s             = w->b_mlp2 + (size_t)layer_idx * (size_t)E * (size_t)H;
-
-    dim3 grid((H + BLOCK_N_MLP - 1) / BLOCK_N_MLP, cur_tiles);
-    dim3 block(LANE_PER_WAVE, WAVES_PER_BLOCK_MLP);
-
-    const int ldA = BLOCK_K_MLP + PAD_K_MLP;
-    const int ldB = BLOCK_K_MLP + PAD_K_MLP;
-    const size_t shmem =
-    sizeof(uint16_t) * (size_t)(
-        2 * BLOCK_M_MLP * ldA +      // sA0, sA1
-        2 * ldB * BLOCK_N_MLP        // sB0, sB1
-    );
-
-    assert_smem_or_die(shmem, "grouped_mlp2_mxfp4_bias_kernel(TP)");
-    hipLaunchKernelGGL(grouped_mlp2_mxfp4_bias_kernel, grid, block, shmem, sMoe,
-                       s->expert_output_partial_g,    // [total_tokens, H] float (partial)
-                       s->gate_up_g,                  // [total_tokens, i_len] float
-                       W2_packed_layer, S2_layer,     // MXFP4 local shard
-                       b2s,                           // bf16 bias [E,H]
-                       s->d_expert_offsets, s->d_expert_counts,
-                       s->d_tile2expert_g, s->d_tile2local_g,
-                       E, /*K=*/i_len, /*N=*/H);
-    HIP_CHECK(hipGetLastError());
-}
-
 
     // Ensure partial results are ready before cross-rank reduction
     HIP_CHECK(hipStreamSynchronize(sMoe));
