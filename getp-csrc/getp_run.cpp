@@ -1111,7 +1111,7 @@ void attention_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size,
 
     // Request dynamic LDS (ignore return; not required on all stacks)
     (void)hipFuncSetAttribute(
-        (const void*)fused_attention_kernel_optimized,
+        (const void*)fused_attention_kernel_optimized_3,
         hipFuncAttributeMaxDynamicSharedMemorySize,
         (int)shmem
     );
