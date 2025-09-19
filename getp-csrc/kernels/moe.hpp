@@ -729,7 +729,7 @@ __device__ inline void copy_A_tile_vec_MLP(uint32_t* __restrict__ dst_u32,
 }
 
 #ifndef PAD_K_MLP
-#define PAD_K_MLP 0   // try 2 or 8 if you see LDS conflicts
+#define PAD_K_MLP 8   // try 2 or 8 if you see LDS conflicts
 #endif
 static_assert((BLOCK_K_MLP % 2) == 0, "BLOCK_K_MLP must be even (packs 2×bf16).");
 static_assert((PAD_K_MLP % 2) == 0, "PAD_K_MLP must be even (u32 pair addressing).");
