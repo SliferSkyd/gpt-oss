@@ -1044,66 +1044,95 @@ void attention_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size,
             /* layer_kv_offset = */ layer_elem_offset);
     }
     // 6) fused attention
-     {
-        // TIMER_BLOCK("fused_attention_kernel_streaming");
+     // --- optimized launch (tile_t = 48, same policy as launch_optimized) ---
+{
+    const int B   = batch_size;
+    const int H   = NA;   // n_attn_heads
+    const int NKv = NK;   // n_kv_heads
+    const int D   = Hd;
 
-        const int B  = batch_size;
-        const int H  = NA;        // n_attn_heads
-        const int NKv= NK;        // n_kv_heads
-        const int D  = Hd;
+    // GQA ratio: heads per KV head
+    const int kv_mul = H / NKv;
 
-        // Heads per KV head (GQA)
-        const int kv_mul = H / NKv;
+    // SW cap: even layers use sliding window, odd layers use full length (cap@112)
+    const int sw_cap = (p->sliding_window > 0 && ((layer_idx & 1) == 0))
+                       ? SW_WINDOW
+                       : 112;
 
-        // --- Choose tile_t so that 2*T*D*4 <= 64 KiB (MI250 LDS per block) ---
-        const size_t LDS_LIMIT = 64ull * 1024ull;               // 65,536 bytes
-        const size_t per_row   = (size_t)2 * (size_t)D * sizeof(float);
-        int T = 64;                                             // target
-        if (per_row * (size_t)T > LDS_LIMIT) {
-            T = (int)(LDS_LIMIT / per_row);                     // floor
-            if (T < 1) T = 1;
-            // round T down to a friendly small multiple
-            if (T >= 64)      T = 64;
-            else if (T >= 48) T = 48;
-            else if (T >= 32) T = 32;
-            else if (T >= 16) T = 16;
-            else if (T >= 8)  T = 8;
-            else if (T >= 4)  T = 4;
-            else              T = 1;
-        }
+    // Target the tuned winner, but respect the SW cap
+    int T = std::min(48, sw_cap);
 
-        // --- Block shape: 64 lanes × warps_y (<= 16 → 1024 threads max) ---
-        const int warps_y_cap = 16;                   // 64*16 = 1024 threads
-        const int warps_y     = std::min(kv_mul, warps_y_cap);
-        dim3 block(64, warps_y);
+    // Block/grid mapping identical to launch_optimized:
+    // 64 lanes × kv_mul warps = 512 threads (for kv_mul=8)
+    dim3 block(64, kv_mul, 1);
+    dim3 grid(NKv, B, 1);
 
-        // Grid: (kv heads, batch)
-        dim3 grid(NKv, B);
+    // Shared memory footprint must match the kernel:
+    // 2 * tile_t * PADDED_HEAD_DIM * sizeof(storage_type)
+    constexpr int PADDED_HEAD_DIM = 72;
 
-        // fused_attention_kernel_optimized_3 uses:
-        // - PADDED_HEAD_DIM = 72 (64 + 8 padding to avoid bank conflicts)
-        // - __hip_bfloat16 for shared memory (not float)
-        // Calculate shared memory to match what the kernel actually uses
-        const size_t PADDED_HEAD_DIM = 72;
-        const size_t shmem = (size_t)2 * (size_t)T * PADDED_HEAD_DIM * sizeof(__hip_bfloat16);
-        assert_smem_or_die(shmem, "fused_attention_kernel_optimized_3");
+    size_t shmem =
+    #if defined(OPT_STORE_SHARED_AS_F32) && OPT_STORE_SHARED_AS_F32
+        (size_t)2 * (size_t)T * (size_t)PADDED_HEAD_DIM * sizeof(float);
+    #else
+        (size_t)2 * (size_t)T * (size_t)PADDED_HEAD_DIM * sizeof(__hip_bfloat16);
+    #endif
 
-        hipLaunchKernelGGL(
-            fused_attention_kernel_optimized_3,
-            grid, block, shmem, sAttn,
-            tb_mb, q_mb, key_cache_mb, value_cache_mb,
-            w->attn_sinks + (size_t)layer_idx * NA,
-            s->mask, pos_mb,
-            batch_size, NA, NKv, Hd,
-            MAX_SEQ_LEN, p->n_layers, layer_idx,
-            p->sliding_window > 0,
-            /* batch_kv_stride = */ layers_capacity * (size_t)KV,
-            /* layer_kv_offset = */ layer_elem_offset,
-            /* tile_t = */ T
-        );
+    // Cap tile_t against device max dynamic shared memory, like launch_optimized
+    auto get_max_dyn_shmem = []() -> size_t {
+        int dev = 0, basic = 0;
+        HIP_CHECK(hipGetDevice(&dev));
+        hipError_t st = hipDeviceGetAttribute(
+            &basic, hipDeviceAttributeMaxSharedMemoryPerBlock, dev);
+        if (st != hipSuccess || basic <= 0) basic = 64 * 1024; // safe fallback
+        return (size_t)basic;
+    };
 
-        HIP_CHECK(hipGetLastError());
+    const size_t max_dyn = get_max_dyn_shmem();
+    if (max_dyn > 0 && shmem > max_dyn) {
+        // Compute max tile that fits and clamp T
+        int max_tile =
+        #if defined(OPT_STORE_SHARED_AS_F32) && OPT_STORE_SHARED_AS_F32
+            (int)(max_dyn / (2 * PADDED_HEAD_DIM * sizeof(float)));
+        #else
+            (int)(max_dyn / (2 * PADDED_HEAD_DIM * sizeof(__hip_bfloat16)));
+        #endif
+        max_tile = std::max(1, std::min(max_tile, sw_cap));
+        T = std::min(T, max_tile);
+
+        // Recompute shmem with the clamped T
+        shmem =
+        #if defined(OPT_STORE_SHARED_AS_F32) && OPT_STORE_SHARED_AS_F32
+            (size_t)2 * (size_t)T * (size_t)PADDED_HEAD_DIM * sizeof(float);
+        #else
+            (size_t)2 * (size_t)T * (size_t)PADDED_HEAD_DIM * sizeof(__hip_bfloat16);
+        #endif
     }
+
+    // Request dynamic LDS (ignore return; not required on all stacks)
+    (void)hipFuncSetAttribute(
+        (const void*)fused_attention_kernel_optimized,
+        hipFuncAttributeMaxDynamicSharedMemorySize,
+        (int)shmem
+    );
+
+    hipLaunchKernelGGL(
+        fused_attention_kernel_optimized_3,
+        grid, block, shmem, sAttn,
+        tb_mb, q_mb, key_cache_mb, value_cache_mb,
+        w->attn_sinks + (size_t)layer_idx * NA,
+        s->mask, pos_mb,
+        batch_size, NA, NKv, Hd,
+        MAX_SEQ_LEN, p->n_layers, layer_idx,
+        p->sliding_window > 0,
+        /* batch_kv_stride = */ layers_capacity * (size_t)KV,
+        /* layer_kv_offset = */ layer_elem_offset,
+        /* tile_t = */ T   // == 48 unless clamped by caps above
+    );
+
+    HIP_CHECK(hipGetLastError());
+}
+
     // 7) fused output projection
     {
         // TIMER_BLOCK("fused_output_projection_kernel_optimized");
