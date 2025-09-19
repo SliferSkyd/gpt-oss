@@ -8,4 +8,9 @@
 
 #define MAX_GPUS 8
 
-#define TENSOR_PARALLEL_SIZE 2   // change as you like
+#define TENSOR_PARALLEL_SIZE 4   // change as you like
+
+#ifndef RING_TILE_BYTES
+// 8 MiB tile; tune 4–32 MiB depending on your platform
+#define RING_TILE_BYTES (8u << 20)
+#endif

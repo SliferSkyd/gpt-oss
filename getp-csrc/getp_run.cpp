@@ -30,6 +30,7 @@
 #include <queue>
 #include <vector>
 #include "nccl.hpp" // <— NCCL/RCCL-free TP collectives/helpers
+#include "tp_ring.hpp"
 
 #include <chrono>
 
@@ -1704,41 +1705,22 @@ void moe_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size,
     tp_group_barrier(tp);
 
     // 1) ALL-GATHER normalized inputs across TP into gather_x_g[Bgrp,H]
+    // Each rank contributes [bs_local, H] in s->t + row_offset*H
+    // Place result rank-major in s->gather_x_g: [TP*bs_local, H]
     {
-        // TIMER_BLOCK("moe_allgather");
-        // self copy
-        float *dst_self = s->gather_x_g + (size_t)rank_in_group * bs_local * H;
-        float *src_self = s->t + (size_t)row_offset * H;
-        HIP_CHECK(hipMemcpyAsync(dst_self, src_self,
-                                 (size_t)bs_local * H * sizeof(float),
-                                 hipMemcpyDeviceToDevice, sMoe));
-        // peer copies
-        for (int r = 0; r < TP; ++r)
-        {
+        const int TP = tp.tp_size;
+        float* peers[MAX_TP];
+        for (int r = 0; r < TP; ++r) {
             const int peer_dev = group_base + r;
-            if (peer_dev == my_dev)
-                continue;
-            float *dst = s->gather_x_g + (size_t)r * bs_local * H;
-            float *peer_src = gpu_transformers[peer_dev]->state.t + (size_t)row_offset * H;
-
-            if (tp.p2p[rank_in_group][r])
-            {
-                HIP_CHECK(hipMemcpyPeerAsync(dst, my_dev, peer_src, peer_dev,
-                                             (size_t)bs_local * H * sizeof(float), sMoe));
-            }
-            else
-            {
-                HIP_CHECK(hipMemcpyAsync(cpu->tp_host_stage, peer_src,
-                                         (size_t)bs_local * H * sizeof(float),
-                                         hipMemcpyDeviceToHost, sMoe));
-                HIP_CHECK(hipMemcpyAsync(dst, cpu->tp_host_stage,
-                                         (size_t)bs_local * H * sizeof(float),
-                                         hipMemcpyHostToDevice, sMoe));
-            }
+            peers[r] = gpu_transformers[peer_dev]->state.gather_x_g; // peer dst base
         }
-        HIP_CHECK(hipStreamSynchronize(sMoe));
+
+        float* my_dst = s->gather_x_g;
+        const float* my_src = s->t + (size_t)row_offset * H;
+        ring_allgather_rows(my_dst, my_src, /*R_local=*/bs_local, /*C=*/H, peers, tp, sMoe);
     }
-    tp_group_barrier(tp);
+
+    // tp_group_barrier(tp);
 
     // 2) Router on union -> topk indices/weights (softmax on top-k scores)
     {
@@ -1816,13 +1798,16 @@ void moe_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size,
     if (total_tokens > 0)
     {
         // TIMER_BLOCK("route_and_pack_fused_kernel_moe");
-        int threads = 1;
-        while (threads < Bgrp)
-            threads <<= 1;
-        threads = min(threads, 1024); // hardware cap
+        // Round up to next power-of-two AND a multiple of warpSize (64 on MI250)
+        auto next_pow2 = [](int v){ v--; v |= v>>1; v |= v>>2; v |= v>>4; v |= v>>8; v |= v>>16; return v+1; };
+        int threads = next_pow2(Bgrp);
+        threads = max(threads, warpSize);
+        threads = (threads + (warpSize-1)) & ~(warpSize-1);
+        threads = min(threads, 1024);
 
-        // 5 arrays of int[T]
-        size_t shmem = (size_t)threads * 5 * sizeof(int) + sizeof(int);
+        // shared: nwarps*2 + T*2 + 1 ints
+        int nwarps = (threads + warpSize - 1) / warpSize;
+        size_t shmem = (size_t)(nwarps*2 + threads*2 + 1) * sizeof(int);
 
         route_and_pack_fused_kernel<<<E, threads, shmem, sMoe>>>(
             s->gather_x_g, Bgrp, H,
@@ -1830,6 +1815,7 @@ void moe_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size,
             s->d_expert_offsets, E,
             s->local_ids_g, s->local_wts_g,
             s->expert_input_buffer_g);
+
     }
     else
     {
@@ -1953,47 +1939,25 @@ void moe_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size,
     HIP_CHECK(hipStreamSynchronize(sMoe));
     tp_group_barrier(tp);
 
-    // 8) Emulate ALL-REDUCE across TP on [total_tokens, H]
+    // 8) Ring ALL-REDUCE across TP on [total_tokens, H] in-place
     {
-        // TIMER_BLOCK("moe_allreduce");
-        const size_t bytes = (size_t)total_tokens * H * sizeof(float);
-        const size_t span = (size_t)total_tokens * H;
+    const size_t elems = (size_t)total_tokens * H;
 
-        // self
-        HIP_CHECK(hipMemcpyAsync(
-            s->expert_output_gather_g + (size_t)rank_in_group * span,
-            s->expert_output_partial_g, bytes,
-            hipMemcpyDeviceToDevice, sMoe));
-
-        // peers
-        for (int r = 0; r < TP; ++r)
-        {
-            const int peer_dev = group_base + r;
-            if (peer_dev == my_dev)
-                continue;
-            float *peer_src = gpu_transformers[peer_dev]->state.expert_output_partial_g;
-            float *dst = s->expert_output_gather_g + (size_t)r * span;
-
-            if (tp.p2p[rank_in_group][r])
-            {
-                HIP_CHECK(hipMemcpyPeerAsync(dst, my_dev, peer_src, peer_dev, bytes, sMoe));
-            }
-            else
-            {
-                HIP_CHECK(hipMemcpyAsync(cpu->tp_host_stage, peer_src, bytes, hipMemcpyDeviceToHost, sMoe));
-                HIP_CHECK(hipMemcpyAsync(dst, cpu->tp_host_stage, bytes, hipMemcpyHostToDevice, sMoe));
-            }
-        }
-        HIP_CHECK(hipStreamSynchronize(sMoe));
-        tp_group_barrier(tp);
-
-        // sum across ranks -> expert_output_partial_g
-        const size_t total = (size_t)total_tokens * H;
-        const int BLK = 256, GRD = (int)((total + BLK - 1) / BLK);
-        sum_rank_axis_kernel<<<GRD, BLK, 0, sMoe>>>(
-            s->expert_output_partial_g, s->expert_output_gather_g, TP, total_tokens, H);
-        HIP_CHECK(hipGetLastError());
+    // Build peer base pointers (group-local order 0..TP-1)
+    float* peer_bufs[MAX_TP];
+    for (int r = 0; r < TP; ++r) {
+        const int peer_dev = group_base + r;
+        peer_bufs[r] = gpu_transformers[peer_dev]->state.expert_output_partial_g;
     }
+
+    ring_allreduce_sum(
+        /*buf_local=*/s->expert_output_partial_g,
+        /*peer_bases=*/peer_bufs,
+        /*N_elems=*/elems,
+        /*tp=*/tp,
+        /*s=*/sMoe);
+    }
+
 
     // 9) Reduce over experts back to tokens (union) -> e_agg_g[Bgrp,H]
     {
