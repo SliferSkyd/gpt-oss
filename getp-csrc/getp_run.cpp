@@ -1599,6 +1599,11 @@ void warm_up(Transformer *transformer, Tokenizer *tokenizer)
     Config *p = &transformer->config;
     if(p->n_experts == 32) IS_20B_MODEL = 1;
     else IS_20B_MODEL = 0;
+
+    if(IS_20B_MODEL) BATCH_SIZE = 1024;
+    else BATCH_SIZE = 512;
+
+
     HIP_CHECK(hipGetDeviceCount(&num_gpus));
     if (num_gpus > MAX_GPUS)
         num_gpus = MAX_GPUS;
