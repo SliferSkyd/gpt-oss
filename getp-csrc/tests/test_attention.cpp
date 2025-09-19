@@ -662,49 +662,69 @@ static size_t get_device_max_dyn_shmem() {
 
 
 // ---- Optimized launch helper from attention.hpp (unchanged API) ----
+// static void launch_optimized(
+//     dim3 /*grid_ignored*/, dim3 /*block_ignored*/, size_t /*shmem_ignored*/, hipStream_t stream,
+//     float* out, const float* q,
+//     const __hip_bfloat16* key_cache, const __hip_bfloat16* value_cache,
+//     const __hip_bfloat16* sinks, const float* mask, const int* seq_lengths,
+//     int batch_size, int n_heads, int n_kv_heads, int head_dim,
+//     int seq_len, int n_layers, int layer_idx, bool use_sw,
+//     size_t batch_kv_stride, size_t layer_kv_offset, int tile_t_in)
+// {
+//   // This helper matches the host launcher you had before (specialized for D=64).
+//   if (batch_size <= 0 || n_kv_heads <= 0 || n_heads <= 0 || head_dim != 64) return;
+
+//   const int gqa_ratio = n_heads / n_kv_heads;
+
+//   // Respect sliding-window cap (even layers) and default max tile 112 from the kernel file.
+//   const int sw_cap = (use_sw && ((layer_idx & 1) == 0)) ? SW_WINDOW : 112;
+//   int tile_t = tile_t_in > 0 ? tile_t_in : std::min(112, sw_cap);
+
+//   // Block/Grid mapping (64 lanes × gqa_ratio warps = 512 threads)
+//   dim3 block(64, gqa_ratio, 1);
+//   dim3 grid(n_kv_heads, batch_size, 1);
+
+//   // Dynamic LDS: K and V only, with PADDED=72 (64 + 8) to avoid bank conflicts
+//   constexpr int PADDED = 72;
+//   size_t shmem_bytes = (size_t)2 * (size_t)tile_t * (size_t)PADDED * sizeof(__hip_bfloat16);
+
+//   // Cap to device max dynamic shared memory if necessary
+//   size_t max_dyn = get_device_max_dyn_shmem();
+//   if (max_dyn > 0 && shmem_bytes > max_dyn) {
+//     int max_tile = (int)(max_dyn / (2 * PADDED * sizeof(__hip_bfloat16)));
+//     max_tile = std::max(1, std::min(max_tile, sw_cap));
+//     tile_t = std::min(tile_t, max_tile);
+//     shmem_bytes = (size_t)2 * (size_t)tile_t * (size_t)PADDED * sizeof(__hip_bfloat16);
+//   }
+
+//   // Try to request the needed dynamic shared memory; ignore failure on stacks that don't use opt-in.
+//   (void)hipFuncSetAttribute((const void*)fused_attention_kernel_optimized,
+//                             hipFuncAttributeMaxDynamicSharedMemorySize,
+//                             (int)shmem_bytes);
+
+//   hipLaunchKernelGGL(
+//     fused_attention_kernel_optimized,
+//     grid, block, shmem_bytes, stream,
+//     out, q, key_cache, value_cache,
+//     sinks, mask, seq_lengths,
+//     batch_size, n_heads, n_kv_heads, head_dim,
+//     seq_len, n_layers, layer_idx, use_sw,
+//     batch_kv_stride, layer_kv_offset, tile_t
+//   );
+// }
+
 static void launch_optimized(
-    dim3 /*grid_ignored*/, dim3 /*block_ignored*/, size_t /*shmem_ignored*/, hipStream_t stream,
+    dim3 grid, dim3 block, size_t shmem, hipStream_t stream,
     float* out, const float* q,
     const __hip_bfloat16* key_cache, const __hip_bfloat16* value_cache,
     const __hip_bfloat16* sinks, const float* mask, const int* seq_lengths,
     int batch_size, int n_heads, int n_kv_heads, int head_dim,
     int seq_len, int n_layers, int layer_idx, bool use_sw,
-    size_t batch_kv_stride, size_t layer_kv_offset, int tile_t_in)
-{
-  // This helper matches the host launcher you had before (specialized for D=64).
-  if (batch_size <= 0 || n_kv_heads <= 0 || n_heads <= 0 || head_dim != 64) return;
-
-  const int gqa_ratio = n_heads / n_kv_heads;
-
-  // Respect sliding-window cap (even layers) and default max tile 112 from the kernel file.
-  const int sw_cap = (use_sw && ((layer_idx & 1) == 0)) ? SW_WINDOW : 112;
-  int tile_t = tile_t_in > 0 ? tile_t_in : std::min(112, sw_cap);
-
-  // Block/Grid mapping (64 lanes × gqa_ratio warps = 512 threads)
-  dim3 block(64, gqa_ratio, 1);
-  dim3 grid(n_kv_heads, batch_size, 1);
-
-  // Dynamic LDS: K and V only, with PADDED=72 (64 + 8) to avoid bank conflicts
-  constexpr int PADDED = 72;
-  size_t shmem_bytes = (size_t)2 * (size_t)tile_t * (size_t)PADDED * sizeof(__hip_bfloat16);
-
-  // Cap to device max dynamic shared memory if necessary
-  size_t max_dyn = get_device_max_dyn_shmem();
-  if (max_dyn > 0 && shmem_bytes > max_dyn) {
-    int max_tile = (int)(max_dyn / (2 * PADDED * sizeof(__hip_bfloat16)));
-    max_tile = std::max(1, std::min(max_tile, sw_cap));
-    tile_t = std::min(tile_t, max_tile);
-    shmem_bytes = (size_t)2 * (size_t)tile_t * (size_t)PADDED * sizeof(__hip_bfloat16);
-  }
-
-  // Try to request the needed dynamic shared memory; ignore failure on stacks that don't use opt-in.
-  (void)hipFuncSetAttribute((const void*)fused_attention_kernel_optimized,
-                            hipFuncAttributeMaxDynamicSharedMemorySize,
-                            (int)shmem_bytes);
+    size_t batch_kv_stride, size_t layer_kv_offset, int tile_t) {
 
   hipLaunchKernelGGL(
-    fused_attention_kernel_optimized,
-    grid, block, shmem_bytes, stream,
+    fused_attention_kernel_optimized, // baseline symbol from attention.hpp
+    grid, block, shmem, stream,
     out, q, key_cache, value_cache,
     sinks, mask, seq_lengths,
     batch_size, n_heads, n_kv_heads, head_dim,
@@ -712,7 +732,6 @@ static void launch_optimized(
     batch_kv_stride, layer_kv_offset, tile_t
   );
 }
-
 // =====================
 // Autotune infrastructure
 // =====================

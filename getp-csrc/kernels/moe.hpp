@@ -503,8 +503,8 @@ __global__ void route_and_pack_fused_kernel(
     const int T = blockDim.x; // threads per block
     const int tid = threadIdx.x;
 
-    extern __shared__ int smem[];
-    int *flags = smem;               // [T]
+    extern __shared__ int _smem[];
+    int *flags = _smem;               // [T]
     int *excl = flags + T;           // [T]  (inclusive scan buffer)
     int *kidx = excl + T;            // [T]  (which k matched e, or -1)
     int *toklist = kidx + T;         // [T]  (selected token indices in this chunk)

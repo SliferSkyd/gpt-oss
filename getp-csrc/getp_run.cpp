@@ -16,6 +16,8 @@
 #include "config.hpp"
 #include "utils.hpp"
 #include "kernels/attention.hpp"
+#include "kernels/attention_mfma.hpp"
+
 #include "kernels/rmsnorm.hpp"
 #include "kernels/matmul.hpp"
 #include "kernels/softmax.hpp"
@@ -1859,34 +1861,27 @@ void attention_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size,
     const int NKv = NK;   // n_kv_heads
     const int D   = Hd;
 
-    // GQA ratio: heads per KV head
-    const int kv_mul = H / NKv;
+    // GQA ratio: heads per KV head (unused by this launcher; kernel handles 8 heads per warp)
+    const int kv_mul = H / NKv;  // == 8
 
     // SW cap: even layers use sliding window, odd layers use full length (cap@112)
     const int sw_cap = (p->sliding_window > 0 && ((layer_idx & 1) == 0))
                        ? SW_WINDOW
                        : 112;
 
-    // Target the tuned winner, but respect the SW cap
-    int T = std::min(48, sw_cap);
+    // Tile length for single-warp kernel; 96–112 is usually best
+    int T = std::min(112, sw_cap);
 
-    // Block/grid mapping identical to launch_optimized:
-    // 64 lanes × kv_mul warps = 512 threads (for kv_mul=8)
-    dim3 block(64, kv_mul, 1);
+    // Block/grid mapping for 1-warp-per-KV-head:
+    // 64 lanes, 1 warp (the kernel internally processes 8 query heads)
+    dim3 block(64, 1, 1);
     dim3 grid(NKv, B, 1);
 
-    // Shared memory footprint must match the kernel:
-    // 2 * tile_t * PADDED_HEAD_DIM * sizeof(storage_type)
+    // Shared memory footprint (bf16): sK + sV = 2 * T * PADDED_HEAD_DIM
     constexpr int PADDED_HEAD_DIM = 72;
+    size_t shmem = (size_t)2 * (size_t)T * (size_t)PADDED_HEAD_DIM * sizeof(__hip_bfloat16);
 
-    size_t shmem =
-    #if defined(OPT_STORE_SHARED_AS_F32) && OPT_STORE_SHARED_AS_F32
-        (size_t)2 * (size_t)T * (size_t)PADDED_HEAD_DIM * sizeof(float);
-    #else
-        (size_t)2 * (size_t)T * (size_t)PADDED_HEAD_DIM * sizeof(__hip_bfloat16);
-    #endif
-
-    // Cap tile_t against device max dynamic shared memory, like launch_optimized
+    // Cap tile_t against device max dynamic shared memory
     auto get_max_dyn_shmem = []() -> size_t {
         int dev = 0, basic = 0;
         HIP_CHECK(hipGetDevice(&dev));
@@ -1898,34 +1893,21 @@ void attention_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size,
 
     const size_t max_dyn = get_max_dyn_shmem();
     if (max_dyn > 0 && shmem > max_dyn) {
-        // Compute max tile that fits and clamp T
-        int max_tile =
-        #if defined(OPT_STORE_SHARED_AS_F32) && OPT_STORE_SHARED_AS_F32
-            (int)(max_dyn / (2 * PADDED_HEAD_DIM * sizeof(float)));
-        #else
-            (int)(max_dyn / (2 * PADDED_HEAD_DIM * sizeof(__hip_bfloat16)));
-        #endif
+        int max_tile = (int)(max_dyn / (2 * PADDED_HEAD_DIM * sizeof(__hip_bfloat16)));
         max_tile = std::max(1, std::min(max_tile, sw_cap));
         T = std::min(T, max_tile);
-
-        // Recompute shmem with the clamped T
-        shmem =
-        #if defined(OPT_STORE_SHARED_AS_F32) && OPT_STORE_SHARED_AS_F32
-            (size_t)2 * (size_t)T * (size_t)PADDED_HEAD_DIM * sizeof(float);
-        #else
-            (size_t)2 * (size_t)T * (size_t)PADDED_HEAD_DIM * sizeof(__hip_bfloat16);
-        #endif
+        shmem = (size_t)2 * (size_t)T * (size_t)PADDED_HEAD_DIM * sizeof(__hip_bfloat16);
     }
 
     // Request dynamic LDS (ignore return; not required on all stacks)
     (void)hipFuncSetAttribute(
-        (const void*)fused_attention_kernel_optimized_3,
+        (const void*)fused_attention_kernel_1warp8q,
         hipFuncAttributeMaxDynamicSharedMemorySize,
         (int)shmem
     );
 
     hipLaunchKernelGGL(
-        fused_attention_kernel_optimized_3,
+        fused_attention_kernel_1warp8q,
         grid, block, shmem, sAttn,
         tb_mb, q_mb, key_cache_mb, value_cache_mb,
         w->attn_sinks + (size_t)layer_idx * NA,
@@ -1935,11 +1917,12 @@ void attention_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size,
         p->sliding_window > 0,
         /* batch_kv_stride = */ layers_capacity * (size_t)KV,
         /* layer_kv_offset = */ layer_elem_offset,
-        /* tile_t = */ T   // == 48 unless clamped by caps above
+        /* tile_t = */ T
     );
 
     HIP_CHECK(hipGetLastError());
 }
+
 
     // 7) fused output projection
     {
@@ -2795,6 +2778,7 @@ int *forward_batch_gpu(GPUTransformer *gpu_t, int *tokens, int batch_size)
         HIP_CHECK(hipGetLastError());
     }
     {
+        // TIMER_BLOCK("final_matmul");
         matmul<
             16,16,16,
             4,4,2,
@@ -2804,6 +2788,7 @@ int *forward_batch_gpu(GPUTransformer *gpu_t, int *tokens, int batch_size)
         HIP_CHECK(hipGetLastError());
     }
     {
+        // TIMER_BLOCK("sample_argmax");
         sample_argmax(s->logits, s->current_tokens, B, p->vocab_size);
         HIP_CHECK(hipGetLastError());
     }
@@ -3049,6 +3034,7 @@ long long continuous_batching_inference(Tokenizer *tokenizer,
         }
     }
 
+    write_profile_info();
     return total_tokens_generated;
 }
 
@@ -3056,6 +3042,7 @@ long long inference(Transformer *transformer, Tokenizer *tokenizer,
                     Sampler *sampler, Requests *requests)
 {
     return continuous_batching_inference(tokenizer, sampler, requests);
+    
 }
 
 #endif // GETP_RUN
