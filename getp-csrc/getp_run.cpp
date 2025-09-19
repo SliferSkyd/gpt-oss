@@ -1089,7 +1089,7 @@ void attention_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size,
         assert_smem_or_die(shmem, "fused_attention_kernel_optimized_3");
 
         hipLaunchKernelGGL(
-            fused_attention_kernel_optimized_3,
+            fused_attention_kernel_optimized,
             grid, block, shmem, sAttn,
             tb_mb, q_mb, key_cache_mb, value_cache_mb,
             w->attn_sinks + (size_t)layer_idx * NA,
