@@ -171,7 +171,7 @@ static void pick_defaults_for_launch(
   shmem_bytes = compute_shmem_bytes(tile_t, head_dim);
 }
 
-static void launch_baseline(
+static void launch_baseline_old(
     dim3 grid, dim3 block, size_t shmem, hipStream_t stream,
     float* out, const float* q,
     const __hip_bfloat16* key_cache, const __hip_bfloat16* value_cache,
@@ -216,60 +216,8 @@ static void launch_baseline(
 //   return static_cast<size_t>(basic);
 // }
 
-static void launch_optimized_old(
-    dim3 /*grid_ignored*/, dim3 /*block_ignored*/, size_t /*shmem_ignored*/, hipStream_t stream,
-    float* out, const float* q,
-    const __hip_bfloat16* key_cache, const __hip_bfloat16* value_cache,
-    const __hip_bfloat16* sinks, const float* mask, const int* seq_lengths,
-    int batch_size, int n_heads, int n_kv_heads, int head_dim,
-    int seq_len, int n_layers, int layer_idx, bool use_sw,
-    size_t batch_kv_stride, size_t layer_kv_offset, int tile_t_in)
-{
-  // This helper matches the host launcher you had before (specialized for D=64).
-  if (batch_size <= 0 || n_kv_heads <= 0 || n_heads <= 0 || head_dim != 64) return;
-
-  const int gqa_ratio = n_heads / n_kv_heads;
-
-  // Respect sliding-window cap (even layers) and default max tile 112 from the kernel file.
-  const int sw_cap = (use_sw && ((layer_idx & 1) == 0)) ? SW_WINDOW : 112;
-  int tile_t = tile_t_in > 0 ? tile_t_in : std::min(112, sw_cap);
-
-  // Block/Grid mapping (64 lanes × gqa_ratio warps = 512 threads)
-  dim3 block(64, gqa_ratio, 1);
-  dim3 grid(n_kv_heads, batch_size, 1);
-
-  // Dynamic LDS: K and V only, with PADDED=72 (64 + 8) to avoid bank conflicts
-  constexpr int PADDED = 72;
-  size_t shmem_bytes = (size_t)2 * (size_t)tile_t * (size_t)PADDED * sizeof(__hip_bfloat16);
-
-  // Cap to device max dynamic shared memory if necessary
-  size_t max_dyn = get_device_max_dyn_shmem();
-  if (max_dyn > 0 && shmem_bytes > max_dyn) {
-    int max_tile = (int)(max_dyn / (2 * PADDED * sizeof(__hip_bfloat16)));
-    max_tile = std::max(1, std::min(max_tile, sw_cap));
-    tile_t = std::min(tile_t, max_tile);
-    shmem_bytes = (size_t)2 * (size_t)tile_t * (size_t)PADDED * sizeof(__hip_bfloat16);
-  }
-
-  // Try to request the needed dynamic shared memory; ignore failure on stacks that don't use opt-in.
-  (void)hipFuncSetAttribute((const void*)fused_attention_kernel_optimized,
-                            hipFuncAttributeMaxDynamicSharedMemorySize,
-                            (int)shmem_bytes);
-
-  hipLaunchKernelGGL(
-    fused_attention_kernel_optimized,
-    grid, block, shmem_bytes, stream,
-    out, q, key_cache, value_cache,
-    sinks, mask, seq_lengths,
-    batch_size, n_heads, n_kv_heads, head_dim,
-    seq_len, n_layers, layer_idx, use_sw,
-    batch_kv_stride, layer_kv_offset, tile_t
-  );
-}
-
-
-// static void launch_optimized(
-//     dim3, dim3, size_t, hipStream_t stream,
+// static void launch_baseline(
+//     dim3 /*grid_ignored*/, dim3 /*block_ignored*/, size_t /*shmem_ignored*/, hipStream_t stream,
 //     float* out, const float* q,
 //     const __hip_bfloat16* key_cache, const __hip_bfloat16* value_cache,
 //     const __hip_bfloat16* sinks, const float* mask, const int* seq_lengths,
@@ -277,136 +225,95 @@ static void launch_optimized_old(
 //     int seq_len, int n_layers, int layer_idx, bool use_sw,
 //     size_t batch_kv_stride, size_t layer_kv_offset, int tile_t_in)
 // {
-//   if (batch_size<=0 || n_kv_heads<=0 || n_heads<=0 || head_dim!=64) return;
-//   const int gqa_ratio = n_heads / n_kv_heads;
-//   if (gqa_ratio != 8) return;
+//   // This helper matches the host launcher you had before (specialized for D=64).
+//   if (batch_size <= 0 || n_kv_heads <= 0 || n_heads <= 0 || head_dim != 64) return;
 
+//   const int gqa_ratio = n_heads / n_kv_heads;
+
+//   // Respect sliding-window cap (even layers) and default max tile 112 from the kernel file.
 //   const int sw_cap = (use_sw && ((layer_idx & 1) == 0)) ? SW_WINDOW : 112;
 //   int tile_t = tile_t_in > 0 ? tile_t_in : std::min(112, sw_cap);
 
-//   dim3 block(64, 1, 1);                 // <-- single warp
+//   // Block/Grid mapping (64 lanes × gqa_ratio warps = 512 threads)
+//   dim3 block(64, gqa_ratio, 1);
 //   dim3 grid(n_kv_heads, batch_size, 1);
 
-//   size_t sK_bytes = (size_t)tile_t * PADDED_HEAD_DIM * sizeof(__hip_bfloat16);
-//   size_t sV_bytes = (size_t)tile_t * PADDED_HEAD_DIM * sizeof(__hip_bfloat16);
-//   size_t shmem_bytes = sK_bytes + sV_bytes;
+//   // Dynamic LDS: K and V only, with PADDED=72 (64 + 8) to avoid bank conflicts
+//   constexpr int PADDED = 72;
+//   size_t shmem_bytes = (size_t)2 * (size_t)tile_t * (size_t)PADDED * sizeof(__hip_bfloat16);
 
+//   // Cap to device max dynamic shared memory if necessary
 //   size_t max_dyn = get_device_max_dyn_shmem();
 //   if (max_dyn > 0 && shmem_bytes > max_dyn) {
-//     int max_tile = (int)(max_dyn / (2 * PADDED_HEAD_DIM * sizeof(__hip_bfloat16)));
+//     int max_tile = (int)(max_dyn / (2 * PADDED * sizeof(__hip_bfloat16)));
 //     max_tile = std::max(1, std::min(max_tile, sw_cap));
-//     tile_t   = std::min(tile_t, max_tile);
-//     shmem_bytes = (size_t)2 * tile_t * PADDED_HEAD_DIM * sizeof(__hip_bfloat16);
+//     tile_t = std::min(tile_t, max_tile);
+//     shmem_bytes = (size_t)2 * (size_t)tile_t * (size_t)PADDED * sizeof(__hip_bfloat16);
 //   }
 
-//   (void)hipFuncSetAttribute((const void*)fused_attention_kernel_1warp8q,
+//   // Try to request the needed dynamic shared memory; ignore failure on stacks that don't use opt-in.
+//   (void)hipFuncSetAttribute((const void*)fused_attention_kernel_optimized,
 //                             hipFuncAttributeMaxDynamicSharedMemorySize,
 //                             (int)shmem_bytes);
 
 //   hipLaunchKernelGGL(
-//       fused_attention_kernel_1warp8q,
-//       grid, block, shmem_bytes, stream,
-//       out, q, key_cache, value_cache,
-//       sinks, mask, seq_lengths,
-//       batch_size, n_heads, n_kv_heads, head_dim,
-//       seq_len, n_layers, layer_idx, use_sw,
-//       batch_kv_stride, layer_kv_offset, tile_t
+//     fused_attention_kernel_optimized,
+//     grid, block, shmem_bytes, stream,
+//     out, q, key_cache, value_cache,
+//     sinks, mask, seq_lengths,
+//     batch_size, n_heads, n_kv_heads, head_dim,
+//     seq_len, n_layers, layer_idx, use_sw,
+//     batch_kv_stride, layer_kv_offset, tile_t
 //   );
 // }
 
 
-// =====================
-// Host launchers
-// =====================
-
-// Returns the device's max dynamic shared memory (bytes); assumed to exist elsewhere in your codebase.
-// int get_device_max_dyn_shmem();
-
-static void launch_flashdecoding_phase1(
-    hipStream_t stream,
-    // outputs
-    float* partial_out, float* partial_m, float* partial_l,
-    // inputs
-    const float* q,
+static void launch_baseline(
+    dim3, dim3, size_t, hipStream_t stream,
+    float* out, const float* q,
     const __hip_bfloat16* key_cache, const __hip_bfloat16* value_cache,
-    const int* seq_lengths,
+    const __hip_bfloat16* sinks, const float* mask, const int* seq_lengths,
     int batch_size, int n_heads, int n_kv_heads, int head_dim,
-    int L, int layer_idx, bool use_sw,
-    size_t batch_kv_stride, size_t layer_kv_offset,
-    int split_t_in,                             // requested split length (tokens per split)
-    int* out_max_splits,                        // return value: max_splits used
-    int* out_split_t                            // return value: split_t actually used
-){
-  if (batch_size<=0 || n_kv_heads<=0 || n_heads<=0 || head_dim!=64) { *out_max_splits=0; *out_split_t=0; return; }
+    int seq_len, int n_layers, int layer_idx, bool use_sw,
+    size_t batch_kv_stride, size_t layer_kv_offset, int tile_t_in)
+{
+  if (batch_size<=0 || n_kv_heads<=0 || n_heads<=0 || head_dim!=64) return;
   const int gqa_ratio = n_heads / n_kv_heads;
-  if (gqa_ratio != 8) { *out_max_splits=0; *out_split_t=0; return; }
+  if (gqa_ratio != 8) return;
 
-  // Cap the effective sequence for this layer (SW or full)
-  const int sw_cap = (use_sw && ((layer_idx & 1) == 0)) ? SW_WINDOW : L;
+  const int sw_cap = (use_sw && ((layer_idx & 1) == 0)) ? SW_WINDOW : 112;
+  int tile_t = tile_t_in > 0 ? tile_t_in : std::min(112, sw_cap);
 
-  // Choose split size subject to dynamic shared memory limits:
-  // SMEM needed = 2 * split_t * PADDED_HEAD_DIM * sizeof(bf16)
-  int split_t = split_t_in > 0 ? split_t_in : min(112, sw_cap);
-  size_t shmem_bytes = (size_t)2 * split_t * PADDED_HEAD_DIM * sizeof(__hip_bfloat16);
+  dim3 block(64, 1, 1);                 // <-- single warp
+  dim3 grid(n_kv_heads, batch_size, 1);
+
+  size_t sK_bytes = (size_t)tile_t * PADDED_HEAD_DIM * sizeof(__hip_bfloat16);
+  size_t sV_bytes = (size_t)tile_t * PADDED_HEAD_DIM * sizeof(__hip_bfloat16);
+  size_t shmem_bytes = sK_bytes + sV_bytes;
+
   size_t max_dyn = get_device_max_dyn_shmem();
   if (max_dyn > 0 && shmem_bytes > max_dyn) {
-    int max_t = (int)(max_dyn / (2 * PADDED_HEAD_DIM * sizeof(__hip_bfloat16)));
-    max_t = max(1, min(max_t, sw_cap));
-    split_t = min(split_t, max_t);
-    shmem_bytes = (size_t)2 * split_t * PADDED_HEAD_DIM * sizeof(__hip_bfloat16);
+    int max_tile = (int)(max_dyn / (2 * PADDED_HEAD_DIM * sizeof(__hip_bfloat16)));
+    max_tile = std::max(1, std::min(max_tile, sw_cap));
+    tile_t   = std::min(tile_t, max_tile);
+    shmem_bytes = (size_t)2 * tile_t * PADDED_HEAD_DIM * sizeof(__hip_bfloat16);
   }
 
-  const int max_splits = (sw_cap + split_t - 1) / split_t;
-
-  dim3 block(64, 1, 1);
-  dim3 grid(n_kv_heads, batch_size, max_splits);
-
-  (void)hipFuncSetAttribute((const void*)flashdecoding_phase1_kernel_1warp8q,
+  (void)hipFuncSetAttribute((const void*)fused_attention_kernel_1warp8q_fast,
                             hipFuncAttributeMaxDynamicSharedMemorySize,
                             (int)shmem_bytes);
 
   hipLaunchKernelGGL(
-      flashdecoding_phase1_kernel_1warp8q,
+      fused_attention_kernel_1warp8q_fast,
       grid, block, shmem_bytes, stream,
-      partial_out, partial_m, partial_l,
-      q, key_cache, value_cache, seq_lengths,
-      batch_size, n_heads, n_kv_heads, head_dim, L,
-      layer_idx, use_sw, batch_kv_stride, layer_kv_offset, split_t
-  );
-
-  if (out_max_splits) *out_max_splits = max_splits;
-  if (out_split_t)    *out_split_t    = split_t;
-}
-
-static void launch_flashdecoding_reduce(
-    hipStream_t stream,
-    // final output
-    float* out,
-    // phase-1 partials
-    const float* partial_out, const float* partial_m, const float* partial_l,
-    // sink + meta
-    const __hip_bfloat16* sinks, const int* seq_lengths,
-    int batch_size, int n_heads, int n_kv_heads, int head_dim,
-    int L, int layer_idx, bool use_sw,
-    int max_splits, int split_t
-){
-  if (batch_size<=0 || n_kv_heads<=0 || n_heads<=0 || head_dim!=64 || max_splits<=0 || split_t<=0) return;
-  const int gqa_ratio = n_heads / n_kv_heads;
-  if (gqa_ratio != 8) return;
-
-  dim3 block(64, 1, 1);
-  dim3 grid(n_kv_heads, batch_size, 1);
-
-  hipLaunchKernelGGL(
-      flashdecoding_reduce_splits_kernel_1warp8q,
-      grid, block, /*shmem=*/0, stream,
-      out, partial_out, partial_m, partial_l,
-      sinks, seq_lengths,
-      batch_size, n_heads, n_kv_heads, head_dim, L,
-      layer_idx, use_sw,
-      max_splits, split_t
+      out, q, key_cache, value_cache,
+      sinks, mask, seq_lengths,
+      batch_size, n_heads, n_kv_heads, head_dim,
+      seq_len, n_layers, layer_idx, use_sw,
+      batch_kv_stride, layer_kv_offset, tile_t
   );
 }
+
 
 
 
