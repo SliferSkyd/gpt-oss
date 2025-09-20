@@ -1798,16 +1798,13 @@ void moe_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size,
     if (total_tokens > 0)
     {
         // TIMER_BLOCK("route_and_pack_fused_kernel_moe");
-        // Round up to next power-of-two AND a multiple of warpSize (64 on MI250)
-        auto next_pow2 = [](int v){ v--; v |= v>>1; v |= v>>2; v |= v>>4; v |= v>>8; v |= v>>16; return v+1; };
-        int threads = next_pow2(Bgrp);
-        threads = max(threads, warpSize);
-        threads = (threads + (warpSize-1)) & ~(warpSize-1);
-        threads = min(threads, 1024);
+        int threads = 1;
+        while (threads < Bgrp)
+            threads <<= 1;
+        threads = min(threads, 1024); // hardware cap
 
-        // shared: nwarps*2 + T*2 + 1 ints
-        int nwarps = (threads + warpSize - 1) / warpSize;
-        size_t shmem = (size_t)(nwarps*2 + threads*2 + 1) * sizeof(int);
+        // 5 arrays of int[T]
+        size_t shmem = (size_t)threads * 5 * sizeof(int) + sizeof(int);
 
         route_and_pack_fused_kernel<<<E, threads, shmem, sMoe>>>(
             s->gather_x_g, Bgrp, H,
@@ -1815,7 +1812,6 @@ void moe_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size,
             s->d_expert_offsets, E,
             s->local_ids_g, s->local_wts_g,
             s->expert_input_buffer_g);
-
     }
     else
     {
@@ -1939,26 +1935,6 @@ void moe_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size,
     HIP_CHECK(hipStreamSynchronize(sMoe));
     tp_group_barrier(tp);
 
-    // 8) Ring ALL-REDUCE across TP on [total_tokens, H] in-place
-    {
-    const size_t elems = (size_t)total_tokens * H;
-
-    // Build peer base pointers (group-local order 0..TP-1)
-    float* peer_bufs[MAX_TP];
-    for (int r = 0; r < TP; ++r) {
-        const int peer_dev = group_base + r;
-        peer_bufs[r] = gpu_transformers[peer_dev]->state.expert_output_partial_g;
-    }
-
-    ring_allreduce_sum(
-        /*buf_local=*/s->expert_output_partial_g,
-        /*peer_bases=*/peer_bufs,
-        /*N_elems=*/elems,
-        /*tp=*/tp,
-        /*s=*/sMoe);
-    }
-
-
     // 9) Reduce over experts back to tokens (union) -> e_agg_g[Bgrp,H]
     {
         // TIMER_BLOCK("reduce_tokenwise_expert_outputs_moe");
@@ -1968,6 +1944,26 @@ void moe_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size,
             s->e_agg_g, s->expert_output_partial_g,
             s->local_ids_g, s->local_wts_g, Bgrp, H, K);
         HIP_CHECK(hipGetLastError());
+    }
+
+    // 9b) Ring ALL-REDUCE across TP on token-wise results: e_agg_g[Bgrp, H]
+    {
+        const size_t elems = (size_t)Bgrp * (size_t)H;
+
+        // Build peer base pointers (group-local order 0..TP-1)
+        float* peer_bufs[MAX_TP];
+        for (int r = 0; r < TP; ++r) {
+            const int peer_dev = group_base + r;
+            peer_bufs[r] = gpu_transformers[peer_dev]->state.e_agg_g;
+        }
+
+        // Sum into s->e_agg_g in place (each rank contributes its partial)
+        ring_allreduce_sum(
+            /*buf_local=*/s->e_agg_g,
+            /*peer_bases=*/peer_bufs,
+            /*N_elems=*/elems,
+            /*tp=*/tp,
+            /*s=*/sMoe);
     }
 
     // 10) Scatter owner rows back to this rank and residual-add into x

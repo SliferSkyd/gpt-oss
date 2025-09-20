@@ -1,17 +1,3 @@
-// Optimized deterministic fused router + packer (HIP/CUDA-friendly)
-// - One expert per block (gridDim.x = E)
-// - Deterministic order by token index (increasing t_global)
-// - Requires blockDim.x to be a multiple of warpSize (64 on AMD gfx90a)
-
-__device__ __forceinline__ int lane_id() { return threadIdx.x & (warpSize - 1); }
-__device__ __forceinline__ int warp_id() { return threadIdx.x >> (__ffs(warpSize) - 1); }
-
-template <typename T>
-__device__ __forceinline__ bool is_aligned(const T* p) {
-    constexpr size_t A = alignof(float4);
-    return (reinterpret_cast<uintptr_t>(p) & (A - 1)) == 0;
-}
-
 __global__ void route_and_pack_fused_kernel(
     const float*  __restrict__ x,              // [B, H]
     int B, int H,
@@ -27,116 +13,79 @@ __global__ void route_and_pack_fused_kernel(
     const int e = blockIdx.x;
     if (e >= E) return;
 
-    const int T = blockDim.x;    // threads per block (multiple of warpSize)
+    const int T = blockDim.x;     // threads per block
     const int tid = threadIdx.x;
-    const int lane = lane_id();
-    const int wid  = warp_id();
-    const int nwarps = (T + warpSize - 1) / warpSize;
 
     extern __shared__ int smem[];
-    // Layout: [per-warp totals nwarps] [per-warp prefix nwarps] [toklist T] [cmplist T] [carry 1]
-    int* warp_totals = smem;                         // nwarps
-    int* warp_prefix = warp_totals + nwarps;         // nwarps
-    int* toklist     = warp_prefix + nwarps;         // T (selected token indices)
-    int* cmplist     = toklist + T;                  // T (their compact indices)
-    int* carry_shared= cmplist + T;                  // 1
+    int* flags   = smem;          // [T]
+    int* excl    = flags + T;     // [T]  (inclusive scan buffer)
+    int* kidx    = excl  + T;     // [T]  (which k matched e, or -1)
+    int* toklist = kidx  + T;     // [T]  (selected token indices in this chunk)
+    int* cmplist = toklist + T;   // [T]  (their compact indices)
+    int* carry_shared = cmplist + T; // [1]  (shared carry value)
 
-    if (tid == 0) carry_shared[0] = 0;
+
+    // int carry = 0;                // how many tokens for expert e packed so far
+    if (tid == 0) carry_shared[0] = 0;  // Initialize shared carry
     __syncthreads();
 
-    const int base_out_e = expert_offsets[e];
-
-    // process tokens in tiles of T
+    // Process tokens in tiles of T to support B > T
     for (int base = 0; base < B; base += T) {
 
-        const int t_global = base + tid;
-
-        // ---- 1) For this thread's token, check if expert e is in its top-k ----
-        int hit = 0;
-        int k_sel = -1;
+        // ---- 1) Flag tokens in this chunk and remember which k matched ----
+        int t_global = base + tid;
+        int f = 0, kk = -1;
         if (t_global < B) {
             const int off = t_global * K;
             #pragma unroll
-            for (int i = 0; i < 8; ++i) {
-                if (i >= K) break;
-                if (!hit && topk_i[off + i] == e) { hit = 1; k_sel = i; }
-            }
-            // If K > 8, continue scanning (rare; still branch-friendly)
-            for (int i = 8; i < K; ++i) {
-                if (!hit && topk_i[off + i] == e) { hit = 1; k_sel = i; break; }
+            for (int i = 0; i < K; ++i) {
+                if (topk_i[off + i] == e) { f = 1; kk = i; break; }
             }
         }
-
-        // ---- 2) Warp-scope inclusive count via ballot/popc ----
-        // On AMD HIP, __ballot returns unsigned long long for 64-lane waves.
-        unsigned long long mask = __ballot(hit != 0);
-        const int warp_rank = __popcll(mask & ((lane == 63) ? ~0ull : ((1ull << lane) - 1ull)));
-        const int warp_count = __popcll(mask);
-
-        // lane 0 writes its warp total
-        if (lane == 0) warp_totals[wid] = warp_count;
+        flags[tid] = f;
+        kidx[tid]  = kk;
         __syncthreads();
 
-        // ---- 3) Block-wide prefix of per-warp totals (small array, do it serial on a few threads) ----
-        if (tid < nwarps) {
-            int acc = 0;
-            #pragma unroll
-            for (int w = 0; w < nwarps; ++w) {
-                int t = warp_totals[w];
-                warp_prefix[w] = acc; // exclusive
-                acc += t;
-            }
-            // stash the last acc in warp_totals[0] to broadcast chunk_total
-            if (tid == 0) warp_totals[0] = acc;
+        // ---- 2) Inclusive scan on flags (Hillis–Steele in-place) ----
+        excl[tid] = flags[tid];
+        __syncthreads();
+        for (int ofs = 1; ofs < T; ofs <<= 1) {
+            int v = (tid >= ofs) ? excl[tid - ofs] : 0;
+            __syncthreads();
+            excl[tid] += v;
+            __syncthreads();
         }
-        __syncthreads();
+        const int rank_local   = (tid == 0) ? 0 : excl[tid - 1];   // exclusive rank within this chunk
+        const int chunk_total  = excl[T - 1];                      // total selected in this chunk
 
-        const int chunk_total = warp_totals[0];
-        const int my_block_rank = warp_prefix[wid] + warp_rank; // exclusive rank within the chunk
+        // ---- 3) For selected tokens: compute compact_idx, store lists, fill ids/wts ----
+        if (flags[tid]) {
+            const int compact_idx = expert_offsets[e] + carry_shared[0] + rank_local;
+            const int lid = t_global * K + kidx[tid];
 
-        // ---- 4) For selected tokens, compute compact_idx and write ids/wts; also fill compact lists ----
-        if (hit) {
-            const int compact_idx = base_out_e + carry_shared[0] + my_block_rank;
-            const int lid = t_global * K + k_sel;
+            // per-(b,k) mapping; exactly one expert block writes each entry
             local_ids[lid] = compact_idx;
             local_wts[lid] = topk_v[lid];
 
-            toklist[my_block_rank] = t_global;
-            cmplist[my_block_rank] = compact_idx;
+            toklist[rank_local] = t_global;
+            cmplist[rank_local] = compact_idx;
         }
         __syncthreads();
 
-        // ---- 5) Cooperative packing of the selected rows in this chunk ----
-        // Vectorized path if H % 4 == 0 and pointers are 16B-aligned
-        if (chunk_total) {
-            const int H4 = H >> 2;
-
-            // Use all threads to copy each row; j loops over compacted selections
-            for (int j = 0; j < chunk_total; ++j) {
-                const int tkn = toklist[j];
-                const int cmp = cmplist[j];
-
-                const float* __restrict__ src = x + (size_t)tkn * H;
-                float*       __restrict__ dst = expert_in + (size_t)cmp * H;
-
-                if (((H & 3) == 0) && is_aligned(src) && is_aligned(dst)) {
-                    const float4* __restrict__ src4 = reinterpret_cast<const float4*>(src);
-                    float4*       __restrict__ dst4 = reinterpret_cast<float4*>(dst);
-                    // stride by T across float4 lanes
-                    for (int i4 = tid; i4 < H4; i4 += T) {
-                        float4 v = src4[i4];
-                        dst4[i4] = v;
-                    }
-                } else {
-                    for (int i = tid; i < H; i += T) {
-                        dst[i] = src[i];
-                    }
-                }
+        // ---- 4) Cooperative copy of all rows selected in this chunk ----
+        // Every thread helps copy each row (good coalescing: i strides by T)
+        for (int j = 0; j < chunk_total; ++j) {
+            const int tkn = toklist[j];
+            const int cmp = cmplist[j];
+            const float* __restrict__ src = x + (size_t)tkn * H;
+            float*       __restrict__ dst = expert_in + (size_t)cmp * H;
+            for (int i = tid; i < H; i += T) {
+                dst[i] = src[i];
             }
         }
         __syncthreads();
 
-        // ---- 6) Advance carry (once per chunk) ----
+        // ---- 5) Advance global carry for this expert ----
         if (tid == 0) carry_shared[0] += chunk_total;
         __syncthreads();
     }
