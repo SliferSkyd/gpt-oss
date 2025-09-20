@@ -1856,6 +1856,8 @@ void attention_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size,
     // 6) fused attention
      // --- optimized launch (tile_t = 48, same policy as launch_optimized) ---
 {
+        // TIMER_BLOCK("fused_attention_kernel");
+
     const int B   = batch_size;
     const int H   = NA;   // n_attn_heads
     const int NKv = NK;   // n_kv_heads
@@ -1901,13 +1903,13 @@ void attention_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size,
 
     // Request dynamic LDS (ignore return; not required on all stacks)
     (void)hipFuncSetAttribute(
-        (const void*)fused_attention_kernel_1warp8q,
+        (const void*)fused_attention_kernel_1warp8q_fast,
         hipFuncAttributeMaxDynamicSharedMemorySize,
         (int)shmem
     );
 
     hipLaunchKernelGGL(
-        fused_attention_kernel_1warp8q,
+        fused_attention_kernel_1warp8q_fast,
         grid, block, shmem, sAttn,
         tb_mb, q_mb, key_cache_mb, value_cache_mb,
         w->attn_sinks + (size_t)layer_idx * NA,

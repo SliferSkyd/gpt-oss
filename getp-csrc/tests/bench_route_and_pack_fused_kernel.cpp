@@ -1,5 +1,5 @@
-// bench_route_and_pack_fused_kernel.cpp
-// Benchmark harness for route_and_pack_fused_kernel from MoE GPU implementation
+// bench_route_and_pack_fused_kernel_optimized.cpp
+// Benchmark harness for route_and_pack_fused_kernel_optimized from MoE GPU implementation
 // Simulates real-world usage in moe_gpu function with multiple experts and token routing
 
 #include <hip/hip_runtime.h>
@@ -196,7 +196,7 @@ int main(int argc, char** argv) {
   const int TP = TENSOR_PARALLEL_SIZE;
   const int Bgrp = TP * batch_size;  // Union batch size across TP group
 
-  std::cout << "=== route_and_pack_fused_kernel Benchmark ===\n";
+  std::cout << "=== route_and_pack_fused_kernel_optimized Benchmark ===\n";
   std::cout << "Batch (union): " << Bgrp << " (local: " << batch_size << " × TP: " << TP << ")\n";
   std::cout << "Hidden dim: " << hidden_dim << "\n";
   std::cout << "Experts: " << n_experts << "\n";
@@ -283,7 +283,7 @@ int main(int argc, char** argv) {
 
   // Warmup
   for (int i = 0; i < 3; ++i) {
-    route_and_pack_fused_kernel<<<n_experts, threads, shmem, stream>>>(
+    route_and_pack_fused_kernel_optimized<<<n_experts, threads, shmem, stream>>>(
         d_x, Bgrp, hidden_dim,
         d_topk_i, d_topk_v, experts_per_token,
         d_expert_offsets, n_experts,
@@ -300,7 +300,7 @@ int main(int argc, char** argv) {
 
   HIP_CHECK(hipEventRecord(start, stream));
   for (int i = 0; i < iters; ++i) {
-    route_and_pack_fused_kernel<<<n_experts, threads, shmem, stream>>>(
+    route_and_pack_fused_kernel_optimized<<<n_experts, threads, shmem, stream>>>(
         d_x, Bgrp, hidden_dim,
         d_topk_i, d_topk_v, experts_per_token,
         d_expert_offsets, n_experts,
