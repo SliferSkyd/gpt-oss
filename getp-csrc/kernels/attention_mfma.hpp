@@ -173,3 +173,136 @@ void fused_attention_kernel_1warp8q(
     out_head[d] = (out_vec[s] * alpha_sink) / (l_final + SOFTMAX_EPS);
   }
 }
+
+
+__global__ __launch_bounds__(64, 8)
+void fused_attention_kernel_1warp8q_fast(
+    float * __restrict__ output, const float * __restrict__ q,
+    const __hip_bfloat16 * __restrict__ key_cache,
+    const __hip_bfloat16 * __restrict__ value_cache,
+    const __hip_bfloat16 * __restrict__ sinks, const float* /*mask*/,
+    const int * __restrict__ seq_lengths,
+    int B, int H, int KVH, int D, int /*seq_len*/,
+    int L, int layer_idx, bool use_sw,
+    size_t batch_kv_stride, size_t layer_kv_offset, int tile_t)
+{
+  const int kv_h = blockIdx.x, b = blockIdx.y;
+  if (b>=B || kv_h>=KVH || D!=64) return;
+  const int lane = threadIdx.x;               // 0..63
+  const int hloc = lane >> 3;                 // 0..7 (which Q head)
+  const int li   = lane & 7;                  // 0..7 (lane-in-head)
+  const int gqa  = 8;
+  const int h = kv_h*gqa + hloc; if (h>=H) return;
+
+  int pos = seq_lengths[b];
+  int t_start = (use_sw && ((layer_idx & 1)==0)) ? max(0, pos-(SW_WINDOW-1)) : 0;
+  const int n_steps = pos - t_start + 1;
+
+  const int kv_dim = D * KVH;
+  const __hip_bfloat16* __restrict__ K0 =
+      key_cache   + (size_t)b*batch_kv_stride + layer_kv_offset + (size_t)kv_h*D;
+  const __hip_bfloat16* __restrict__ V0 =
+      value_cache + (size_t)b*batch_kv_stride + layer_kv_offset + (size_t)kv_h*D;
+
+  // Pre-scale q by 1/sqrt(D) once
+  float qseg[8];
+  {
+    const float inv = rsqrtf(64.f);
+    const float* __restrict__ qh = q + (size_t)b*H*D + (size_t)h*D;
+    #pragma unroll
+    for (int s=0; s<8; ++s) qseg[s] = qh[li + 8*s] * inv;
+  }
+
+  extern __shared__ __hip_bfloat16 smem[];
+  __hip_bfloat16* sK = smem;
+  __hip_bfloat16* sV = sK + (size_t)tile_t * PADDED_HEAD_DIM;
+
+  // streaming softmax state (per head, stored on li==0 lane)
+  float m = -INFINITY, l = 0.f;
+  float out8[8] = {0,0,0,0,0,0,0,0};
+
+  // vec load helper
+  struct u128 { uint4 v; };
+  auto ld8 = [](__hip_bfloat16 const* p){ u128 r; r.v=*reinterpret_cast<uint4 const*>(p); return r; };
+
+  for (int base=0; base<n_steps; base+=tile_t) {
+    const int cur = min(tile_t, n_steps-base);
+
+    // stage K/V
+    const int vec8 = D/8;                 // 8 bf16 = 16B
+    const int tot  = cur * vec8;
+    for (int e=lane; e<tot; e+=64) {
+      int tloc = e / vec8;
+      int i8   = (e - tloc*vec8) * 8;
+      int t_abs = t_start + base + tloc;
+      int tw = ((layer_idx & 1)==0) ? (t_abs % SW_WINDOW) : t_abs;
+      *reinterpret_cast<u128*>(sK + (size_t)tloc*PADDED_HEAD_DIM + i8) =
+        ld8(K0 + (size_t)tw*kv_dim + i8);
+      *reinterpret_cast<u128*>(sV + (size_t)tloc*PADDED_HEAD_DIM + i8) =
+        ld8(V0 + (size_t)tw*kv_dim + i8);
+    }
+    __syncthreads();
+
+    // tokens in this tile
+    #pragma unroll 1
+    for (int t=0; t<cur; ++t) {
+      const __hip_bfloat16* __restrict__ krow = sK + (size_t)t*PADDED_HEAD_DIM;
+      const __hip_bfloat16* __restrict__ vrow = sV + (size_t)t*PADDED_HEAD_DIM;
+
+      // dot for this head across 64 dims split over 8 lanes
+      float part = 0.f;
+      #pragma unroll
+      for (int s=0; s<8; ++s) {
+        float k = __bfloat162float(krow[li + 8*s]);
+        part = fmaf(qseg[s], k, part);      // q pre-scaled
+      }
+      // subgroup-8 sum
+      part += __shfl_xor(part, 4, 8);
+      part += __shfl_xor(part, 2, 8);
+      part += __shfl_xor(part, 1, 8);
+
+      // leader does alpha/w; broadcast to subgroup
+      float alpha = 1.f, w = 0.f;
+      if (li==0) {
+        float s = part;                      // already scaled
+        float m_new = fmaxf(m, s);
+        alpha = __expf(m - m_new);
+        w     = __expf(s - m_new);
+        l     = l * alpha + w;
+        m     = m_new;
+      }
+      alpha = __shfl(alpha, (hloc<<3), 64);
+      w     = __shfl(w,     (hloc<<3), 64);
+
+      // numerator update for this lane's 8 dims
+      #pragma unroll
+      for (int s=0; s<8; ++s) {
+        float v = __bfloat162float(vrow[li + 8*s]);
+        out8[s] = fmaf(w, v, out8[s] * alpha);
+      }
+    }
+    __syncthreads();
+  }
+
+  // sink merge
+  float alpha_sink = 1.f, l_final = 0.f;
+  if (li==0) {
+    float ss = __bfloat162float(sinks[h]);
+    float m_new = fmaxf(m, ss);
+    float alpha = __expf(m - m_new);
+    float e     = __expf(ss - m_new);
+    l           = l * alpha + e;
+    alpha_sink  = alpha;
+    l_final     = l;
+  }
+  alpha_sink = __shfl(alpha_sink, (hloc<<3), 64);
+  l_final    = __shfl(l_final,    (hloc<<3), 64);
+
+  // store
+  float* __restrict__ oh = output + (size_t)b*H*D + (size_t)h*D;
+  #pragma unroll
+  for (int s=0; s<8; ++s) {
+    int d = li + 8*s;
+    oh[d] = (out8[s] * alpha_sink) / (l_final + SOFTMAX_EPS);
+  }
+}

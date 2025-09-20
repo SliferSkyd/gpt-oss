@@ -373,45 +373,6 @@ __global__ void topk_kernel(float *topk_values, int *topk_indices, const float *
     }
 }
 
-// "Gather" kernel: Finds tokens for an expert and creates a compact list.
-__global__ void gather_expert_inputs_kernel(const float *d_t, const int *topk_i, const float *topk_v,
-                                            int expert_id, int batch_size, int hidden_dim, int experts_per_token,
-                                            float *expert_input_buffer, int *expert_indices, float *expert_weights,
-                                            int *d_batch_count)
-{
-    int b = blockIdx.x * blockDim.x + threadIdx.x;
-    if (b >= batch_size)
-        return;
-
-    // Check if this token 'b' selected the current 'expert_id'
-    for (int k = 0; k < experts_per_token; ++k)
-    {
-        int topk_idx = b * experts_per_token + k;
-        if (topk_i[topk_idx] == expert_id)
-        {
-            // This token is routed to this expert.
-            // Atomically get a unique index for this token in the compact buffer.
-            int compact_idx = atomicAdd(d_batch_count, 1);
-
-            // Store the original batch index and weight for the scatter step.
-            expert_indices[compact_idx] = b;
-            expert_weights[compact_idx] = topk_v[topk_idx];
-
-            // Copy the hidden state from d_t into the compact input buffer.
-            // This is a strided copy, which is slow. For max performance,
-            // a second kernel could re-format this into a dense matrix.
-            // For logic matching, this is correct.
-            const float *src = d_t + b * hidden_dim;
-            float *dst = expert_input_buffer + compact_idx * hidden_dim;
-            for (int i = 0; i < hidden_dim; ++i)
-            {
-                dst[i] = src[i];
-            }
-            // break; // Token found its expert, move to next token
-        }
-    }
-}
-
 __global__ void reduce_tokenwise_expert_outputs(
     float *__restrict__ e_agg,               // [B, H]  (output)
     const float *__restrict__ expert_output, // [sum_tokens, H]
@@ -436,52 +397,6 @@ __global__ void reduce_tokenwise_expert_outputs(
         }
     }
     e_agg[(size_t)b * H + d] = acc;
-}
-
-__global__ void permute_expert_inputs_kernel(
-    const float *d_t, const int *topk_i, const float *topk_v,
-    const int *d_expert_offsets, int *d_expert_write_idx,
-    int batch_size, int hidden_dim, int experts_per_token,
-    float *expert_input_buffer,
-    // NEW: per-token stable mapping
-    int *local_ids, float *local_wts)
-{
-    int token_idx = blockIdx.x;
-    if (token_idx >= batch_size)
-        return;
-
-    extern __shared__ int destination_indices[]; // size: experts_per_token
-
-    // One thread per k handles the index math
-    if (threadIdx.x < experts_per_token)
-    {
-        const int k = threadIdx.x;
-        const int topk_flat_idx = token_idx * experts_per_token + k;
-        const int expert_id = topk_i[topk_flat_idx];
-
-        // Local position inside expert's block (order here does not matter
-        // anymore, we will remember the compact index explicitly)
-        const int local_idx = atomicAdd(&d_expert_write_idx[expert_id], 1);
-        const int compact_idx = d_expert_offsets[expert_id] + local_idx;
-
-        // NEW: remember the exact compact slot for (token, k)
-        local_ids[topk_flat_idx] = compact_idx;
-        local_wts[topk_flat_idx] = topk_v[topk_flat_idx];
-
-        destination_indices[k] = compact_idx;
-    }
-    __syncthreads();
-
-    // Coalesced copy of hidden vector into each expert slot
-    for (int k = 0; k < experts_per_token; ++k)
-    {
-        const float *src = d_t + (size_t)token_idx * hidden_dim;
-        float *dst = expert_input_buffer + (size_t)destination_indices[k] * hidden_dim;
-        for (int i = threadIdx.x; i < hidden_dim; i += blockDim.x)
-        {
-            dst[i] = src[i];
-        }
-    }
 }
 
 __global__ void route_and_pack_fused_kernel(
@@ -587,77 +502,6 @@ __global__ void route_and_pack_fused_kernel(
         if (tid == 0)
             carry_shared[0] += chunk_total;
         __syncthreads();
-    }
-}
-
-// "Scatter" kernel: Adds the expert outputs back to the final aggregation buffer.
-__global__ void scatter_expert_outputs_kernel(float *d_e_agg, const float *expert_output_buffer,
-                                              const int *expert_indices, const float *expert_weights,
-                                              int batch_count, int hidden_dim)
-{
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= batch_count * hidden_dim)
-        return;
-
-    int compact_idx = idx / hidden_dim;
-    int dim = idx % hidden_dim;
-
-    // Get the original batch index and the expert's router weight
-    int original_batch_idx = expert_indices[compact_idx];
-    float weight = expert_weights[compact_idx];
-
-    // Calculate the destination address in the main aggregation buffer
-    float *dst = d_e_agg + original_batch_idx * hidden_dim + dim;
-    float value = expert_output_buffer[idx];
-
-    // Atomically add the weighted result. This is crucial because multiple
-    // experts (if experts_per_token > 1) write to the same d_e_agg location.
-    atomicAdd(dst, value * weight);
-}
-
-// NEW: Improved MoE implementation with better expert routing
-__global__ void expert_routing_kernel(float *expert_weights, const int *topk_indices,
-                                      const float *topk_values, int batch_size,
-                                      int experts_per_token, int n_experts)
-{
-    int batch_idx = blockIdx.x;
-    int expert_slot = blockIdx.y;
-
-    if (batch_idx >= batch_size || expert_slot >= experts_per_token)
-        return;
-
-    int expert_id = topk_indices[batch_idx * experts_per_token + expert_slot];
-    float weight = topk_values[batch_idx * experts_per_token + expert_slot];
-
-    expert_weights[batch_idx * n_experts + expert_id] = weight;
-}
-
-// NEW KERNEL for correct MoE aggregation
-__global__ void aggregate_expert_output_kernel(float *d_e_agg, const float *expert_output,
-                                               const int *topk_indices, const float *topk_values,
-                                               int current_expert_id, int batch_size, int hidden_dim,
-                                               int experts_per_token)
-{
-    // Each thread handles one dimension of one token in the batch
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= batch_size * hidden_dim)
-        return;
-
-    int b = idx / hidden_dim; // Get the batch index for this thread
-
-    // Check if the current expert (current_expert_id) was selected for this token (b)
-    for (int k = 0; k < experts_per_token; ++k)
-    {
-        int expert_slot_idx = b * experts_per_token + k;
-        if (topk_indices[expert_slot_idx] == current_expert_id)
-        {
-            // This token uses this expert. Add the weighted output to the aggregation buffer.
-            float weight = topk_values[expert_slot_idx];
-            d_e_agg[idx] += weight * expert_output[idx];
-
-            // Since top-k indices are unique for a token, we can stop after finding the match
-            break;
-        }
     }
 }
 
