@@ -190,31 +190,31 @@ static void launch_baseline(
     batch_kv_stride, layer_kv_offset, tile_t
   );
 }
-static size_t get_device_max_dyn_shmem() {
-  int dev = 0;
-  HIP_CHECK(hipGetDevice(&dev));
+// static size_t get_device_max_dyn_shmem() {
+//   int dev = 0;
+//   HIP_CHECK(hipGetDevice(&dev));
 
-  int basic = 0;
-  hipError_t st_basic = hipDeviceGetAttribute(
-      &basic, hipDeviceAttributeMaxSharedMemoryPerBlock, dev);
-  if (st_basic != hipSuccess || basic <= 0) {
-    // Fallback if the query ever fails: assume 64 KiB (typical default)
-    basic = 64 * 1024;
-  }
+//   int basic = 0;
+//   hipError_t st_basic = hipDeviceGetAttribute(
+//       &basic, hipDeviceAttributeMaxSharedMemoryPerBlock, dev);
+//   if (st_basic != hipSuccess || basic <= 0) {
+//     // Fallback if the query ever fails: assume 64 KiB (typical default)
+//     basic = 64 * 1024;
+//   }
 
-  // On NVIDIA (HIP on CUDA), an "optin" cap may exist. Guard it so ROCm compiles.
-  // Only prefer it if it’s larger than the basic per-block limit.
-#if defined(__HIP_PLATFORM_NVIDIA__) && defined(hipDeviceAttributeMaxSharedMemoryPerBlockOptin)
-  int optin = 0;
-  hipError_t st_optin = hipDeviceGetAttribute(
-      &optin, hipDeviceAttributeMaxSharedMemoryPerBlockOptin, dev);
-  if (st_optin == hipSuccess && optin > basic) {
-    return static_cast<size_t>(optin);
-  }
-#endif
+//   // On NVIDIA (HIP on CUDA), an "optin" cap may exist. Guard it so ROCm compiles.
+//   // Only prefer it if it’s larger than the basic per-block limit.
+// #if defined(__HIP_PLATFORM_NVIDIA__) && defined(hipDeviceAttributeMaxSharedMemoryPerBlockOptin)
+//   int optin = 0;
+//   hipError_t st_optin = hipDeviceGetAttribute(
+//       &optin, hipDeviceAttributeMaxSharedMemoryPerBlockOptin, dev);
+//   if (st_optin == hipSuccess && optin > basic) {
+//     return static_cast<size_t>(optin);
+//   }
+// #endif
 
-  return static_cast<size_t>(basic);
-}
+//   return static_cast<size_t>(basic);
+// }
 
 static void launch_optimized_old(
     dim3 /*grid_ignored*/, dim3 /*block_ignored*/, size_t /*shmem_ignored*/, hipStream_t stream,
@@ -268,49 +268,229 @@ static void launch_optimized_old(
 }
 
 
-static void launch_optimized(
-    dim3, dim3, size_t, hipStream_t stream,
-    float* out, const float* q,
+// static void launch_optimized(
+//     dim3, dim3, size_t, hipStream_t stream,
+//     float* out, const float* q,
+//     const __hip_bfloat16* key_cache, const __hip_bfloat16* value_cache,
+//     const __hip_bfloat16* sinks, const float* mask, const int* seq_lengths,
+//     int batch_size, int n_heads, int n_kv_heads, int head_dim,
+//     int seq_len, int n_layers, int layer_idx, bool use_sw,
+//     size_t batch_kv_stride, size_t layer_kv_offset, int tile_t_in)
+// {
+//   if (batch_size<=0 || n_kv_heads<=0 || n_heads<=0 || head_dim!=64) return;
+//   const int gqa_ratio = n_heads / n_kv_heads;
+//   if (gqa_ratio != 8) return;
+
+//   const int sw_cap = (use_sw && ((layer_idx & 1) == 0)) ? SW_WINDOW : 112;
+//   int tile_t = tile_t_in > 0 ? tile_t_in : std::min(112, sw_cap);
+
+//   dim3 block(64, 1, 1);                 // <-- single warp
+//   dim3 grid(n_kv_heads, batch_size, 1);
+
+//   size_t sK_bytes = (size_t)tile_t * PADDED_HEAD_DIM * sizeof(__hip_bfloat16);
+//   size_t sV_bytes = (size_t)tile_t * PADDED_HEAD_DIM * sizeof(__hip_bfloat16);
+//   size_t shmem_bytes = sK_bytes + sV_bytes;
+
+//   size_t max_dyn = get_device_max_dyn_shmem();
+//   if (max_dyn > 0 && shmem_bytes > max_dyn) {
+//     int max_tile = (int)(max_dyn / (2 * PADDED_HEAD_DIM * sizeof(__hip_bfloat16)));
+//     max_tile = std::max(1, std::min(max_tile, sw_cap));
+//     tile_t   = std::min(tile_t, max_tile);
+//     shmem_bytes = (size_t)2 * tile_t * PADDED_HEAD_DIM * sizeof(__hip_bfloat16);
+//   }
+
+//   (void)hipFuncSetAttribute((const void*)fused_attention_kernel_1warp8q,
+//                             hipFuncAttributeMaxDynamicSharedMemorySize,
+//                             (int)shmem_bytes);
+
+//   hipLaunchKernelGGL(
+//       fused_attention_kernel_1warp8q,
+//       grid, block, shmem_bytes, stream,
+//       out, q, key_cache, value_cache,
+//       sinks, mask, seq_lengths,
+//       batch_size, n_heads, n_kv_heads, head_dim,
+//       seq_len, n_layers, layer_idx, use_sw,
+//       batch_kv_stride, layer_kv_offset, tile_t
+//   );
+// }
+
+
+// =====================
+// Host launchers
+// =====================
+
+// Returns the device's max dynamic shared memory (bytes); assumed to exist elsewhere in your codebase.
+// int get_device_max_dyn_shmem();
+
+static void launch_flashdecoding_phase1(
+    hipStream_t stream,
+    // outputs
+    float* partial_out, float* partial_m, float* partial_l,
+    // inputs
+    const float* q,
     const __hip_bfloat16* key_cache, const __hip_bfloat16* value_cache,
-    const __hip_bfloat16* sinks, const float* mask, const int* seq_lengths,
+    const int* seq_lengths,
     int batch_size, int n_heads, int n_kv_heads, int head_dim,
-    int seq_len, int n_layers, int layer_idx, bool use_sw,
-    size_t batch_kv_stride, size_t layer_kv_offset, int tile_t_in)
-{
-  if (batch_size<=0 || n_kv_heads<=0 || n_heads<=0 || head_dim!=64) return;
+    int L, int layer_idx, bool use_sw,
+    size_t batch_kv_stride, size_t layer_kv_offset,
+    int split_t_in,                             // requested split length (tokens per split)
+    int* out_max_splits,                        // return value: max_splits used
+    int* out_split_t                            // return value: split_t actually used
+){
+  if (batch_size<=0 || n_kv_heads<=0 || n_heads<=0 || head_dim!=64) { *out_max_splits=0; *out_split_t=0; return; }
   const int gqa_ratio = n_heads / n_kv_heads;
-  if (gqa_ratio != 8) return;
+  if (gqa_ratio != 8) { *out_max_splits=0; *out_split_t=0; return; }
 
-  const int sw_cap = (use_sw && ((layer_idx & 1) == 0)) ? SW_WINDOW : 112;
-  int tile_t = tile_t_in > 0 ? tile_t_in : std::min(112, sw_cap);
+  // Cap the effective sequence for this layer (SW or full)
+  const int sw_cap = (use_sw && ((layer_idx & 1) == 0)) ? SW_WINDOW : L;
 
-  dim3 block(64, 1, 1);                 // <-- single warp
-  dim3 grid(n_kv_heads, batch_size, 1);
-
-  size_t sK_bytes = (size_t)tile_t * PADDED_HEAD_DIM * sizeof(__hip_bfloat16);
-  size_t sV_bytes = (size_t)tile_t * PADDED_HEAD_DIM * sizeof(__hip_bfloat16);
-  size_t shmem_bytes = sK_bytes + sV_bytes;
-
+  // Choose split size subject to dynamic shared memory limits:
+  // SMEM needed = 2 * split_t * PADDED_HEAD_DIM * sizeof(bf16)
+  int split_t = split_t_in > 0 ? split_t_in : min(112, sw_cap);
+  size_t shmem_bytes = (size_t)2 * split_t * PADDED_HEAD_DIM * sizeof(__hip_bfloat16);
   size_t max_dyn = get_device_max_dyn_shmem();
   if (max_dyn > 0 && shmem_bytes > max_dyn) {
-    int max_tile = (int)(max_dyn / (2 * PADDED_HEAD_DIM * sizeof(__hip_bfloat16)));
-    max_tile = std::max(1, std::min(max_tile, sw_cap));
-    tile_t   = std::min(tile_t, max_tile);
-    shmem_bytes = (size_t)2 * tile_t * PADDED_HEAD_DIM * sizeof(__hip_bfloat16);
+    int max_t = (int)(max_dyn / (2 * PADDED_HEAD_DIM * sizeof(__hip_bfloat16)));
+    max_t = max(1, min(max_t, sw_cap));
+    split_t = min(split_t, max_t);
+    shmem_bytes = (size_t)2 * split_t * PADDED_HEAD_DIM * sizeof(__hip_bfloat16);
   }
 
-  (void)hipFuncSetAttribute((const void*)fused_attention_kernel_1warp8q,
+  const int max_splits = (sw_cap + split_t - 1) / split_t;
+
+  dim3 block(64, 1, 1);
+  dim3 grid(n_kv_heads, batch_size, max_splits);
+
+  (void)hipFuncSetAttribute((const void*)flashdecoding_phase1_kernel_1warp8q,
                             hipFuncAttributeMaxDynamicSharedMemorySize,
                             (int)shmem_bytes);
 
   hipLaunchKernelGGL(
-      fused_attention_kernel_1warp8q,
+      flashdecoding_phase1_kernel_1warp8q,
       grid, block, shmem_bytes, stream,
-      out, q, key_cache, value_cache,
-      sinks, mask, seq_lengths,
-      batch_size, n_heads, n_kv_heads, head_dim,
-      seq_len, n_layers, layer_idx, use_sw,
-      batch_kv_stride, layer_kv_offset, tile_t
+      partial_out, partial_m, partial_l,
+      q, key_cache, value_cache, seq_lengths,
+      batch_size, n_heads, n_kv_heads, head_dim, L,
+      layer_idx, use_sw, batch_kv_stride, layer_kv_offset, split_t
+  );
+
+  if (out_max_splits) *out_max_splits = max_splits;
+  if (out_split_t)    *out_split_t    = split_t;
+}
+
+static void launch_flashdecoding_reduce(
+    hipStream_t stream,
+    // final output
+    float* out,
+    // phase-1 partials
+    const float* partial_out, const float* partial_m, const float* partial_l,
+    // sink + meta
+    const __hip_bfloat16* sinks, const int* seq_lengths,
+    int batch_size, int n_heads, int n_kv_heads, int head_dim,
+    int L, int layer_idx, bool use_sw,
+    int max_splits, int split_t
+){
+  if (batch_size<=0 || n_kv_heads<=0 || n_heads<=0 || head_dim!=64 || max_splits<=0 || split_t<=0) return;
+  const int gqa_ratio = n_heads / n_kv_heads;
+  if (gqa_ratio != 8) return;
+
+  dim3 block(64, 1, 1);
+  dim3 grid(n_kv_heads, batch_size, 1);
+
+  hipLaunchKernelGGL(
+      flashdecoding_reduce_splits_kernel_1warp8q,
+      grid, block, /*shmem=*/0, stream,
+      out, partial_out, partial_m, partial_l,
+      sinks, seq_lengths,
+      batch_size, n_heads, n_kv_heads, head_dim, L,
+      layer_idx, use_sw,
+      max_splits, split_t
+  );
+}
+
+
+
+// Fused Flash-Decoding launcher with the original interface.
+// Replaces the previous single-warp path with a multi-warp split-parallel kernel.
+// Assumes the kernel `flashdecoding_fused_multiwarp_1warp8q` is defined elsewhere.
+
+#ifndef FD_MAX_WARPS_PER_CTA
+#define FD_MAX_WARPS_PER_CTA 4   // Good default; try 4 or 6 on MI2xx/MI3xx
+#endif
+
+// extern size_t get_device_max_dyn_shmem();
+
+static void launch_optimized(
+    dim3 /*unused_grid_hint*/, dim3 /*unused_block_hint*/, size_t /*unused_shmem_hint*/,
+    hipStream_t stream,
+    float* out, const float* q,
+    const __hip_bfloat16* key_cache, const __hip_bfloat16* value_cache,
+    const __hip_bfloat16* sinks, const float* /*mask*/, const int* seq_lengths,
+    int batch_size, int n_heads, int n_kv_heads, int head_dim,
+    int seq_len, int /*n_layers*/, int layer_idx, bool use_sw,
+    size_t batch_kv_stride, size_t layer_kv_offset, int tile_t_in // tile_t_in == split_t
+){
+  // Guard unsupported configs (match previous behavior)
+  if (batch_size<=0 || n_kv_heads<=0 || n_heads<=0 || head_dim!=64) return;
+  const int gqa_ratio = n_heads / n_kv_heads;
+  if (gqa_ratio != 8) return;
+
+  // Effective sequence cap (sliding window on even layers if enabled)
+  const int sw_cap = (use_sw && ((layer_idx & 1) == 0)) ? SW_WINDOW : seq_len;
+  if (sw_cap <= 0) return;
+
+  // Choose split size over sequence (defaults similar to prior code)
+  int split_t = (tile_t_in > 0) ? tile_t_in : min(112, sw_cap);
+  split_t = max(1, min(split_t, sw_cap));
+
+  // Estimate max splits (worst case, since per-b seq length is on device)
+  const int max_splits_est = (sw_cap + split_t - 1) / split_t;
+
+  // Choose number of warps per CTA (parallel over splits)
+  int W = FD_MAX_WARPS_PER_CTA;
+  W = max(1, min(W, 8));                    // safety clamp
+  W = min(W, max(1, max_splits_est));       // don't exceed needed parallelism
+
+  // Dynamic shared memory only used for final per-CTA reduction:
+  //   W * (64 lanes * 8 floats per lane   // vectors
+  //      + 8                              // m per head
+  //      + 8)                             // l per head
+  size_t shmem_floats = (size_t)W * (64*8 + 8 + 8);
+  size_t shmem_bytes = shmem_floats * sizeof(float);
+
+  // Respect device dynamic shared memory budget by reducing W if needed
+  const size_t max_dyn = get_device_max_dyn_shmem();
+  if (max_dyn > 0 && shmem_floats > 0 && shmem_floats * sizeof(float) > max_dyn) {
+    int best_W = W;
+    for (int w=W; w>=1; --w) {
+      const size_t need = (size_t)w * (64*8 + 8 + 8) * sizeof(float);
+      if (need <= max_dyn) { best_W = w; break; }
+    }
+    W = max(1, best_W);
+    shmem_floats = (size_t)W * (64*8 + 8 + 8);
+    shmem_bytes  = shmem_floats * sizeof(float);
+  }
+
+  // Threads per block
+  dim3 block(64 * W, 1, 1);
+  dim3 grid(n_kv_heads, batch_size, 1);
+
+  // Advertise dynamic smem usage
+  (void)hipFuncSetAttribute((const void*)flashdecoding_fused_multiwarp_1warp8q,
+                            hipFuncAttributeMaxDynamicSharedMemorySize,
+                            (int)shmem_bytes);
+
+  // Launch fused Flash-Decoding kernel
+  hipLaunchKernelGGL(
+      flashdecoding_fused_multiwarp_1warp8q,
+      grid, block, (unsigned)shmem_bytes, stream,
+      out, q,
+      key_cache, value_cache,
+      sinks, seq_lengths,
+      batch_size, n_heads, n_kv_heads, head_dim, seq_len,
+      layer_idx, use_sw,
+      batch_kv_stride, layer_kv_offset,
+      split_t
   );
 }
 
