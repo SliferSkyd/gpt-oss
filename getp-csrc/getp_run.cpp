@@ -1856,6 +1856,7 @@ void attention_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size,
     // 6) fused attention
     // --- optimized launch (tile_t = 48, same policy as launch_optimized) ---
     {
+        // TIMER_BLOCK("flashdecoding_fused");
         // --- Fused Flash-Decoding (fast-merge, no K/V staging) launch --------------------
         // Uses 4 warps/block (256 threads). Tune WARPS if needed (e.g., 2 or 6).
         const int B = batch_size;
