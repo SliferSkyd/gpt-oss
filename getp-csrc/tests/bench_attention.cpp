@@ -190,31 +190,31 @@ static void launch_baseline_old(
     batch_kv_stride, layer_kv_offset, tile_t
   );
 }
-// static size_t get_device_max_dyn_shmem() {
-//   int dev = 0;
-//   HIP_CHECK(hipGetDevice(&dev));
+static size_t get_device_max_dyn_shmem() {
+  int dev = 0;
+  HIP_CHECK(hipGetDevice(&dev));
 
-//   int basic = 0;
-//   hipError_t st_basic = hipDeviceGetAttribute(
-//       &basic, hipDeviceAttributeMaxSharedMemoryPerBlock, dev);
-//   if (st_basic != hipSuccess || basic <= 0) {
-//     // Fallback if the query ever fails: assume 64 KiB (typical default)
-//     basic = 64 * 1024;
-//   }
+  int basic = 0;
+  hipError_t st_basic = hipDeviceGetAttribute(
+      &basic, hipDeviceAttributeMaxSharedMemoryPerBlock, dev);
+  if (st_basic != hipSuccess || basic <= 0) {
+    // Fallback if the query ever fails: assume 64 KiB (typical default)
+    basic = 64 * 1024;
+  }
 
-//   // On NVIDIA (HIP on CUDA), an "optin" cap may exist. Guard it so ROCm compiles.
-//   // Only prefer it if it’s larger than the basic per-block limit.
-// #if defined(__HIP_PLATFORM_NVIDIA__) && defined(hipDeviceAttributeMaxSharedMemoryPerBlockOptin)
-//   int optin = 0;
-//   hipError_t st_optin = hipDeviceGetAttribute(
-//       &optin, hipDeviceAttributeMaxSharedMemoryPerBlockOptin, dev);
-//   if (st_optin == hipSuccess && optin > basic) {
-//     return static_cast<size_t>(optin);
-//   }
-// #endif
+  // On NVIDIA (HIP on CUDA), an "optin" cap may exist. Guard it so ROCm compiles.
+  // Only prefer it if it’s larger than the basic per-block limit.
+#if defined(__HIP_PLATFORM_NVIDIA__) && defined(hipDeviceAttributeMaxSharedMemoryPerBlockOptin)
+  int optin = 0;
+  hipError_t st_optin = hipDeviceGetAttribute(
+      &optin, hipDeviceAttributeMaxSharedMemoryPerBlockOptin, dev);
+  if (st_optin == hipSuccess && optin > basic) {
+    return static_cast<size_t>(optin);
+  }
+#endif
 
-//   return static_cast<size_t>(basic);
-// }
+  return static_cast<size_t>(basic);
+}
 
 // static void launch_baseline(
 //     dim3 /*grid_ignored*/, dim3 /*block_ignored*/, size_t /*shmem_ignored*/, hipStream_t stream,
@@ -327,79 +327,50 @@ static void launch_baseline(
 
 // extern size_t get_device_max_dyn_shmem();
 
+// ---------------------------------
+// Launcher
+// ---------------------------------
 static void launch_optimized(
-    dim3 /*unused_grid_hint*/, dim3 /*unused_block_hint*/, size_t /*unused_shmem_hint*/,
-    hipStream_t stream,
+    dim3, dim3, size_t, hipStream_t stream,
     float* out, const float* q,
     const __hip_bfloat16* key_cache, const __hip_bfloat16* value_cache,
-    const __hip_bfloat16* sinks, const float* /*mask*/, const int* seq_lengths,
+    const __hip_bfloat16* sinks, const float* mask, const int* seq_lengths,
     int batch_size, int n_heads, int n_kv_heads, int head_dim,
-    int seq_len, int /*n_layers*/, int layer_idx, bool use_sw,
-    size_t batch_kv_stride, size_t layer_kv_offset, int tile_t_in // tile_t_in == split_t
-){
-  // Guard unsupported configs (match previous behavior)
+    int seq_len, int n_layers, int layer_idx, bool use_sw,
+    size_t batch_kv_stride, size_t layer_kv_offset, int tile_t_ignored)
+{
   if (batch_size<=0 || n_kv_heads<=0 || n_heads<=0 || head_dim!=64) return;
   const int gqa_ratio = n_heads / n_kv_heads;
   if (gqa_ratio != 8) return;
 
-  // Effective sequence cap (sliding window on even layers if enabled)
-  const int sw_cap = (use_sw && ((layer_idx & 1) == 0)) ? SW_WINDOW : seq_len;
-  if (sw_cap <= 0) return;
+  // Use 4 warps per block (256 threads) by default — good balance of latency hiding
+  // without inflating the reduction buffer.
+  const int warps_per_block = 4;
 
-  // Choose split size over sequence (defaults similar to prior code)
-  int split_t = (tile_t_in > 0) ? tile_t_in : min(112, sw_cap);
-  split_t = max(1, min(split_t, sw_cap));
-
-  // Estimate max splits (worst case, since per-b seq length is on device)
-  const int max_splits_est = (sw_cap + split_t - 1) / split_t;
-
-  // Choose number of warps per CTA (parallel over splits)
-  int W = FD_MAX_WARPS_PER_CTA;
-  W = max(1, min(W, 8));                    // safety clamp
-  W = min(W, max(1, max_splits_est));       // don't exceed needed parallelism
-
-  // Dynamic shared memory only used for final per-CTA reduction:
-  //   W * (64 lanes * 8 floats per lane   // vectors
-  //      + 8                              // m per head
-  //      + 8)                             // l per head
-  size_t shmem_floats = (size_t)W * (64*8 + 8 + 8);
-  size_t shmem_bytes = shmem_floats * sizeof(float);
-
-  // Respect device dynamic shared memory budget by reducing W if needed
-  const size_t max_dyn = get_device_max_dyn_shmem();
-  if (max_dyn > 0 && shmem_floats > 0 && shmem_floats * sizeof(float) > max_dyn) {
-    int best_W = W;
-    for (int w=W; w>=1; --w) {
-      const size_t need = (size_t)w * (64*8 + 8 + 8) * sizeof(float);
-      if (need <= max_dyn) { best_W = w; break; }
-    }
-    W = max(1, best_W);
-    shmem_floats = (size_t)W * (64*8 + 8 + 8);
-    shmem_bytes  = shmem_floats * sizeof(float);
-  }
-
-  // Threads per block
-  dim3 block(64 * W, 1, 1);
+  dim3 block(64 * warps_per_block, 1, 1);
   dim3 grid(n_kv_heads, batch_size, 1);
 
-  // Advertise dynamic smem usage
-  (void)hipFuncSetAttribute((const void*)flashdecoding_fused_multiwarp_1warp8q,
+  // Shared memory for the fast-merge reduction only:
+  // (m,l): 2 * W * 8 floats  +  numerators: W * 64 * 8 floats
+  const size_t red_bytes = (size_t)((2 * warps_per_block * 8) + (warps_per_block * 64 * 8)) * sizeof(float);
+  const size_t shmem_bytes = red_bytes;
+
+  (void)hipFuncSetAttribute((const void*)flashdecoding_fused_fastmerge_nostage_1warp8q,
                             hipFuncAttributeMaxDynamicSharedMemorySize,
                             (int)shmem_bytes);
 
-  // Launch fused Flash-Decoding kernel
   hipLaunchKernelGGL(
-      flashdecoding_fused_multiwarp_1warp8q,
-      grid, block, (unsigned)shmem_bytes, stream,
-      out, q,
-      key_cache, value_cache,
-      sinks, seq_lengths,
-      batch_size, n_heads, n_kv_heads, head_dim, seq_len,
-      layer_idx, use_sw,
-      batch_kv_stride, layer_kv_offset,
-      split_t
+      flashdecoding_fused_fastmerge_nostage_1warp8q,
+      grid, block, shmem_bytes, stream,
+      out, q, key_cache, value_cache,
+      sinks, mask, seq_lengths,
+      batch_size, n_heads, n_kv_heads, head_dim,
+      seq_len, n_layers, layer_idx, use_sw,
+      batch_kv_stride, layer_kv_offset, /*tile_t_unused=*/0
   );
 }
+
+
 
 
 // In your benchmark switching logic, you would now call launch_mfma

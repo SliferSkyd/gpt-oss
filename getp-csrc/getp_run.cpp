@@ -68,13 +68,12 @@ typedef struct
     __hip_bfloat16 *w_mlp2; // (n_layers, n_experts, H,   D) row-major [O=H,  I=D]
     __hip_bfloat16 *b_mlp1, *b_mlp2;
 
-     // MoE weights now use MXFP4 quantization
+    // MoE weights now use MXFP4 quantization
     // MoE weights (pure BF16 now)
     uint8_t *w_mlp1_mxfp4, *w_mlp2_mxfp4;   // packed n/2 bytes
     uint8_t *w_mlp1_scales, *w_mlp2_scales; // n/32 bytes (e8m0 per block)
     // GPUTransformerWeights (add two pointers)
     float *w_mlp1_scales_f32, *w_mlp2_scales_f32; // one float per 32 elems
-
 
     // Output weights
     __hip_bfloat16 *out; // (vocab_size, hidden_dim)
@@ -333,15 +332,17 @@ void malloc_gpu_run_state(GPURunState *s, Config *p)
     HIP_CHECK(hipMalloc((void **)&s->gate_up_g, (size_t)pairs_max * Dloc_max * sizeof(float)));
     HIP_CHECK(hipMalloc((void **)&s->expert_output_partial_g, (size_t)pairs_max * H * sizeof(float)));
     HIP_CHECK(hipMalloc((void **)&s->expert_output_gather_g, (size_t)TP * pairs_max * H * sizeof(float)));
-    
+
     // Calculate maximum possible tiles needed
     // In worst case, all tokens could be distributed across experts
     // Each expert processes its tokens in tiles of size BLOCK_M_MLP
     // Since each token selects K experts, max tokens per expert is min(pairs_max, Bgrp_max * K)
     // But to be safe, we assume worst-case distribution
     int max_tiles_per_expert = (pairs_max + BLOCK_M_MLP - 1) / BLOCK_M_MLP;
-    if(IS_20B_MODEL) s->cap_tiles = max_tiles_per_expert * 2;  // 2x safety factor for worst-case distribution
-    else s->cap_tiles = max_tiles_per_expert * 4; // 4x safety factor for worst-case distribution
+    if (IS_20B_MODEL)
+        s->cap_tiles = max_tiles_per_expert * 2; // 2x safety factor for worst-case distribution
+    else
+        s->cap_tiles = max_tiles_per_expert * 4; // 4x safety factor for worst-case distribution
 
     HIP_CHECK(hipMalloc((void **)&s->d_tile2expert_g, s->cap_tiles * sizeof(int)));
     HIP_CHECK(hipMalloc((void **)&s->d_tile2local_g, s->cap_tiles * sizeof(int)));
@@ -456,8 +457,6 @@ void malloc_gpu_weights_20b(GPUTransformerWeights *w, Config *p)
     HIP_CHECK(hipMalloc((void **)&w->out, p->hidden_dim * p->vocab_size * sizeof(__hip_bfloat16)));
     HIP_CHECK(hipMalloc((void **)&w->attn_sinks, p->n_layers * p->n_attn_heads * sizeof(__hip_bfloat16)));
 }
-
-
 
 void malloc_gpu_weights_120b(GPUTransformerWeights *w, Config *p)
 {
@@ -790,7 +789,6 @@ void copy_weights_to_gpu_20b(Transformer *transformer, GPUTransformerWeights *gp
     printf("Weights copied. w_qkv and out are transposed in-place on GPU ([K,N] layout).\n");
 }
 
-
 __global__ void e8m0_to_f32_kernel(const uint8_t *__restrict__ e8,
                                    float *__restrict__ f, size_t nblocks)
 {
@@ -936,7 +934,6 @@ static void streaming_quantize_copy_mxfp4_cpu_to_gpu(
         // Ensure we don't overwrite buffers still in use (rare with two buffers, but safe)
         HIP_CHECK(hipEventSynchronize(compute_done[ping]));
 
-      
         fflush(stdout);
     }
 
@@ -1575,36 +1572,40 @@ void free_cpu_buffers(CPUBuffers *cpu_buf)
 
 void build_gpu_transformer(GPUTransformer *gpu_t, Transformer *cpu_t)
 {
-    if(IS_20B_MODEL){
-    gpu_t->config = cpu_t->config;
-
-    malloc_gpu_weights_20b(&gpu_t->weights, &gpu_t->config);
-    malloc_gpu_run_state(&gpu_t->state, &gpu_t->config);
-    malloc_cpu_buffers(&gpu_t->cpu_buffers, &gpu_t->config);
-
-    copy_weights_to_gpu_20b(cpu_t, &gpu_t->weights);
-    }else{
+    if (IS_20B_MODEL)
+    {
         gpu_t->config = cpu_t->config;
 
-    malloc_gpu_weights_120b(&gpu_t->weights, &gpu_t->config);
-    malloc_gpu_run_state(&gpu_t->state, &gpu_t->config);
-    malloc_cpu_buffers(&gpu_t->cpu_buffers, &gpu_t->config);
+        malloc_gpu_weights_20b(&gpu_t->weights, &gpu_t->config);
+        malloc_gpu_run_state(&gpu_t->state, &gpu_t->config);
+        malloc_cpu_buffers(&gpu_t->cpu_buffers, &gpu_t->config);
 
-    copy_weights_to_gpu_120b(cpu_t, &gpu_t->weights);
-
+        copy_weights_to_gpu_20b(cpu_t, &gpu_t->weights);
     }
+    else
+    {
+        gpu_t->config = cpu_t->config;
 
+        malloc_gpu_weights_120b(&gpu_t->weights, &gpu_t->config);
+        malloc_gpu_run_state(&gpu_t->state, &gpu_t->config);
+        malloc_cpu_buffers(&gpu_t->cpu_buffers, &gpu_t->config);
+
+        copy_weights_to_gpu_120b(cpu_t, &gpu_t->weights);
+    }
 }
 
 void warm_up(Transformer *transformer, Tokenizer *tokenizer)
 {
     Config *p = &transformer->config;
-    if(p->n_experts == 32) IS_20B_MODEL = 1;
-    else IS_20B_MODEL = 0;
+    if (p->n_experts == 32)
+        IS_20B_MODEL = 1;
+    else
+        IS_20B_MODEL = 0;
 
-    if(IS_20B_MODEL) BATCH_SIZE = 1024;
-    else BATCH_SIZE = 512;
-
+    if (IS_20B_MODEL)
+        BATCH_SIZE = 1024;
+    else
+        BATCH_SIZE = 512;
 
     HIP_CHECK(hipGetDeviceCount(&num_gpus));
     if (num_gpus > MAX_GPUS)
@@ -1671,7 +1672,7 @@ void free_gpu_weights(GPUTransformerWeights *w)
     if (w->w_mlp2)
         HIP_CHECK(hipFree(w->w_mlp2));
 
-      if (w->w_mlp1_mxfp4)
+    if (w->w_mlp1_mxfp4)
         HIP_CHECK(hipFree(w->w_mlp1_mxfp4));
     if (w->w_mlp2_mxfp4)
         HIP_CHECK(hipFree(w->w_mlp2_mxfp4));
@@ -1813,12 +1814,11 @@ void attention_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size,
         // TIMER_BLOCK("matmul_mc_attention");
         const int woff = layer_idx * H * QKV;
         matmul<
-            /*WM,WN,WK*/ 16,16,16,
-            /*WAVES_M,N,K*/ 4,4,2,
-            /*TW_M,TW_N*/ 1,1,
+            /*WM,WN,WK*/ 16, 16, 16,
+            /*WAVES_M,N,K*/ 4, 4, 2,
+            /*TW_M,TW_N*/ 1, 1,
             /*PAD_K*/ 8,
-            /*FUSED*/ false
-        >(qkv_mb, t_mb, w->w_qkv + woff, batch_size, H, QKV, nullptr, sAttn);
+            /*FUSED*/ false>(qkv_mb, t_mb, w->w_qkv + woff, batch_size, H, QKV, nullptr, sAttn);
         HIP_CHECK(hipGetLastError());
     }
     // 3) bias
@@ -1854,77 +1854,62 @@ void attention_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size,
             /* layer_kv_offset = */ layer_elem_offset);
     }
     // 6) fused attention
-     // --- optimized launch (tile_t = 48, same policy as launch_optimized) ---
-{
-        // TIMER_BLOCK("fused_attention_kernel");
+    // --- optimized launch (tile_t = 48, same policy as launch_optimized) ---
+    {
+        // --- Fused Flash-Decoding (fast-merge, no K/V staging) launch --------------------
+        // Uses 4 warps/block (256 threads). Tune WARPS if needed (e.g., 2 or 6).
+        const int B = batch_size;
+        const int H = NA;   // n_attn_heads
+        const int NKv = NK; // n_kv_heads
+        const int D = Hd;
 
-    const int B   = batch_size;
-    const int H   = NA;   // n_attn_heads
-    const int NKv = NK;   // n_kv_heads
-    const int D   = Hd;
+        // GQA ratio (should be 8 for this kernel path)
+        const int kv_mul = H / NKv; // == 8
+        if (kv_mul != 8 || D != 64)
+        {
+            // Fall back to your baseline if you want, or assert.
+            // For now, just return to avoid a bad launch.
+            HIP_CHECK(hipSuccess);
+        }
+        else
+        {
+            // Block/grid mapping: multi-warp per (b, kv_h)
+            const int WARPS = 4;          // <<< tune knob
+            dim3 block(64 * WARPS, 1, 1); // 64 = AMD warp size
+            dim3 grid(NKv, B, 1);
 
-    // GQA ratio: heads per KV head (unused by this launcher; kernel handles 8 heads per warp)
-    const int kv_mul = H / NKv;  // == 8
+            // Shared memory only for fast-merge reduction:
+            // (m,l): 2 * WARPS * 8 floats  +  numerators: WARPS * 64 * 8 floats
+            const size_t shmem =
+                (size_t)((2 * WARPS * 8) + (WARPS * 64 * 8)) * sizeof(float);
 
-    // SW cap: even layers use sliding window, odd layers use full length (cap@112)
-    const int sw_cap = (p->sliding_window > 0 && ((layer_idx & 1) == 0))
-                       ? SW_WINDOW
-                       : 112;
+            // Request dynamic LDS (ignore return; optional on some stacks)
+            (void)hipFuncSetAttribute(
+                (const void *)flashdecoding_fused_fastmerge_nostage_1warp8q,
+                hipFuncAttributeMaxDynamicSharedMemorySize,
+                (int)shmem);
 
-    // Tile length for single-warp kernel; 96–112 is usually best
-    int T = std::min(112, sw_cap);
+            hipLaunchKernelGGL(
+                flashdecoding_fused_fastmerge_nostage_1warp8q,
+                grid, block, shmem, sAttn,
+                /* output      */ tb_mb,
+                /* q           */ q_mb,
+                /* key_cache   */ key_cache_mb,
+                /* value_cache */ value_cache_mb,
+                /* sinks       */ w->attn_sinks + (size_t)layer_idx * NA,
+                /* mask        */ s->mask,
+                /* seq_lengths */ pos_mb,
+                /* B,H,KVH,D   */ batch_size, NA, NKv, Hd,
+                /* seq_len,L   */ MAX_SEQ_LEN, p->n_layers,
+                /* layer_idx   */ layer_idx,
+                /* use_sw      */ p->sliding_window > 0,
+                /* strides     */ /* batch_kv_stride = */ layers_capacity * (size_t)KV,
+                /* offsets     */ /* layer_kv_offset  = */ layer_elem_offset,
+                /* tile_t_unused */ 0);
 
-    // Block/grid mapping for 1-warp-per-KV-head:
-    // 64 lanes, 1 warp (the kernel internally processes 8 query heads)
-    dim3 block(64, 1, 1);
-    dim3 grid(NKv, B, 1);
-
-    // Shared memory footprint (bf16): sK + sV = 2 * T * PADDED_HEAD_DIM
-    constexpr int PADDED_HEAD_DIM = 72;
-    size_t shmem = (size_t)2 * (size_t)T * (size_t)PADDED_HEAD_DIM * sizeof(__hip_bfloat16);
-
-    // Cap tile_t against device max dynamic shared memory
-    auto get_max_dyn_shmem = []() -> size_t {
-        int dev = 0, basic = 0;
-        HIP_CHECK(hipGetDevice(&dev));
-        hipError_t st = hipDeviceGetAttribute(
-            &basic, hipDeviceAttributeMaxSharedMemoryPerBlock, dev);
-        if (st != hipSuccess || basic <= 0) basic = 64 * 1024; // safe fallback
-        return (size_t)basic;
-    };
-
-    const size_t max_dyn = get_max_dyn_shmem();
-    if (max_dyn > 0 && shmem > max_dyn) {
-        int max_tile = (int)(max_dyn / (2 * PADDED_HEAD_DIM * sizeof(__hip_bfloat16)));
-        max_tile = std::max(1, std::min(max_tile, sw_cap));
-        T = std::min(T, max_tile);
-        shmem = (size_t)2 * (size_t)T * (size_t)PADDED_HEAD_DIM * sizeof(__hip_bfloat16);
+            HIP_CHECK(hipGetLastError());
+        }
     }
-
-    // Request dynamic LDS (ignore return; not required on all stacks)
-    (void)hipFuncSetAttribute(
-        (const void*)fused_attention_kernel_1warp8q_fast,
-        hipFuncAttributeMaxDynamicSharedMemorySize,
-        (int)shmem
-    );
-
-    hipLaunchKernelGGL(
-        fused_attention_kernel_1warp8q_fast,
-        grid, block, shmem, sAttn,
-        tb_mb, q_mb, key_cache_mb, value_cache_mb,
-        w->attn_sinks + (size_t)layer_idx * NA,
-        s->mask, pos_mb,
-        batch_size, NA, NKv, Hd,
-        MAX_SEQ_LEN, p->n_layers, layer_idx,
-        p->sliding_window > 0,
-        /* batch_kv_stride = */ layers_capacity * (size_t)KV,
-        /* layer_kv_offset = */ layer_elem_offset,
-        /* tile_t = */ T
-    );
-
-    HIP_CHECK(hipGetLastError());
-}
-
 
     // 7) fused output projection
     {
@@ -1935,13 +1920,12 @@ void attention_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size,
         const int boff = (size_t)layer_idx * H;
 
         matmul<
-            16,16,16,
-            4,4,2,
-            1,1,
+            16, 16, 16,
+            4, 4, 2,
+            1, 1,
             8,
-            /*FUSED*/ true
-        >(x_mb, tb_mb, w->w_o + woff, /*M=*/batch_size, /*K=*/Hd*NA, /*N=*/H,
-        /*bias=*/w->b_o + boff, /*stream=*/sAttn);
+            /*FUSED*/ true>(x_mb, tb_mb, w->w_o + woff, /*M=*/batch_size, /*K=*/Hd * NA, /*N=*/H,
+                            /*bias=*/w->b_o + boff, /*stream=*/sAttn);
         HIP_CHECK(hipGetLastError());
     }
 }
@@ -2054,20 +2038,19 @@ void moe_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size,
         HIP_CHECK(hipStreamSynchronize(sMoe));
     }
     tp_group_barrier(tp);
-    {    
+    {
         // TIMER_BLOCK("matmul_mc_router");
         matmul<
-            16,16,16,
-            4,4,2,
-            1,1,
+            16, 16, 16,
+            4, 4, 2,
+            1, 1,
             8,
-            /*FUSED*/ false
-        >(s->router_score_g, s->gather_x_g,
-            w->w_router + (size_t)layer_idx * H * E,
-            /*M=*/Bgrp, /*K=*/H, /*N=*/E,
-            /*bias=*/nullptr, /*stream=*/sMoe);
+            /*FUSED*/ false>(s->router_score_g, s->gather_x_g,
+                             w->w_router + (size_t)layer_idx * H * E,
+                             /*M=*/Bgrp, /*K=*/H, /*N=*/E,
+                             /*bias=*/nullptr, /*stream=*/sMoe);
     }
-    
+
     {
         // TIMER_BLOCK("route_select_softmax_fused");
         if (Bgrp > 0 && E > 0)
@@ -2170,9 +2153,9 @@ void moe_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size,
         const size_t seg1_loc = (size_t)o_len * H; // per-expert stride in local shard
         const __hip_bfloat16 *W1 = w->w_mlp1 + (size_t)layer_idx * (size_t)E * seg1_loc;
 
-        mlp1<16,16,16,  /*WAVES_M,N,K*/ 4,4,2,
-            /*TW_M,TW_N*/ 1,1,
-            /*PAD_K*/ 8>(
+        mlp1<16, 16, 16, /*WAVES_M,N,K*/ 4, 4, 2,
+             /*TW_M,TW_N*/ 1, 1,
+             /*PAD_K*/ 8>(
             s->mlp1_out_g, s->expert_input_buffer_g, W1,
             s->d_expert_offsets, s->d_expert_counts,
             s->d_tile2expert_g, s->d_tile2local_g,
@@ -2215,14 +2198,14 @@ void moe_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size,
         const size_t seg2_loc = (size_t)H * (size_t)i_len;
         const __hip_bfloat16 *W2 = w->w_mlp2 + (size_t)layer_idx * (size_t)E * seg2_loc;
         const __hip_bfloat16 *b2s = w->b_mlp2 + (size_t)layer_idx * (size_t)E * H;
-        
-        mlp2<16,16,16,  /*WAVES_M,N,K*/ 4,4,2,
-            /*TW_M,TW_N*/ 1,1,
-            /*PAD_K*/ 8>(
-                s->expert_output_partial_g, s->gate_up_g, W2, b2s,
-                           s->d_expert_offsets, s->d_expert_counts,
-                           s->d_tile2expert_g, s->d_tile2local_g,
-                /*E=*/E, /*D=*/i_len, /*H=*/H, /*cur_tiles=*/cur_tiles, sMoe);
+
+        mlp2<16, 16, 16, /*WAVES_M,N,K*/ 4, 4, 2,
+             /*TW_M,TW_N*/ 1, 1,
+             /*PAD_K*/ 8>(
+            s->expert_output_partial_g, s->gate_up_g, W2, b2s,
+            s->d_expert_offsets, s->d_expert_counts,
+            s->d_tile2expert_g, s->d_tile2local_g,
+            /*E=*/E, /*D=*/i_len, /*H=*/H, /*cur_tiles=*/cur_tiles, sMoe);
         HIP_CHECK(hipGetLastError());
     }
 
@@ -2296,9 +2279,8 @@ void moe_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size,
     }
 }
 
-
 void moe_gpu_120b(GPUTransformer *gpu_t, int layer_idx, int batch_size,
-             int row_offset, hipStream_t sMoe)
+                  int row_offset, hipStream_t sMoe)
 {
     if (batch_size <= 0)
         return;
@@ -2377,23 +2359,22 @@ void moe_gpu_120b(GPUTransformer *gpu_t, int layer_idx, int batch_size,
     tp_group_barrier(tp);
 
     // 2) Router on union -> topk indices/weights (softmax on top-k scores)
-   {    
+    {
         // TIMER_BLOCK("matmul_mc_router");
         matmul<
-            16,16,16,
-            4,4,2,
-            1,1,
+            16, 16, 16,
+            4, 4, 2,
+            1, 1,
             8,
-            /*FUSED*/ false
-        >(s->router_score_g, s->gather_x_g,
-            w->w_router + (size_t)layer_idx * H * E,
-            /*M=*/Bgrp, /*K=*/H, /*N=*/E,
-            /*bias=*/nullptr, /*stream=*/sMoe);
+            /*FUSED*/ false>(s->router_score_g, s->gather_x_g,
+                             w->w_router + (size_t)layer_idx * H * E,
+                             /*M=*/Bgrp, /*K=*/H, /*N=*/E,
+                             /*bias=*/nullptr, /*stream=*/sMoe);
     }
     HIP_CHECK(hipGetLastError());
     {
         const int elems = Bgrp * E;
-        
+
         if (elems > 0)
         {
             add_bias_kernel<<<(elems + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK,
@@ -2740,8 +2721,10 @@ int *forward_batch_gpu(GPUTransformer *gpu_t, int *tokens, int batch_size)
                 const int prev_row = row - MB;
                 const int prev_bs = std::min(MB, B - prev_row);
                 HIP_CHECK(hipStreamWaitEvent(moe_stream, evt_attn_done[i - 1], 0));
-                if(IS_20B_MODEL) moe_gpu(gpu_t, l, prev_bs, /*row_offset=*/prev_row, moe_stream);
-                else moe_gpu_120b(gpu_t, l, prev_bs, /*row_offset=*/prev_row, moe_stream);
+                if (IS_20B_MODEL)
+                    moe_gpu(gpu_t, l, prev_bs, /*row_offset=*/prev_row, moe_stream);
+                else
+                    moe_gpu_120b(gpu_t, l, prev_bs, /*row_offset=*/prev_row, moe_stream);
                 HIP_CHECK(hipEventRecord(evt_moe_done_cur[i - 1], moe_stream));
             }
         }
@@ -2754,8 +2737,10 @@ int *forward_batch_gpu(GPUTransformer *gpu_t, int *tokens, int batch_size)
             if (bs_last > 0)
             {
                 HIP_CHECK(hipStreamWaitEvent(moe_stream, evt_attn_done[i_last], 0));
-                if(IS_20B_MODEL) moe_gpu(gpu_t, l, bs_last, /*row_offset=*/row_last, moe_stream);
-                else moe_gpu_120b(gpu_t, l, bs_last, /*row_offset=*/row_last, moe_stream);
+                if (IS_20B_MODEL)
+                    moe_gpu(gpu_t, l, bs_last, /*row_offset=*/row_last, moe_stream);
+                else
+                    moe_gpu_120b(gpu_t, l, bs_last, /*row_offset=*/row_last, moe_stream);
 
                 HIP_CHECK(hipEventRecord(evt_moe_done_cur[i_last], moe_stream));
             }
@@ -2782,9 +2767,9 @@ int *forward_batch_gpu(GPUTransformer *gpu_t, int *tokens, int batch_size)
     {
         // TIMER_BLOCK("final_matmul");
         matmul<
-            16,16,16,
-            4,4,2,
-            1,1,
+            16, 16, 16,
+            4, 4, 2,
+            1, 1,
             8,
             false>(s->logits, s->x, w->out, B, H, p->vocab_size);
         HIP_CHECK(hipGetLastError());
@@ -3044,7 +3029,6 @@ long long inference(Transformer *transformer, Tokenizer *tokenizer,
                     Sampler *sampler, Requests *requests)
 {
     return continuous_batching_inference(tokenizer, sampler, requests);
-    
 }
 
 #endif // GETP_RUN
