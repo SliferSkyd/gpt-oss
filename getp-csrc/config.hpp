@@ -8,4 +8,6 @@ size_t BATCH_SIZE = 1024LL;
 
 #define MAX_GPUS 8
 
-#define TENSOR_PARALLEL_SIZE 2   // change as you like
+int TENSOR_PARALLEL_SIZE = 2;   
+
+#define RING_TILE_BYTES (8u << 20)  // 8 MiB tile; tune 4–32 MiB depending on your platform

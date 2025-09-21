@@ -32,6 +32,7 @@
 #include <queue>
 #include <vector>
 #include "nccl.hpp" // <— NCCL/RCCL-free TP collectives/helpers
+#include "tp_ring.hpp"
 
 #ifndef GETP_RUN
 #define GETP_RUN
@@ -150,6 +151,7 @@ typedef struct
     int *local_ids;   // [BATCH_SIZE * K]
     float *local_wts; // [BATCH_SIZE * K]
     int *n_local;     // [BATCH_SIZE]
+    float *d_recv;
 } GPURunState;
 
 // CPU buffers for warmup and host-side operations
@@ -386,6 +388,11 @@ void malloc_gpu_run_state(GPURunState *s, Config *p)
         }
         HIP_CHECK(hipMemcpy(s->mask, h_mask, mask_size, hipMemcpyHostToDevice));
         free(h_mask);
+    }
+
+    if (!IS_20B_MODEL) {
+        const size_t TILE_ELEMS = RING_TILE_BYTES / sizeof(float);
+        HIP_CHECK(hipMalloc((void**)&s->d_recv, TILE_ELEMS * sizeof(float)));
     }
 }
 
@@ -1602,8 +1609,8 @@ void warm_up(Transformer *transformer, Tokenizer *tokenizer)
     if(p->n_experts == 32) IS_20B_MODEL = 1;
     else IS_20B_MODEL = 0;
 
-    if(IS_20B_MODEL) BATCH_SIZE = 1024;
-    else BATCH_SIZE = 512;
+    if(IS_20B_MODEL) BATCH_SIZE = 1024, TENSOR_PARALLEL_SIZE = 2;
+    else BATCH_SIZE = 920, TENSOR_PARALLEL_SIZE = 4;
 
 
     HIP_CHECK(hipGetDeviceCount(&num_gpus));
@@ -2338,42 +2345,22 @@ void moe_gpu_120b(GPUTransformer *gpu_t, int layer_idx, int batch_size,
     HIP_CHECK(hipStreamSynchronize(sMoe));
     tp_group_barrier(tp);
 
+    
     // 1) ALL-GATHER normalized inputs across TP into gather_x_g[Bgrp,H]
+    // Each rank contributes [bs_local, H] in s->t + row_offset*H
+    // Place result rank-major in s->gather_x_g: [TP*bs_local, H]
     {
-        // TIMER_BLOCK("moe_allgather");
-        // self copy
-        float *dst_self = s->gather_x_g + (size_t)rank_in_group * bs_local * H;
-        float *src_self = s->t + (size_t)row_offset * H;
-        HIP_CHECK(hipMemcpyAsync(dst_self, src_self,
-                                 (size_t)bs_local * H * sizeof(float),
-                                 hipMemcpyDeviceToDevice, sMoe));
-        // peer copies
-        for (int r = 0; r < TP; ++r)
-        {
+        const int TP = tp.tp_size;
+        float* peers[MAX_TP];
+        for (int r = 0; r < TP; ++r) {
             const int peer_dev = group_base + r;
-            if (peer_dev == my_dev)
-                continue;
-            float *dst = s->gather_x_g + (size_t)r * bs_local * H;
-            float *peer_src = gpu_transformers[peer_dev]->state.t + (size_t)row_offset * H;
-
-            if (tp.p2p[rank_in_group][r])
-            {
-                HIP_CHECK(hipMemcpyPeerAsync(dst, my_dev, peer_src, peer_dev,
-                                             (size_t)bs_local * H * sizeof(float), sMoe));
-            }
-            else
-            {
-                HIP_CHECK(hipMemcpyAsync(cpu->tp_host_stage, peer_src,
-                                         (size_t)bs_local * H * sizeof(float),
-                                         hipMemcpyDeviceToHost, sMoe));
-                HIP_CHECK(hipMemcpyAsync(dst, cpu->tp_host_stage,
-                                         (size_t)bs_local * H * sizeof(float),
-                                         hipMemcpyHostToDevice, sMoe));
-            }
+            peers[r] = gpu_transformers[peer_dev]->state.gather_x_g; // peer dst base
         }
-        HIP_CHECK(hipStreamSynchronize(sMoe));
+
+        float* my_dst = s->gather_x_g;
+        const float* my_src = s->t + (size_t)row_offset * H;
+        ring_allgather_rows(my_dst, my_src, /*R_local=*/bs_local, /*C=*/H, peers, tp, sMoe);
     }
-    tp_group_barrier(tp);
 
     // 2) Router on union -> topk indices/weights (softmax on top-k scores)
    {    
@@ -2604,42 +2591,25 @@ void moe_gpu_120b(GPUTransformer *gpu_t, int layer_idx, int batch_size,
         HIP_CHECK(hipGetLastError());
     }
 
-    // 9b) Emulate ALL-REDUCE across TP on e_agg_g[Bgrp, H]
+    HIP_CHECK(hipStreamSynchronize(sMoe));
+    tp_group_barrier(tp);
     {
-        // TIMER_BLOCK("moe_allreduce_tokenwise");
-        const size_t span_elems = (size_t)Bgrp * (size_t)H;
-        const size_t bytes      = span_elems * sizeof(float);
+        const size_t elems = (size_t)Bgrp * (size_t)H;
 
-        float* gather_base = s->expert_output_gather_g; // reuse workspace
-
-        // self
-        HIP_CHECK(hipMemcpyAsync(
-            gather_base + (size_t)rank_in_group * span_elems,
-            s->e_agg_g, bytes,
-            hipMemcpyDeviceToDevice, sMoe));
-
-        // peers
+        // Build peer base pointers (group-local order 0..TP-1)
+        float* peer_bufs[MAX_TP];
         for (int r = 0; r < TP; ++r) {
             const int peer_dev = group_base + r;
-            if (peer_dev == my_dev) continue;
-            float* peer_src = gpu_transformers[peer_dev]->state.e_agg_g;
-            float* dst      = gather_base + (size_t)r * span_elems;
-
-            if (tp.p2p[rank_in_group][r]) {
-                HIP_CHECK(hipMemcpyPeerAsync(dst, my_dev, peer_src, peer_dev, bytes, sMoe));
-            } else {
-                HIP_CHECK(hipMemcpyAsync(cpu->tp_host_stage, peer_src, bytes, hipMemcpyDeviceToHost, sMoe));
-                HIP_CHECK(hipMemcpyAsync(dst, cpu->tp_host_stage, bytes, hipMemcpyHostToDevice, sMoe));
-            }
+            peer_bufs[r] = gpu_transformers[peer_dev]->state.e_agg_g;
         }
-        HIP_CHECK(hipStreamSynchronize(sMoe));
-        tp_group_barrier(tp);
 
-        const size_t total = span_elems;
-        const int BLK = 256, GRD = (int)((total + BLK - 1) / BLK);
-        sum_rank_axis_kernel<<<GRD, BLK, 0, sMoe>>>(
-            s->e_agg_g, gather_base, TP, Bgrp, H);
-        HIP_CHECK(hipGetLastError());
+        // Sum into s->e_agg_g in place (each rank contributes its partial)
+        ring_allreduce_sum(
+            /*buf_local=*/s->e_agg_g,
+            /*peer_bases=*/peer_bufs,
+            /*N_elems=*/elems, s->d_recv,
+            /*tp=*/tp,
+            /*s=*/sMoe);
     }
 
     // 10) Scatter owner rows back to this rank and residual-add into x (unchanged)
