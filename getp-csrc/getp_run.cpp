@@ -1820,12 +1820,11 @@ void attention_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size,
         // TIMER_BLOCK("matmul_mc_attention");
         const int woff = layer_idx * H * QKV;
         matmul<
-            /*WM,WN,WK*/ 16,16,16,
-            /*WAVES_M,N,K*/ 4,4,2,
-            /*TW_M,TW_N*/ 1,1,
+            /*WM,WN,WK*/ 16, 16, 16,
+            /*WAVES_M,N,K*/ 4, 4, 2,
+            /*TW_M,TW_N*/ 1, 1,
             /*PAD_K*/ 8,
-            /*FUSED*/ false
-        >(qkv_mb, t_mb, w->w_qkv + woff, batch_size, H, QKV, nullptr, sAttn);
+            /*FUSED*/ false>(qkv_mb, t_mb, w->w_qkv + woff, batch_size, H, QKV, nullptr, sAttn);
         HIP_CHECK(hipGetLastError());
     }
     // 3) bias
@@ -1861,77 +1860,63 @@ void attention_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size,
             /* layer_kv_offset = */ layer_elem_offset);
     }
     // 6) fused attention
-     // --- optimized launch (tile_t = 48, same policy as launch_optimized) ---
-{
-        // TIMER_BLOCK("fused_attention_kernel");
+    // --- optimized launch (tile_t = 48, same policy as launch_optimized) ---
+    {
+        // TIMER_BLOCK("flashdecoding_fused");
+        // --- Fused Flash-Decoding (fast-merge, no K/V staging) launch --------------------
+        // Uses 4 warps/block (256 threads). Tune WARPS if needed (e.g., 2 or 6).
+        const int B = batch_size;
+        const int H = NA;   // n_attn_heads
+        const int NKv = NK; // n_kv_heads
+        const int D = Hd;
 
-    const int B   = batch_size;
-    const int H   = NA;   // n_attn_heads
-    const int NKv = NK;   // n_kv_heads
-    const int D   = Hd;
+        // GQA ratio (should be 8 for this kernel path)
+        const int kv_mul = H / NKv; // == 8
+        if (kv_mul != 8 || D != 64)
+        {
+            // Fall back to your baseline if you want, or assert.
+            // For now, just return to avoid a bad launch.
+            HIP_CHECK(hipSuccess);
+        }
+        else
+        {
+            // Block/grid mapping: multi-warp per (b, kv_h)
+            const int WARPS = 4;          // <<< tune knob
+            dim3 block(64 * WARPS, 1, 1); // 64 = AMD warp size
+            dim3 grid(NKv, B, 1);
 
-    // GQA ratio: heads per KV head (unused by this launcher; kernel handles 8 heads per warp)
-    const int kv_mul = H / NKv;  // == 8
+            // Shared memory only for fast-merge reduction:
+            // (m,l): 2 * WARPS * 8 floats  +  numerators: WARPS * 64 * 8 floats
+            const size_t shmem =
+                (size_t)((2 * WARPS * 8) + (WARPS * 64 * 8)) * sizeof(float);
 
-    // SW cap: even layers use sliding window, odd layers use full length (cap@112)
-    const int sw_cap = (p->sliding_window > 0 && ((layer_idx & 1) == 0))
-                       ? SW_WINDOW
-                       : 112;
+            // Request dynamic LDS (ignore return; optional on some stacks)
+            (void)hipFuncSetAttribute(
+                (const void *)flashdecoding_fused_fastmerge_nostage_1warp8q,
+                hipFuncAttributeMaxDynamicSharedMemorySize,
+                (int)shmem);
 
-    // Tile length for single-warp kernel; 96–112 is usually best
-    int T = std::min(112, sw_cap);
+            hipLaunchKernelGGL(
+                flashdecoding_fused_fastmerge_nostage_1warp8q,
+                grid, block, shmem, sAttn,
+                /* output      */ tb_mb,
+                /* q           */ q_mb,
+                /* key_cache   */ key_cache_mb,
+                /* value_cache */ value_cache_mb,
+                /* sinks       */ w->attn_sinks + (size_t)layer_idx * NA,
+                /* mask        */ s->mask,
+                /* seq_lengths */ pos_mb,
+                /* B,H,KVH,D   */ batch_size, NA, NKv, Hd,
+                /* seq_len,L   */ MAX_SEQ_LEN, p->n_layers,
+                /* layer_idx   */ layer_idx,
+                /* use_sw      */ p->sliding_window > 0,
+                /* strides     */ /* batch_kv_stride = */ layers_capacity * (size_t)KV,
+                /* offsets     */ /* layer_kv_offset  = */ layer_elem_offset,
+                /* tile_t_unused */ 0);
 
-    // Block/grid mapping for 1-warp-per-KV-head:
-    // 64 lanes, 1 warp (the kernel internally processes 8 query heads)
-    dim3 block(64, 1, 1);
-    dim3 grid(NKv, B, 1);
-
-    // Shared memory footprint (bf16): sK + sV = 2 * T * PADDED_HEAD_DIM
-    constexpr int PADDED_HEAD_DIM = 72;
-    size_t shmem = (size_t)2 * (size_t)T * (size_t)PADDED_HEAD_DIM * sizeof(__hip_bfloat16);
-
-    // Cap tile_t against device max dynamic shared memory
-    auto get_max_dyn_shmem = []() -> size_t {
-        int dev = 0, basic = 0;
-        HIP_CHECK(hipGetDevice(&dev));
-        hipError_t st = hipDeviceGetAttribute(
-            &basic, hipDeviceAttributeMaxSharedMemoryPerBlock, dev);
-        if (st != hipSuccess || basic <= 0) basic = 64 * 1024; // safe fallback
-        return (size_t)basic;
-    };
-
-    const size_t max_dyn = get_max_dyn_shmem();
-    if (max_dyn > 0 && shmem > max_dyn) {
-        int max_tile = (int)(max_dyn / (2 * PADDED_HEAD_DIM * sizeof(__hip_bfloat16)));
-        max_tile = std::max(1, std::min(max_tile, sw_cap));
-        T = std::min(T, max_tile);
-        shmem = (size_t)2 * (size_t)T * (size_t)PADDED_HEAD_DIM * sizeof(__hip_bfloat16);
+            HIP_CHECK(hipGetLastError());
+        }
     }
-
-    // Request dynamic LDS (ignore return; not required on all stacks)
-    (void)hipFuncSetAttribute(
-        (const void*)fused_attention_kernel_1warp8q_fast,
-        hipFuncAttributeMaxDynamicSharedMemorySize,
-        (int)shmem
-    );
-
-    hipLaunchKernelGGL(
-        fused_attention_kernel_1warp8q_fast,
-        grid, block, shmem, sAttn,
-        tb_mb, q_mb, key_cache_mb, value_cache_mb,
-        w->attn_sinks + (size_t)layer_idx * NA,
-        s->mask, pos_mb,
-        batch_size, NA, NKv, Hd,
-        MAX_SEQ_LEN, p->n_layers, layer_idx,
-        p->sliding_window > 0,
-        /* batch_kv_stride = */ layers_capacity * (size_t)KV,
-        /* layer_kv_offset = */ layer_elem_offset,
-        /* tile_t = */ T
-    );
-
-    HIP_CHECK(hipGetLastError());
-}
-
 
     // 7) fused output projection
     {
@@ -1942,13 +1927,12 @@ void attention_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size,
         const int boff = (size_t)layer_idx * H;
 
         matmul<
-            16,16,16,
-            4,4,2,
-            1,1,
+            16, 16, 16,
+            4, 4, 2,
+            1, 1,
             8,
-            /*FUSED*/ true
-        >(x_mb, tb_mb, w->w_o + woff, /*M=*/batch_size, /*K=*/Hd*NA, /*N=*/H,
-        /*bias=*/w->b_o + boff, /*stream=*/sAttn);
+            /*FUSED*/ true>(x_mb, tb_mb, w->w_o + woff, /*M=*/batch_size, /*K=*/Hd * NA, /*N=*/H,
+                            /*bias=*/w->b_o + boff, /*stream=*/sAttn);
         HIP_CHECK(hipGetLastError());
     }
 }
