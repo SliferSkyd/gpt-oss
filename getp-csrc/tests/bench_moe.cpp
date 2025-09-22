@@ -52,24 +52,6 @@ struct SimConfig {
   int TP = 1;
 };
 
-// A thin wrapper so you can later swap in a different impl
-// template <
-//     int WM = 16, int WN = 16, int WK = 16,
-//     int WAVES_M = 4, int WAVES_N = 4, int WAVES_K = 2,
-//     int TW_M = 1, int TW_N = 1,
-//     int PAD_K = 8>
-// inline void mlp1_optimized(
-//     float *C, const float *A, const __hip_bfloat16 *W1,
-//     const int *expert_offsets, const int *expert_counts,
-//     const int *tile2expert, const int *tile2local,
-//     int E, int K, int N, int cur_tiles, hipStream_t s = nullptr)
-// {
-//   // For now, it's the same as mlp1
-//   mlp1<WM,WN,WK, WAVES_M,WAVES_N,WAVES_K, TW_M,TW_N, PAD_K>(
-//       C, A, W1,
-//       expert_offsets, expert_counts, tile2expert, tile2local,
-//       E, K, N, cur_tiles, s);
-// }
 
 // Random helpers
 static inline float frand(std::mt19937 &rng) {
