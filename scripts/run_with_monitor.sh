@@ -62,7 +62,7 @@ monitor_gpu() {
 run_inference() {
     echo "Starting inference task..."
     ./scripts/run.sh run \
-        --checkpoint ${MODELBIN_ROOT}/gpt-oss-120b.bin \
+        --checkpoint ${MODELBIN_ROOT}/gpt-oss-20b.bin \
         -m getp \
         -i data/input.txt \
         -o data/output.txt 
