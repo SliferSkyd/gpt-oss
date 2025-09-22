@@ -1870,12 +1870,6 @@ inline void run_route_select_softmax_fused(
     HIP_CHECK(hipGetLastError());
 }
 
-// 128-bit (16B) vectorized copies into LDS, write as u32 pairs (2×bf16 per u32)
-
-__device__ __forceinline__ bool is_aligned_16B(const void *p)
-{
-    return (((uintptr_t)p) & 0xF) == 0;
-}
 
 // ---- A: global fp32 -> LDS bf16 (vectorized) ----
 // Loads float4 (16B) then packs to two u32 (4 bf16).
@@ -2170,98 +2164,6 @@ inline void mlp1_optimized(
         E, K, N);
     HIP_CHECK(hipGetLastError());
 }
-
-
-
-
-// ---- 16B alignment helper ----
-__device__ __forceinline__ bool is_aligned_16B(const void* p) {
-    return (((uintptr_t)p) & 0xF) == 0;
-}
-
-// ---- A (global FP32) -> LDS (bf16 as u16; we write u32 pairs) ----
-// One 16B unit = float4 => 4 bf16 => 2 u32 pairs.
-template<int LD_A, int BM, int BK>
-__device__ inline void copy_A_tile_vec128_fp32_tiled_2(
-    uint32_t* __restrict__ dst_u32,
-    const float* __restrict__ A,
-    int m_start, int M_bound, int K, int kBase,
-    int linearT, int threadsPerBlock)
-{
-    static_assert((BK % 4) == 0, "BK must be multiple of 4 floats (16B).");
-    constexpr int quadsPerRow = BK / 4;      // 4 floats per 16B
-    const int totalQuads      = BM * quadsPerRow;
-
-    for (int t = linearT; t < totalQuads; t += threadsPerBlock) {
-        const int r   = t / quadsPerRow;         // 0..BM-1
-        const int q   = t % quadsPerRow;         // 16B unit along K
-        const int gm  = m_start + r;             // global row
-        const int gk4 = kBase + (q << 2);        // float index (×4)
-
-        uint32_t p0 = 0u, p1 = 0u;
-        if (gm < M_bound) {
-            const size_t base = (size_t)gm * K + gk4;
-            if ((gk4 + 3) < K && is_aligned_16B(&A[base])) {
-                const float4 v = *reinterpret_cast<const float4*>(&A[base]); // 16B coalesced
-                p0 = pack2_bf16_bits_f32(v.x, v.y);
-                p1 = pack2_bf16_bits_f32(v.z, v.w);
-            } else {
-                float tmp[4] = {0.f,0.f,0.f,0.f};
-                #pragma unroll
-                for (int i=0;i<4 && (gk4+i)<K;++i) tmp[i] = A[base + i];
-                p0 = pack2_bf16_bits_f32(tmp[0], tmp[1]);
-                p1 = pack2_bf16_bits_f32(tmp[2], tmp[3]);
-            }
-        }
-        // write 2×u32 to the pair-addressed row
-        uint32_t* row = dst_u32 + ((size_t)r * LD_A >> 1);
-        const int off = (q << 1);
-        row[off + 0] = p0;
-        row[off + 1] = p1;
-    }
-}
-
-// ---- B (global bf16) -> LDS (bf16; write u32 pairs) ----
-// One 16B unit = 8 bf16 => 4 u32 pairs.
-template<int LD_B, int BN, int BK>
-__device__ inline void copy_B_tile_vec128_bf16_tiled_2(
-    uint32_t* __restrict__ dst_u32,
-    const __hip_bfloat16* __restrict__ W, // [N,K] row-major
-    int n0, int N, int K, int kBase,
-    int linearT, int threadsPerBlock)
-{
-    static_assert((BK % 8) == 0, "BK must be multiple of 8 bf16 (16B).");
-    constexpr int quadsPerCol = BK / 8;      // 8 bf16 per 16B
-    const int totalQuads      = BN * quadsPerCol;
-
-    for (int t = linearT; t < totalQuads; t += threadsPerBlock) {
-        const int c   = t / quadsPerCol;         // 0..BN-1
-        const int q   = t % quadsPerCol;         // 16B unit along K
-        const int gn  = n0 + c;                  // global col (N)
-        const int gk8 = kBase + (q << 3);        // bf16 index (×8)
-
-        uint4 v = {0,0,0,0};
-        if (gn < N) {
-            const size_t base = (size_t)gn * K + gk8;
-            if ((gk8 + 7) < K && is_aligned_16B(&W[base])) {
-                v = *reinterpret_cast<const uint4*>(&W[base]);  // 16B coalesced
-            } else {
-                __hip_bfloat16 tmp[8] = {};
-                #pragma unroll
-                for (int i=0;i<8 && (gk8+i)<K;++i) tmp[i] = W[base + i];
-                const uint32_t* p = reinterpret_cast<const uint32_t*>(tmp);
-                v = make_uint4(p[0], p[1], p[2], p[3]);
-            }
-        }
-        uint32_t* col = dst_u32 + ((size_t)c * LD_B >> 1);
-        const int off = (q << 2);
-        col[off + 0] = v.x;
-        col[off + 1] = v.y;
-        col[off + 2] = v.z;
-        col[off + 3] = v.w;
-    }
-}
-
 
 
 template <
