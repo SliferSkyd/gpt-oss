@@ -25,19 +25,14 @@ __device__ inline int lane_group(int lane) { return lane >> 4; }   // 0..3
 __device__ inline f32x4 mfma_16x16x16_bf16(bf16x4 a_vec, bf16x4 b_vec, f32x4 c_vec) {
     return __builtin_amdgcn_mfma_f32_16x16x16bf16_1k(a_vec, b_vec, c_vec, 0, 0, 0);
 }
-
-// ===================================
-// Tile builders and stores (templated on WM/WN)
-// ===================================
 template<int WM>
 __device__ inline bf16x4 make_a_vec_k(const uint16_t* __restrict__ sA,
                                       int ldA, int aRowBase, int kOff, int lane) {
     const int r   = aRowBase + lane_row(lane);
     const int grp = lane_group(lane); // 0..3
-    bf16x4 v;
-    #pragma unroll
-    for (int i = 0; i < 4; ++i) v[i] = sA[r * ldA + (kOff + grp * 4 + i)];
-    return v;
+    // 4 consecutive bf16 along K for this subgroup
+    const bf16x4* p = reinterpret_cast<const bf16x4*>(&sA[(size_t)r * ldA + (kOff + grp * 4)]);
+    return *p; // single LDS read
 }
 
 template<int WN>
@@ -45,11 +40,10 @@ __device__ inline bf16x4 make_b_vec_k(const uint16_t* __restrict__ sB,
                                       int ldB, int bColBase, int kOff, int lane) {
     const int col = bColBase + lane_row(lane); // 0..15 within 16×16
     const int grp = lane_group(lane);          // 0..3
-    bf16x4 v;
-    #pragma unroll
-    for (int i = 0; i < 4; ++i) v[i] = sB[col * ldB + (kOff + grp * 4 + i)];
-    return v;
+    const bf16x4* p = reinterpret_cast<const bf16x4*>(&sB[(size_t)col * ldB + (kOff + grp * 4)]);
+    return *p; // single LDS read
 }
+
 
 template<int WM, int WN, bool Interior>
 __device__ inline void store_c_tile(const f32x4& acc,
@@ -58,12 +52,15 @@ __device__ inline void store_c_tile(const f32x4& acc,
                                     int wave_m_tile, int wave_n_tile, int lane) {
     const int rowBase = m0 + wave_m_tile * WM + lane_group(lane) * 4;
     const int col     = n0 + wave_n_tile * WN + lane_row(lane);
-    #pragma unroll
-    for (int i = 0; i < 4; ++i) {
-        const int row = rowBase + i;
-        if constexpr (Interior) {
-            C[(size_t)row * N + col] = acc[i];
-        } else {
+
+    if constexpr (Interior) {
+        // one vector store if fully interior
+        float* dst = &C[(size_t)rowBase * N + col];
+        *reinterpret_cast<f32x4*>(dst) = acc;
+    } else {
+        #pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            const int row = rowBase + i;
             if (row < M && col < N) C[(size_t)row * N + col] = acc[i];
         }
     }
@@ -77,16 +74,26 @@ __device__ inline void store_and_fuse_tile(const f32x4& acc,
                                            int wave_m_tile, int wave_n_tile, int lane) {
     const int rowBase = m0 + wave_m_tile * WM + lane_group(lane) * 4;
     const int col     = n0 + wave_n_tile * WN + lane_row(lane);
-    #pragma unroll
-    for (int i = 0; i < 4; ++i) {
-        const int row = rowBase + i;
-        if constexpr (!Interior) {
+
+    if constexpr (Interior) {
+        f32x4 v = acc;
+        const float b = __bfloat162float(bias[col]);
+        // add bias + residual vectorized
+        float* dst = &X[(size_t)rowBase * N + col];
+        f32x4 res = *reinterpret_cast<const f32x4*>(dst);
+        v[0] = v[0] + b + res[0];
+        v[1] = v[1] + b + res[1];
+        v[2] = v[2] + b + res[2];
+        v[3] = v[3] + b + res[3];
+        *reinterpret_cast<f32x4*>(dst) = v;
+    } else {
+        #pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            const int row = rowBase + i;
             if (row >= M || col >= N) continue;
+            float v = acc[i] + __bfloat162float(bias[col]) + X[(size_t)row * N + col];
+            X[(size_t)row * N + col] = v;
         }
-        float v = acc[i];
-        v += __bfloat162float(bias[col]);      // bias (bf16 -> f32)
-        v += X[(size_t)row * N + col];         // residual
-        X[(size_t)row * N + col] = v;
     }
 }
 
@@ -99,31 +106,67 @@ __device__ inline uint32_t pack2_bf16_bits_f32(float a0, float a1) {
     return (uint32_t(hipbf16_to_bits(b1)) << 16) | uint32_t(hipbf16_to_bits(b0));
 }
 
-template<int BLOCK_M, int BLOCK_K, int LD_A, bool Aligned>
+template<int BLOCK_M, int BLOCK_K, int LD_A, bool Aligned16B>
 __device__ inline void copy_A_tile_vec(uint32_t* __restrict__ dst_u32,
                                        const float* __restrict__ A,
                                        int m_start, int M, int K, int kBase,
                                        int linearT, int threadsPerBlock) {
-    const int pairsPerRow = BLOCK_K >> 1;
-    const int totalPairs  = BLOCK_M * pairsPerRow;
-    for (int t = linearT; t < totalPairs; t += threadsPerBlock) {
-        const int r  = t / pairsPerRow;
-        const int p  = t % pairsPerRow;
-        const int gm = m_start + r;
-        const int gk = kBase + (p << 1);
-        uint32_t val = 0u;
-        if (gm < M && gk < K) {
-            const size_t base = (size_t)gm * K + gk;
-            if constexpr (Aligned) {
-                const float2 v = *reinterpret_cast<const float2*>(&A[base]);
-                val = pack2_bf16_bits_f32(v.x, v.y);
-            } else {
+    // Each “pair” is 2 bf16 = 1 u32; 4 floats => 8 bf16 => 4 u32
+    if constexpr (Aligned16B) {
+        const int quadsPerRow = BLOCK_K >> 2;        // 4 fp32 per quad
+        const int totalQuads  = BLOCK_M * quadsPerRow;
+        for (int t = linearT; t < totalQuads; t += threadsPerBlock) {
+            const int r  = t / quadsPerRow;
+            const int q  = t % quadsPerRow;
+            const int gm = m_start + r;
+            const int gk = kBase + (q << 2);
+            uint4 out = {0,0,0,0};
+            if (gm < M && (gk + 3) < K) {
+                const float4 v = *reinterpret_cast<const float4*>(&A[(size_t)gm * K + gk]);
+                // pack 4 fp32 -> 8 bf16 -> 4 u32
+                __hip_bfloat16 tmp[8];
+                tmp[0] = __float2bfloat16(v.x); tmp[1] = __float2bfloat16(v.y);
+                tmp[2] = __float2bfloat16(v.z); tmp[3] = __float2bfloat16(v.w);
+                tmp[4] = __float2bfloat16(0.f); tmp[5] = __float2bfloat16(0.f);
+                tmp[6] = __float2bfloat16(0.f); tmp[7] = __float2bfloat16(0.f);
+                const uint32_t* p = reinterpret_cast<const uint32_t*>(tmp);
+                out = make_uint4(p[0], p[1], p[2], p[3]);
+            } else if (gm < M && gk < K) {
+                float a[4] = {0,0,0,0};
+                #pragma unroll
+                for (int i=0;i<4 && (gk+i)<K;i++) a[i] = A[(size_t)gm * K + gk + i];
+                __hip_bfloat16 tmp[8] = {
+                    __float2bfloat16(a[0]), __float2bfloat16(a[1]),
+                    __float2bfloat16(a[2]), __float2bfloat16(a[3]),
+                    __float2bfloat16(0.f),  __float2bfloat16(0.f),
+                    __float2bfloat16(0.f),  __float2bfloat16(0.f)
+                };
+                const uint32_t* p = reinterpret_cast<const uint32_t*>(tmp);
+                out = make_uint4(p[0], p[1], p[2], p[3]);
+            }
+            // write 4*32b to LDS row r at column offset q*4 pairs
+            uint32_t* row = reinterpret_cast<uint32_t*>(dst_u32 + ((size_t)r * LD_A >> 1));
+            const int off = q << 2;
+            row[off+0] = out.x; row[off+1] = out.y; row[off+2] = out.z; row[off+3] = out.w;
+        }
+    } else {
+        // fallback (your existing float2 path)
+        const int pairsPerRow = BLOCK_K >> 1;
+        const int totalPairs  = BLOCK_M * pairsPerRow;
+        for (int t = linearT; t < totalPairs; t += threadsPerBlock) {
+            const int r  = t / pairsPerRow;
+            const int p  = t % pairsPerRow;
+            const int gm = m_start + r;
+            const int gk = kBase + (p << 1);
+            uint32_t val = 0u;
+            if (gm < M && gk < K) {
+                const size_t base = (size_t)gm * K + gk;
                 const float a0 = A[base];
                 const float a1 = (gk + 1 < K) ? A[base + 1] : 0.0f;
                 val = pack2_bf16_bits_f32(a0, a1);
             }
+            reinterpret_cast<uint32_t*>(dst_u32 + ((size_t)r * LD_A >> 1))[p] = val;
         }
-        reinterpret_cast<uint32_t*>(dst_u32 + ((size_t)r * LD_A >> 1))[p] = val;
     }
 }
 
@@ -226,20 +269,16 @@ void mfma_bf16_kernel(
     const int aBase0 = tile_m0 * WM;
     const int bBase0 = tile_n0 * WN;
 
-    // LDS ping–pong (bf16 bits)
+    // ===== Single-buffer LDS (no ping-pong) =====
     extern __shared__ uint8_t smemRaw[];
     constexpr int ldA = BLOCK_K + PAD_K_MC;
     constexpr int ldB = BLOCK_K + PAD_K_MC;
 
-    uint16_t* sA0_u16 = reinterpret_cast<uint16_t*>(smemRaw);
-    uint16_t* sA1_u16 = sA0_u16 + (BLOCK_M * ldA);
-    uint16_t* sB0_u16 = sA1_u16 + (BLOCK_M * ldA);
-    uint16_t* sB1_u16 = sB0_u16 + (ldB * BLOCK_N);
+    uint16_t* sA_u16 = reinterpret_cast<uint16_t*>(smemRaw);
+    uint16_t* sB_u16 = sA_u16 + (BLOCK_M * ldA);
 
-    uint32_t* sA0_u32 = reinterpret_cast<uint32_t*>(sA0_u16);
-    uint32_t* sA1_u32 = reinterpret_cast<uint32_t*>(sA1_u16);
-    uint32_t* sB0_u32 = reinterpret_cast<uint32_t*>(sB0_u16);
-    uint32_t* sB1_u32 = reinterpret_cast<uint32_t*>(sB1_u16);
+    uint32_t* sA_u32 = reinterpret_cast<uint32_t*>(sA_u16);
+    uint32_t* sB_u32 = reinterpret_cast<uint32_t*>(sB_u16);
 
     // Multi-tile accumulators
     f32x4 acc[TW_M][TW_N];
@@ -253,54 +292,34 @@ void mfma_bf16_kernel(
     const int linearT         = wave * blockDim.x + lane;
 
     // Decide vectorization paths once per block
-    const bool alignedA  = (((uintptr_t)A     & 0x7)==0) && ((K & 1)==0); // 8B & even
+    const bool alignedA  = (((uintptr_t)A     & 0x7)==0) && ((K & 3)==0); // 8B & even
     const bool use128bW  = (((uintptr_t)Wbf16 & 0xF)==0) && ((K & 7)==0); // 16B & K%8==0
 
-    // Preload kBase=0
-    if (alignedA) copy_A_tile_vec<BLOCK_M, BLOCK_K, ldA, true >(sA0_u32, A, m0, M, K, 0, linearT, threadsPerBlock);
-    else          copy_A_tile_vec<BLOCK_M, BLOCK_K, ldA, false>(sA0_u32, A, m0, M, K, 0, linearT, threadsPerBlock);
+    // Iterate K in chunks; copy -> sync -> compute; no prefetch
+    for (int k0 = 0; k0 < K; k0 += BLOCK_K) {
+        if (alignedA) copy_A_tile_vec<BLOCK_M, BLOCK_K, ldA, true >(sA_u32, A, m0, M, K, k0, linearT, threadsPerBlock);
+        else          copy_A_tile_vec<BLOCK_M, BLOCK_K, ldA, false>(sA_u32, A, m0, M, K, k0, linearT, threadsPerBlock);
 
-    if (use128bW) copy_B_tile_vec<BLOCK_N, BLOCK_K, ldB, true >(sB0_u32, Wbf16, n0, N, K, 0, linearT, threadsPerBlock);
-    else          copy_B_tile_vec<BLOCK_N, BLOCK_K, ldB, false>(sB0_u32, Wbf16, n0, N, K, 0, linearT, threadsPerBlock);
+        if (use128bW) copy_B_tile_vec<BLOCK_N, BLOCK_K, ldB, true >(sB_u32, Wbf16, n0, N, K, k0, linearT, threadsPerBlock);
+        else          copy_B_tile_vec<BLOCK_N, BLOCK_K, ldB, false>(sB_u32, Wbf16, n0, N, K, k0, linearT, threadsPerBlock);
 
-    __syncthreads();
+        __syncthreads();
 
-    // Ping-pong swap vars
-    uint16_t* currA = sA0_u16; uint16_t* nextA = sA1_u16;
-    uint16_t* currB = sB0_u16; uint16_t* nextB = sB1_u16;
-    uint32_t* nextA32 = sA1_u32;
-    uint32_t* nextB32 = sB1_u32;
-
-    const int Kmain     = (K / BLOCK_K) * BLOCK_K;
-    const bool has_tail = (Kmain < K);
-
-    #pragma unroll 1
-    for (int k0 = 0; k0 < Kmain; k0 += BLOCK_K) {
-        const int kNext = k0 + BLOCK_K;
-
-        // Prefetch next
-        if (kNext < Kmain) {
-            if (alignedA) copy_A_tile_vec<BLOCK_M, BLOCK_K, ldA, true >(nextA32, A, m0, M, K, kNext, linearT, threadsPerBlock);
-            else          copy_A_tile_vec<BLOCK_M, BLOCK_K, ldA, false>(nextA32, A, m0, M, K, kNext, linearT, threadsPerBlock);
-
-            if (use128bW) copy_B_tile_vec<BLOCK_N, BLOCK_K, ldB, true >(nextB32, Wbf16, n0, N, K, kNext, linearT, threadsPerBlock);
-            else          copy_B_tile_vec<BLOCK_N, BLOCK_K, ldB, false>(nextB32, Wbf16, n0, N, K, kNext, linearT, threadsPerBlock);
-        }
-
-        // Consume current tiles, MFMA in steps of WK=16
+        // Consume current tiles, MFMA in steps of WK=16.
+        // Note: copy helpers already zero-pad OOB for the tail slice.
         #pragma unroll
         for (int kk = 0; kk < BLOCK_K; kk += WK) {
             bf16x4 avec[TW_M];
             #pragma unroll
             for (int tm = 0; tm < TW_M; ++tm) {
                 const int aRowBase = aBase0 + tm * WM;
-                avec[tm] = make_a_vec_k<WM>(currA, ldA, aRowBase, kk, lane);
+                avec[tm] = make_a_vec_k<WM>(sA_u16, ldA, aRowBase, kk, lane);
             }
             bf16x4 bvec[TW_N];
             #pragma unroll
             for (int tn = 0; tn < TW_N; ++tn) {
                 const int bColBase = bBase0 + tn * WN;
-                bvec[tn] = make_b_vec_k<WN>(currB, ldB, bColBase, kk, lane);
+                bvec[tn] = make_b_vec_k<WN>(sB_u16, ldB, bColBase, kk, lane);
             }
             #pragma unroll
             for (int tm = 0; tm < TW_M; ++tm)
@@ -309,46 +328,6 @@ void mfma_bf16_kernel(
                 acc[tm][tn] = mfma_16x16x16_bf16(avec[tm], bvec[tn], acc[tm][tn]);
         }
 
-        __syncthreads();
-        if (kNext < Kmain) {
-            uint16_t* tA = currA; currA = nextA; nextA = tA;
-            uint16_t* tB = currB; currB = nextB; nextB = tB;
-            nextA32 = reinterpret_cast<uint32_t*>(nextA);
-            nextB32 = reinterpret_cast<uint32_t*>(nextB);
-        }
-    }
-
-    // Tail slice
-    if (has_tail) {
-        if (alignedA) copy_A_tile_vec<BLOCK_M, BLOCK_K, ldA, true >(nextA32, A, m0, M, K, Kmain, linearT, threadsPerBlock);
-        else          copy_A_tile_vec<BLOCK_M, BLOCK_K, ldA, false>(nextA32, A, m0, M, K, Kmain, linearT, threadsPerBlock);
-
-        if (use128bW) copy_B_tile_vec<BLOCK_N, BLOCK_K, ldB, true >(nextB32, Wbf16, n0, N, K, Kmain, linearT, threadsPerBlock);
-        else          copy_B_tile_vec<BLOCK_N, BLOCK_K, ldB, false>(nextB32, Wbf16, n0, N, K, Kmain, linearT, threadsPerBlock);
-
-        __syncthreads();
-        currA = nextA; currB = nextB;
-
-        #pragma unroll
-        for (int kk = 0; kk < BLOCK_K; kk += WK) {
-            bf16x4 avec[TW_M];
-            #pragma unroll
-            for (int tm = 0; tm < TW_M; ++tm) {
-                const int aRowBase = aBase0 + tm * WM;
-                avec[tm] = make_a_vec_k<WM>(currA, ldA, aRowBase, kk, lane);
-            }
-            bf16x4 bvec[TW_N];
-            #pragma unroll
-            for (int tn = 0; tn < TW_N; ++tn) {
-                const int bColBase = bBase0 + tn * WN;
-                bvec[tn] = make_b_vec_k<WN>(currB, ldB, bColBase, kk, lane);
-            }
-            #pragma unroll
-            for (int tm = 0; tm < TW_M; ++tm)
-            #pragma unroll
-            for (int tn = 0; tn < TW_N; ++tn)
-                acc[tm][tn] = mfma_16x16x16_bf16(avec[tm], bvec[tn], acc[tm][tn]);
-        }
         __syncthreads();
     }
 
@@ -405,12 +384,12 @@ inline void matmul(
               (M + BLOCK_M - 1) / BLOCK_M);
     dim3 block(64, WAVES_PER_BLOCK_E);
 
+    // Single-buffer shared memory footprint
     constexpr int ldA = BLOCK_K + PAD_K_MC;
     constexpr int ldB = BLOCK_K + PAD_K_MC;
     const size_t shmem_bytes =
-        sizeof(uint16_t) * (size_t)(2 * BLOCK_M * ldA + 2 * ldB * BLOCK_N);
+        sizeof(uint16_t) * (size_t)(BLOCK_M * ldA + ldB * BLOCK_N);
 
-    // Optional: sanity check for FUSED
 #ifndef NDEBUG
     if constexpr (FUSED) {
         if (!bias) {

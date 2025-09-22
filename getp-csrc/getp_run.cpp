@@ -37,7 +37,7 @@
 #ifndef GETP_RUN
 #define GETP_RUN
 
-#define BLOCK_M_MLP 16 * 4
+#define BLOCK_M_MLP 16 * 2
 
 int num_gpus = 1;
 bool IS_20B_MODEL = 1;
@@ -1610,7 +1610,7 @@ void warm_up(Transformer *transformer, Tokenizer *tokenizer)
     else IS_20B_MODEL = 0;
 
     if(IS_20B_MODEL) BATCH_SIZE = 1024, TENSOR_PARALLEL_SIZE = 2;
-    else BATCH_SIZE = 920, TENSOR_PARALLEL_SIZE = 4;
+    else BATCH_SIZE = 920, TENSOR_PARALLEL_SIZE = 8;
 
 
     HIP_CHECK(hipGetDeviceCount(&num_gpus));
@@ -1821,9 +1821,9 @@ void attention_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size,
         const int woff = layer_idx * H * QKV;
         matmul<
             /*WM,WN,WK*/ 16, 16, 16,
-            /*WAVES_M,N,K*/ 4, 4, 2,
+            /*WAVES_M,N,K*/ 4, 4, 4,
             /*TW_M,TW_N*/ 1, 1,
-            /*PAD_K*/ 8,
+            /*PAD_K*/ 16,
             /*FUSED*/ false>(qkv_mb, t_mb, w->w_qkv + woff, batch_size, H, QKV, nullptr, sAttn);
         HIP_CHECK(hipGetLastError());
     }
@@ -1928,9 +1928,9 @@ void attention_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size,
 
         matmul<
             16, 16, 16,
-            4, 4, 2,
+            4, 4, 4,
             1, 1,
-            8,
+            16,
             /*FUSED*/ true>(x_mb, tb_mb, w->w_o + woff, /*M=*/batch_size, /*K=*/Hd * NA, /*N=*/H,
                             /*bias=*/w->b_o + boff, /*stream=*/sAttn);
         HIP_CHECK(hipGetLastError());
@@ -2049,9 +2049,9 @@ void moe_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size,
         // TIMER_BLOCK("matmul_mc_router");
         matmul<
             16,16,16,
-            4,4,2,
+            4,4,4,
             1,1,
-            8,
+            16,
             /*FUSED*/ false
         >(s->router_score_g, s->gather_x_g,
             w->w_router + (size_t)layer_idx * H * E,
@@ -2161,9 +2161,9 @@ void moe_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size,
         const size_t seg1_loc = (size_t)o_len * H; // per-expert stride in local shard
         const __hip_bfloat16 *W1 = w->w_mlp1 + (size_t)layer_idx * (size_t)E * seg1_loc;
 
-        mlp1<16,16,16,  /*WAVES_M,N,K*/ 4,4,2,
+        mlp1<16,16,16,  /*WAVES_M,N,K*/ 2,4,4,
             /*TW_M,TW_N*/ 1,1,
-            /*PAD_K*/ 8>(
+            /*PAD_K*/ 16>(
             s->mlp1_out_g, s->expert_input_buffer_g, W1,
             s->d_expert_offsets, s->d_expert_counts,
             s->d_tile2expert_g, s->d_tile2local_g,
@@ -2207,9 +2207,9 @@ void moe_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size,
         const __hip_bfloat16 *W2 = w->w_mlp2 + (size_t)layer_idx * (size_t)E * seg2_loc;
         const __hip_bfloat16 *b2s = w->b_mlp2 + (size_t)layer_idx * (size_t)E * H;
         
-        mlp2<16,16,16,  /*WAVES_M,N,K*/ 4,4,2,
+        mlp2<16,16,16,  /*WAVES_M,N,K*/ 2,4,4,
             /*TW_M,TW_N*/ 1,1,
-            /*PAD_K*/ 8>(
+            /*PAD_K*/ 16>(
                 s->expert_output_partial_g, s->gate_up_g, W2, b2s,
                            s->d_expert_offsets, s->d_expert_counts,
                            s->d_tile2expert_g, s->d_tile2local_g,
@@ -2351,9 +2351,9 @@ void moe_gpu_120b(GPUTransformer *gpu_t, int layer_idx, int batch_size,
         // TIMER_BLOCK("matmul_mc_router");
         matmul<
             16,16,16,
-            4,4,2,
+            4,4,4,
             1,1,
-            8,
+            16,
             /*FUSED*/ false
         >(s->router_score_g, s->gather_x_g,
             w->w_router + (size_t)layer_idx * H * E,
@@ -2728,9 +2728,9 @@ int *forward_batch_gpu(GPUTransformer *gpu_t, int *tokens, int batch_size)
         // TIMER_BLOCK("final_matmul");
         matmul<
             16,16,16,
-            4,4,2,
+            4,4,4,
             1,1,
-            8,
+            16,
             false>(s->logits, s->x, w->out, B, H, p->vocab_size);
         HIP_CHECK(hipGetLastError());
     }
