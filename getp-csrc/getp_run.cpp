@@ -37,7 +37,7 @@
 #ifndef GETP_RUN
 #define GETP_RUN
 
-#define BLOCK_M_MLP 16 * 4
+#define BLOCK_M_MLP 16 * 2
 
 int num_gpus = 1;
 bool IS_20B_MODEL = 1;
@@ -2161,9 +2161,9 @@ void moe_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size,
         const size_t seg1_loc = (size_t)o_len * H; // per-expert stride in local shard
         const __hip_bfloat16 *W1 = w->w_mlp1 + (size_t)layer_idx * (size_t)E * seg1_loc;
 
-        mlp1<16,16,16,  /*WAVES_M,N,K*/ 4,4,2,
+        mlp1<16,16,16,  /*WAVES_M,N,K*/ 2,4,4,
             /*TW_M,TW_N*/ 1,1,
-            /*PAD_K*/ 8>(
+            /*PAD_K*/ 16>(
             s->mlp1_out_g, s->expert_input_buffer_g, W1,
             s->d_expert_offsets, s->d_expert_counts,
             s->d_tile2expert_g, s->d_tile2local_g,
@@ -2207,7 +2207,7 @@ void moe_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size,
         const __hip_bfloat16 *W2 = w->w_mlp2 + (size_t)layer_idx * (size_t)E * seg2_loc;
         const __hip_bfloat16 *b2s = w->b_mlp2 + (size_t)layer_idx * (size_t)E * H;
         
-        mlp2<16,16,16,  /*WAVES_M,N,K*/ 4,4,2,
+        mlp2<16,16,16,  /*WAVES_M,N,K*/ 2,4,4,
             /*TW_M,TW_N*/ 1,1,
             /*PAD_K*/ 8>(
                 s->expert_output_partial_g, s->gate_up_g, W2, b2s,
