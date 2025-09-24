@@ -1610,7 +1610,7 @@ void warm_up(Transformer *transformer, Tokenizer *tokenizer)
     else IS_20B_MODEL = 0;
 
     if(IS_20B_MODEL) BATCH_SIZE = 1024, TENSOR_PARALLEL_SIZE = 2;
-    else BATCH_SIZE = 920, TENSOR_PARALLEL_SIZE = 4;
+    else BATCH_SIZE = 896, TENSOR_PARALLEL_SIZE = 4;
 
 
     HIP_CHECK(hipGetDeviceCount(&num_gpus));
@@ -2162,7 +2162,7 @@ void moe_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size,
         const __hip_bfloat16 *W1 = w->w_mlp1 + (size_t)layer_idx * (size_t)E * seg1_loc;
 
         mlp1_optimized<16,16,16,  /*WAVES_M,N,K*/ 4,4,4,
-            /*TW_M,TW_N*/ 1,2,
+            /*TW_M,TW_N*/ 2,4,
             /*PAD_K*/ 8>(
             s->mlp1_out_g, s->expert_input_buffer_g, W1,
             s->d_expert_offsets, s->d_expert_counts,
@@ -2453,47 +2453,55 @@ void moe_gpu_120b(GPUTransformer *gpu_t, int layer_idx, int batch_size,
     }
 
     // 5) MLP1 (column-parallel on O=2D): local shard, MXFP4
-    int o_len = 0;
-    {
-        // TIMER_BLOCK("mlp1_mxfp4_moe");
-        const int twoD = 2 * D;
-        const int base = twoD / TP;
-        const int rem = twoD % TP;
-        o_len = base + (rank_in_group < rem ? 1 : 0);
+int o_len = 0;
+{
+    // TIMER_BLOCK("mlp1_mxfp4_moe");
+    const int twoD = 2 * D;
+    const int base = twoD / TP;
+    const int rem  = twoD % TP;
+    o_len = base + (rank_in_group < rem ? 1 : 0);
 
-        // Local-shard MXFP4 segment sizes: N=o_len, K=H
-        const size_t seg1_elems_loc = (size_t)o_len * (size_t)H;
-        const size_t seg1_packed_bytes_loc = (seg1_elems_loc + 1) / 2; // 2×4-bit packed
-        const size_t seg1_blocks_loc = (seg1_elems_loc + 31) / 32;     // per-32 elems scale
+    // Local-shard MXFP4 segment sizes: N=o_len, K=H
+    const size_t seg1_elems_loc         = (size_t)o_len * (size_t)H;
+    const size_t seg1_packed_bytes_loc  = (seg1_elems_loc + 1) / 2; // 2×4-bit packed
+    const size_t seg1_blocks_loc        = (seg1_elems_loc + 31) / 32; // per-32 elems scale
 
-        // Per-layer bases for *local shard* (weights for this rank are pre-sharded)
-        const size_t layer_pack_off = (size_t)layer_idx * (size_t)E * seg1_packed_bytes_loc;
-        const size_t layer_sc_off = (size_t)layer_idx * (size_t)E * seg1_blocks_loc;
+    // Per-layer bases for *local shard* (weights for this rank are pre-sharded)
+    const size_t layer_pack_off = (size_t)layer_idx * (size_t)E * seg1_packed_bytes_loc;
+    const size_t layer_sc_off   = (size_t)layer_idx * (size_t)E * seg1_blocks_loc;
 
-        const uint8_t *W1_packed_layer = w->w_mlp1_mxfp4 + layer_pack_off;
-        const float *S1_layer = w->w_mlp1_scales_f32 + layer_sc_off;
+    const uint8_t *W1_packed_layer = w->w_mlp1_mxfp4      + layer_pack_off;
+    const float   *S1_layer        = w->w_mlp1_scales_f32 + layer_sc_off;
 
-        dim3 grid((o_len + BLOCK_N_MLP - 1) / BLOCK_N_MLP, cur_tiles);
-        dim3 block(LANE_PER_WAVE, WAVES_PER_BLOCK_MLP);
+    // Grid/block: use effective waves for TW_M=1, TW_N=2 (matches your bf16 unified kernel)
+    dim3 grid((o_len + BLOCK_N_MLP - 1) / BLOCK_N_MLP, cur_tiles);
+    dim3 block(LANE_PER_WAVE, (WAVES_M_MLP / 1) * (WAVES_N_MLP / 2));
 
-        const int ldA = BLOCK_K_MLP + PAD_K_MLP;
-        const int ldB = BLOCK_K_MLP + PAD_K_MLP;
-        const size_t shmem =
-            sizeof(uint16_t) * (size_t)(2 * BLOCK_M_MLP * ldA + // sA0, sA1
-                                        2 * ldB * BLOCK_N_MLP   // sB0, sB1
-                               );
+    const int ldA = BLOCK_K_MLP + PAD_K_MLP;
+    const int ldB = BLOCK_K_MLP + PAD_K_MLP;
 
-        assert_smem_or_die(shmem, "grouped_mlp1_mxfp4_kernel(TP)");
-        hipLaunchKernelGGL(grouped_mlp1_mxfp4_kernel, grid, block, shmem, sMoe,
-                           s->mlp1_out_g,            // [total_tokens, o_len] float
-                           s->expert_input_buffer_g, // [total_tokens, H]     float
-                           W1_packed_layer,          // packed MXFP4 (local shard)
-                           S1_layer,                 // e8m0 scales (local shard)
-                           s->d_expert_offsets, s->d_expert_counts,
-                           s->d_tile2expert_g, s->d_tile2local_g,
-                           E, /*K=*/H, /*N=*/o_len);
-        HIP_CHECK(hipGetLastError());
-    }
+    // Single-buffer LDS: sA [BM x ldA] + sB [ldB x BN]
+    const size_t shmem =
+        sizeof(uint16_t) * (size_t)(BLOCK_M_MLP * ldA + ldB * BLOCK_N_MLP);
+
+    assert_smem_or_die(shmem, "grouped_mlp1_mxfp4_kernel_unified(TP)");
+    hipLaunchKernelGGL(
+        (grouped_mlp1_mxfp4_kernel_unified<
+            /*WM,WN,WK*/ 16, 16, 16,
+            /*WAVES_M,N,K*/ WAVES_M_MLP, WAVES_N_MLP, WAVES_K_MLP,
+            /*TW_M,TW_N*/ 1, 2,
+            /*PAD_K_MC*/  PAD_K_MLP>),
+        grid, block, shmem, sMoe,
+        /*C*/  s->mlp1_out_g,            // [total_tokens, o_len] float
+        /*A*/  s->expert_input_buffer_g, // [total_tokens, H]     float
+        /*W*/  W1_packed_layer,          // packed MXFP4 (local shard)
+        /*S*/  S1_layer,                 // f32 scales (local shard, per 32 elems)
+        /*routing*/ s->d_expert_offsets, s->d_expert_counts,
+        /*tiles*/   s->d_tile2expert_g,  s->d_tile2local_g,
+        /*E,K,N*/   E, /*K=*/H, /*N=*/o_len);
+    HIP_CHECK(hipGetLastError());
+}
+
 
     // 6) SwiGLU + bias for local columns -> gate_up_g with Dloc = o_len/2
     const int Dloc = o_len / 2;

@@ -12,7 +12,7 @@ constexpr int LANE_PER_WAVE = 64;
 #define WAVES_M_MLP 4
 #endif
 #ifndef WAVES_N_MLP
-#define WAVES_N_MLP 4
+#define WAVES_N_MLP 8
 #endif
 
 #ifndef WAVES_K_MLP
@@ -26,7 +26,7 @@ constexpr int BLOCK_N_MLP = WN * WAVES_N_MLP; // e.g. 64 if WAVES_N_MLP=4
 constexpr int WAVES_PER_BLOCK_MLP = WAVES_M_MLP * WAVES_N_MLP;
 constexpr int BLOCK_K_MLP = WK * WAVES_K_MLP; // e.g. 16 if WAVES_K_MLP=1
 #ifndef PAD_K_MLP
-#define PAD_K_MLP 8 // try 2 or 8 if you see LDS conflicts
+#define PAD_K_MLP 24 // try 2 or 8 if you see LDS conflicts
 #endif
 static_assert((BLOCK_K_MLP % 2) == 0, "BLOCK_K_MLP must be even (packs 2×bf16).");
 static_assert((PAD_K_MLP % 2) == 0, "PAD_K_MLP must be even (u32 pair addressing).");
@@ -211,6 +211,7 @@ __device__ inline void copy_B_tile_vec_MLP_MXFP4(
         reinterpret_cast<uint32_t *>(dst_u32 + ((size_t)c * LD_B >> 1))[p] = out;
     }
 }
+
 
 // Load B tile: global (MXFP4) -> LDS (bf16 col-major) using f32 scales.
 // Stores into LDS as u32 (two bf16 packed). LD_B is LDS stride in elements.
@@ -2341,6 +2342,657 @@ inline void mlp2_optimized(
             WM, WN, WK, WAVES_M, WAVES_N, WAVES_K, TW_M, TW_N, PAD_K>),
         grid, block, shmem_bytes, s,
         C, A, W2, b2,
+        expert_offsets, expert_counts,
+        tile2expert, tile2local,
+        E, K, N);
+    HIP_CHECK(hipGetLastError());
+}
+
+
+// // --- Optimized MXFP4 B-tile load (single buffer, cooperative, u32 stores) ---
+// // Converts packed 4-bit (with pre-expanded f32 scales) -> bf16, writes as u32 (2×bf16)
+// // into LDS in column-major layout. Each thread handles a strided set of (pair) positions.
+// //
+// // LDS stride LD_B is in *elements* (bf16). We index u32 words (2×bf16) so we >> 1.
+// template <int LD_B>
+// __device__ inline void copy_B_tile_vec_MLP_MXFP4_Optimized(
+//     uint32_t *__restrict__ dst_u32,         // writes u32 (2×bf16) into LDS
+//     const uint8_t *__restrict__ W_packed_e, // per-expert packed nibble base
+//     const float   *__restrict__ S_f32_e,    // per-expert f32 scales base
+//     int n0, int N, int K, int kBase,
+//     int linearT, int threadsPerBlock)
+// {
+//     constexpr int BN_ = BLOCK_N_MLP;
+//     constexpr int BK_ = BLOCK_K_MLP;
+//     const int pairsPerCol = BK_ >> 1;   // 2 elems per u32
+//     const int totalPairs  = BN_ * pairsPerCol;
+
+//     // For each destination column inside the tile:
+//     //   c in [0..BN_-1]  -> global column gn = n0 + c
+//     // For each pair index along K inside the tile:
+//     //   p in [0..pairsPerCol-1] -> even global row gk = kBase + 2*p
+//     // We dequantize two MXFP4 values at (gn, gk) and (gn, gk+1) in one go.
+//     for (int t = linearT; t < totalPairs; t += threadsPerBlock)
+//     {
+//         const int c  = t / pairsPerCol;              // tile column
+//         const int p  = t % pairsPerCol;              // pair along K
+//         const int gn = n0 + c;                       // global column (N)
+//         const int gk = kBase + (p << 1);             // even global row within K
+
+//         uint32_t out = 0u;
+//         if (gn < N && gk < K)
+//         {
+//             const size_t idx0 = (size_t)gn * (size_t)K + (size_t)gk; // row-major [N x K]
+//             out = deq2_pack_bf16_u32_fscale(W_packed_e, S_f32_e, idx0, K, N);
+//         }
+//         // LDS is column-major for B: one column per contiguous block with stride LD_B
+//         // We store u32 (2 bf16), so address as (c*LD_B)/2, then [p].
+//         reinterpret_cast<uint32_t *>(dst_u32 + ((size_t)c * LD_B >> 1))[p] = out;
+//     }
+// }
+
+
+// // --- grouped_mlp1_mxfp4_kernel_optimized (single-buffer version) ---
+// // Loads A (float -> bf16) and B (MXFP4 -> bf16) tiles once per K-slice into LDS,
+// // then computes with MFMA; no double buffering. Copy helpers zero-fill out-of-range.
+// __global__ void grouped_mlp1_mxfp4_kernel_optimized(
+//     float *__restrict__ C,                         // [sum_tokens, 2D]
+//     const float *__restrict__ A,                   // [sum_tokens, H] (float), row-major
+//     const uint8_t *__restrict__ W1_packed_layer,   // [E, ceil((2D*H)/2)]
+//     const float *__restrict__ S1_scales_f32_layer, // [E, ceil((2D*H)/32)]
+//     const int *__restrict__ expert_offsets,        // [E]
+//     const int *__restrict__ expert_counts,         // [E]
+//     const int *__restrict__ tile2expert,           // [num_mtiles]
+//     const int *__restrict__ tile2local,            // [num_mtiles]
+//     int /*E*/, int K /*=H*/, int N /*=o_len*/)
+// {
+//     const int mtile_id = blockIdx.y;
+//     const int e        = tile2expert[mtile_id];
+//     const int tile_m   = tile2local[mtile_id];
+
+//     const int m_start  = expert_offsets[e] + tile_m * BLOCK_M_MLP;
+//     const int m_left   = expert_counts[e] - tile_m * BLOCK_M_MLP;
+//     if (m_left <= 0) return;
+
+//     const int n0       = blockIdx.x * BLOCK_N_MLP;
+
+//     const int lane     = threadIdx.x;
+//     const int wave     = threadIdx.y;
+//     const int wave_m   = wave / WAVES_N_MLP;
+//     const int wave_n   = wave % WAVES_N_MLP;
+
+//     extern __shared__ uint8_t smemRaw[];
+//     const int ldA = BLOCK_K_MLP + PAD_K_MLP;   // LDS stride (bf16 elements)
+//     const int ldB = BLOCK_K_MLP + PAD_K_MLP;   // LDS stride (bf16 elements)
+
+//     // Single-buffer LDS layout:
+//     //   sA: [BLOCK_M_MLP x ldA] bf16
+//     //   sB: [ldB x BLOCK_N_MLP] bf16 (column-major for B)
+//     uint16_t *sA_u16 = reinterpret_cast<uint16_t *>(smemRaw);
+//     uint16_t *sB_u16 = sA_u16 + (BLOCK_M_MLP * ldA);
+
+//     uint32_t *sA_u32 = reinterpret_cast<uint32_t *>(sA_u16);
+//     uint32_t *sB_u32 = reinterpret_cast<uint32_t *>(sB_u16);
+
+//     f32x4 acc = {0.f, 0.f, 0.f, 0.f};
+
+//     const int threadsPerBlock = blockDim.x * blockDim.y;
+//     const int linearT         = wave * blockDim.x + lane;
+//     const int M_bound         = m_start + m_left;
+
+//     // Per-expert shard bases (weights already sharded to the local rank)
+//     const size_t seg_elems = (size_t)N * (size_t)K;
+//     const size_t seg_bytes = (seg_elems + 1) / 2;
+//     const size_t seg_blocks = (seg_elems + 31) / 32;
+
+//     const uint8_t *__restrict__ W_e_packed = W1_packed_layer + (size_t)e * seg_bytes;
+//     const float   *__restrict__ S_f32_e    = S1_scales_f32_layer + (size_t)e * seg_blocks;
+
+//     // A alignment check for vectorized float2 path
+//     const bool alignedA = (((uintptr_t)A & 0x7) == 0) && ((K & 1) == 0);
+
+//     const int aRowBase = wave_m * WM;
+//     const int bColBase = wave_n * WN;
+
+//     // Loop over K in BLOCK_K_MLP chunks (last chunk is tail-safe via guards)
+//     for (int k0 = 0; k0 < K; k0 += BLOCK_K_MLP)
+//     {
+//         // Cooperatively stage A tile [BM x BK] into LDS as packed bf16 (u32 stores)
+//         if (alignedA)
+//             copy_A_tile_vec_MLP<true,  /*LD_A=*/ldA>(sA_u32, A, m_start, M_bound, K, k0, linearT, threadsPerBlock);
+//         else
+//             copy_A_tile_vec_MLP<false, /*LD_A=*/ldA>(sA_u32, A, m_start, M_bound, K, k0, linearT, threadsPerBlock);
+
+//         // Cooperatively stage B tile [BK x BN] (from MXFP4) into LDS (u32 stores)
+//         copy_B_tile_vec_MLP_MXFP4_Optimized</*LD_B=*/ldB>(
+//             sB_u32, W_e_packed, S_f32_e, n0, N, K, k0, linearT, threadsPerBlock);
+
+//         __syncthreads();
+
+//         // MFMA over the staged slice
+// #pragma unroll
+//         for (int kk = 0; kk < BLOCK_K_MLP; kk += WK)
+//         {
+//             // Gather 4 bf16 from A and B for this lane/wave microtile
+//             bf16x4 avec = make_a_vec_k(sA_u16, ldA, aRowBase, kk, lane);
+//             bf16x4 bvec = make_b_vec_k(sB_u16, ldB, bColBase, kk, lane);
+//             acc = mfma_16x16x16_bf16(avec, bvec, acc);
+//         }
+
+//         __syncthreads();
+//     }
+
+//     // Write back C tile accumulator
+//     const int rowBase = m_start + wave_m * WM + lane_group(lane) * 4;
+//     const int col     = n0 + wave_n * WN + lane_row(lane);
+// #pragma unroll
+//     for (int i = 0; i < 4; ++i)
+//     {
+//         const int row = rowBase + i;
+//         if (row < M_bound && col < N)
+//         {
+//             C[(size_t)row * N + col] = acc[i];
+//         }
+//     }
+// }
+
+
+
+
+
+// // Dequantize 32 MXFP4 nibbles (packed in 16 bytes = uint4) with one f32 scale X,
+// // and pack them into 16 u32 words (each u32 holds two bf16).
+// __device__ __forceinline__ void deq32_pack16_u32_from_u128(uint4 bytes16, float X, uint32_t out16[16]) {
+//     // Pre-scale magnitudes once per 32-block
+//     const float mtab[8] = {
+//         0.0f,
+//         0.5f * X, 1.0f * X, 1.5f * X,
+//         2.0f * X, 3.0f * X, 4.0f * X, 6.0f * X
+//     };
+
+//     auto unpack_word = [&](uint32_t w, int &idx) {
+// #pragma unroll
+//         for (int k = 0; k < 4; ++k) {
+//             const uint8_t byte = (uint8_t)((w >> (k * 8)) & 0xFF);
+//             const uint8_t n0 = (byte & 0x0F);
+//             const uint8_t n1 = (byte >> 4);
+//             const float v0 = (n0 & 8) ? -mtab[n0 & 7] : mtab[n0 & 7];
+//             const float v1 = (n1 & 8) ? -mtab[n1 & 7] : mtab[n1 & 7];
+//             out16[idx++] = pack2_bf16_bits_f32(v0, v1);
+//         }
+//     };
+
+//     int idx = 0;
+//     unpack_word(bytes16.x, idx);
+//     unpack_word(bytes16.y, idx);
+//     unpack_word(bytes16.z, idx);
+//     unpack_word(bytes16.w, idx);
+// }
+
+
+
+// // Stream dequantize of 32 MXFP4 values from one 16B chunk into LDS (u32* dst)
+// __device__ __forceinline__ void deq32_stream_store_from_u128(uint4 v128, float X, uint32_t* __restrict__ dst_u32) {
+//     const float mtab[8] = {0.f, 0.5f*X, 1.f*X, 1.5f*X, 2.f*X, 3.f*X, 4.f*X, 6.f*X};
+
+//     auto emit4 = [&](uint32_t w){
+// #pragma unroll
+//         for (int k = 0; k < 4; ++k) {
+//             const uint8_t byte = (uint8_t)((w >> (k * 8)) & 0xFF);
+//             const uint8_t n0 =  byte       & 0x0F;
+//             const uint8_t n1 = (byte >> 4) & 0x0F;
+//             const float   v0 = (n0 & 8) ? -mtab[n0 & 7] : mtab[n0 & 7];
+//             const float   v1 = (n1 & 8) ? -mtab[n1 & 7] : mtab[n1 & 7];
+//             *dst_u32++ = pack2_bf16_bits_f32(v0, v1);
+//         }
+//     };
+//     emit4(v128.x); emit4(v128.y); emit4(v128.z); emit4(v128.w);
+// }
+
+// // HYBRID: BK>=64 uses 128b vec32 loader; BK=32 uses coalesced deq2 pairs.
+// template <int LD_B>
+// __device__ inline void copy_B_tile_vec_MLP_MXFP4_Optimized(
+//     uint32_t *__restrict__ dst_u32,         // writes u32 (2×bf16) into LDS
+//     const uint8_t *__restrict__ W_packed_e, // [N,K] row-major, 2 nibbles/byte
+//     const float   *__restrict__ S_f32_e,    // [N*K/32] one f32 per 32 elems
+//     int n0, int N, int K, int kBase,
+//     int linearT, int threadsPerBlock)
+// {
+//     constexpr int BN_ = BLOCK_N_MLP;
+//     constexpr int BK_ = BLOCK_K_MLP;
+
+//     if constexpr (BK_ >= 64) {
+//         // -------- 128-bit vector path (good coalescing when vecsPerCol>=2) --------
+//         const int vecsPerCol = BK_ / 32;      // 32 elems per 16B vector
+//         const int totalVecs  = BN_ * vecsPerCol;
+
+//         for (int t = linearT; t < totalVecs; t += threadsPerBlock)
+//         {
+//             const int c   = t / vecsPerCol;          // 0..BN_-1
+//             const int v32 = t % vecsPerCol;          // 0..(BK_/32 - 1)
+//             const int gn  = n0 + c;
+//             const int gk  = kBase + (v32 << 5);      // multiple of 32
+
+//             // LDS column base for this tile column
+//             uint32_t *col = reinterpret_cast<uint32_t *>(dst_u32 + ((size_t)c * LD_B >> 1));
+//             const int offPairs = ((gk - kBase) >> 1); // u32 pairs offset inside BK stripe
+
+//             if (gn < N && gk < K) {
+//                 const size_t idx0   = (size_t)gn * (size_t)K + (size_t)gk;
+//                 const size_t byteOf = idx0 >> 1;          // 2 nibbles / byte
+//                 const size_t blk32  = idx0 >> 5;          // /32
+//                 const float  X      = S_f32_e[blk32];
+
+//                 if ((gk + 31) < K && is_aligned_16B(&W_packed_e[byteOf])) {
+//                     const uint4 v = *reinterpret_cast<const uint4 *>(&W_packed_e[byteOf]);
+//                     deq32_stream_store_from_u128(v, X, /*dst*/ col + offPairs);
+//                 } else {
+//                     // Fallback: 16 consecutive (v0,v1) pairs
+// #pragma unroll
+//                     for (int j = 0; j < 16; ++j) {
+//                         const int kEven = gk + (j << 1);
+//                         col[offPairs + j] = (kEven < K)
+//                             ? deq2_pack_bf16_u32_fscale(W_packed_e, S_f32_e, idx0 + (j << 1), K, N)
+//                             : 0u;
+//                     }
+//                 }
+//             } else {
+//                 // out of bounds -> zero-fill
+// #pragma unroll
+//                 for (int j = 0; j < 16; ++j) col[offPairs + j] = 0u;
+//             }
+//         }
+//     } else {
+//         // -------- BK=32 friendly coalesced pair path (p-major across threads) --------
+//         const int pairsPerCol = BK_ >> 1;               // 2 elems per u32
+//         const int totalPairs  = BN_ * pairsPerCol;
+
+//         for (int t = linearT; t < totalPairs; t += threadsPerBlock)
+//         {
+//             const int c  = t / pairsPerCol;             // 0..BN_-1
+//             const int p  = t % pairsPerCol;             // 0..pairsPerCol-1
+//             const int gn = n0 + c;                      // global column (N)
+//             const int gk = kBase + (p << 1);            // even K
+
+//             uint32_t out = 0u;
+//             if (gn < N && gk < K) {
+//                 const size_t idx0 = (size_t)gn * (size_t)K + (size_t)gk;
+//                 out = deq2_pack_bf16_u32_fscale(W_packed_e, S_f32_e, idx0, K, N);
+//             }
+//             reinterpret_cast<uint32_t *>(dst_u32 + ((size_t)c * LD_B >> 1))[p] = out;
+//         }
+//     }
+// }
+
+
+
+// // ======================= Kernel (single buffer, vectorized loads) =======================
+// __global__ void grouped_mlp1_mxfp4_kernel_optimized(
+//     float *__restrict__ C,                         // [sum_tokens, N]
+//     const float *__restrict__ A,                   // [sum_tokens, K] (float), row-major
+//     const uint8_t *__restrict__ W1_packed_layer,   // [E, ceil((N*K)/2)]
+//     const float *__restrict__ S1_scales_f32_layer, // [E, ceil((N*K)/32)]
+//     const int *__restrict__ expert_offsets,        // [E]
+//     const int *__restrict__ expert_counts,         // [E]
+//     const int *__restrict__ tile2expert,           // [num_mtiles]
+//     const int *__restrict__ tile2local,            // [num_mtiles]
+//     int /*E*/, int K, int N)
+// {
+//     const int mtile_id = blockIdx.y;
+//     const int e        = tile2expert[mtile_id];
+//     const int tile_m   = tile2local[mtile_id];
+
+//     const int m_start  = expert_offsets[e] + tile_m * BLOCK_M_MLP;
+//     const int m_left   = expert_counts[e] - tile_m * BLOCK_M_MLP;
+//     if (m_left <= 0) return;
+
+//     const int n0       = blockIdx.x * BLOCK_N_MLP;
+
+//     const int lane     = threadIdx.x;
+//     const int wave     = threadIdx.y;
+//     const int wave_m   = wave / WAVES_N_MLP;
+//     const int wave_n   = wave % WAVES_N_MLP;
+
+//     extern __shared__ uint8_t smemRaw[];
+//     const int ldA = BLOCK_K_MLP + PAD_K_MLP;
+//     const int ldB = BLOCK_K_MLP + PAD_K_MLP;
+
+//     // Single buffer LDS: sA [BM x ldA] | sB [ldB x BN]
+//     uint16_t *sA_u16 = reinterpret_cast<uint16_t *>(smemRaw);
+//     uint16_t *sB_u16 = sA_u16 + (BLOCK_M_MLP * ldA);
+
+//     uint32_t *sA_u32 = reinterpret_cast<uint32_t *>(sA_u16);
+//     uint32_t *sB_u32 = reinterpret_cast<uint32_t *>(sB_u16);
+
+//     f32x4 acc = {0.f, 0.f, 0.f, 0.f};
+
+//     const int threadsPerBlock = blockDim.x * blockDim.y;
+//     const int linearT         = wave * blockDim.x + lane;
+//     const int M_bound         = m_start + m_left;
+
+//     // Per-expert segment bases (local shard already chosen by caller)
+//     const size_t seg_elems  = (size_t)N * (size_t)K;
+//     const size_t seg_bytes  = (seg_elems + 1) / 2;
+//     const size_t seg_blocks = (seg_elems + 31) / 32;
+
+//     const uint8_t *__restrict__ W_e_packed = W1_packed_layer     + (size_t)e * seg_bytes;
+//     const float   *__restrict__ S_f32_e    = S1_scales_f32_layer + (size_t)e * seg_blocks;
+
+//     const int aRowBase = wave_m * WM;
+//     const int bColBase = wave_n * WN;
+
+//     // Iterate K in BK stripes; each stripe is staged once then fully consumed
+//     for (int k0 = 0; k0 < K; k0 += BLOCK_K_MLP)
+//     {
+//         // A: global fp32 -> LDS bf16 using 128b loads (your helper)
+//         copy_A_tile_vec128_fp32<BLOCK_M_MLP, BLOCK_K_MLP, /*LD_A=*/ldA>(
+//             sA_u32, A, m_start, M_bound, K, k0, linearT, threadsPerBlock);
+
+//         // B: global MXFP4 -> LDS bf16 using 128b loads + block-of-32 dequant
+//         copy_B_tile_vec_MLP_MXFP4_Optimized</*LD_B=*/ldB>(
+//             sB_u32, W_e_packed, S_f32_e, n0, N, K, k0, linearT, threadsPerBlock);
+
+//         __syncthreads();
+
+// #pragma unroll
+//         for (int kk = 0; kk < BLOCK_K_MLP; kk += WK)
+//         {
+//             bf16x4 avec = make_a_vec_k(sA_u16, ldA, aRowBase, kk, lane);
+//             bf16x4 bvec = make_b_vec_k(sB_u16, ldB, bColBase, kk, lane);
+//             acc = mfma_16x16x16_bf16(avec, bvec, acc);
+//         }
+
+//         __syncthreads();
+//     }
+
+//     // Write C (guarded)
+//     const int rowBase = m_start + wave_m * WM + lane_group(lane) * 4;
+//     const int col     = n0 + wave_n * WN + lane_row(lane);
+// #pragma unroll
+//     for (int i = 0; i < 4; ++i) {
+//         const int row = rowBase + i;
+//         if (row < M_bound && col < N) {
+//             C[(size_t)row * N + col] = acc[i];
+//         }
+//     }
+// }
+
+
+
+
+
+
+__device__ __forceinline__ void deq32_stream_store_from_u128(
+    uint4 v128, float X, uint32_t* __restrict__ dst_u32)
+{
+    const float mtab[8] = {0.f, 0.5f*X, 1.f*X, 1.5f*X, 2.f*X, 3.f*X, 4.f*X, 6.f*X};
+    auto emit4 = [&](uint32_t w){
+#pragma unroll
+        for (int k = 0; k < 4; ++k) {
+            const uint8_t byte = (uint8_t)((w >> (k * 8)) & 0xFF);
+            const uint8_t n0 =  byte       & 0x0F;
+            const uint8_t n1 = (byte >> 4) & 0x0F;
+            const float v0 = (n0 & 8) ? -mtab[n0 & 7] : mtab[n0 & 7];
+            const float v1 = (n1 & 8) ? -mtab[n1 & 7] : mtab[n1 & 7];
+            *dst_u32++ = pack2_bf16_bits_f32(v0, v1);
+        }
+    };
+    emit4(v128.x); emit4(v128.y); emit4(v128.z); emit4(v128.w);
+}
+
+// ========== templated HYBRID MXFP4 B tile copy (row-major N×K -> LDS col-major) ==========
+template <int BLOCK_N, int BLOCK_K, int LD_B>
+__device__ inline void copy_B_tile_vec_MXFP4_hybrid(
+    uint32_t *__restrict__ dst_u32,         // writes u32 (2×bf16) into LDS
+    const uint8_t *__restrict__ W_packed_e, // [N,K] row-major (2 nibbles/byte)
+    const float   *__restrict__ S_f32_e,    // [ceil(N*K/32)] one f32 per 32 elems
+    int n0, int N, int K, int kBase,
+    int linearT, int threadsPerBlock)
+{
+    if constexpr (BLOCK_K >= 64) {
+        constexpr int vecsPerCol = BLOCK_K / 32;
+        constexpr int totalVecs  = BLOCK_N * vecsPerCol;
+
+        for (int t = linearT; t < totalVecs; t += threadsPerBlock)
+        {
+            const int c   = t / vecsPerCol;          // 0..BLOCK_N-1
+            const int v32 = t % vecsPerCol;          // which 32-chunk along K
+            const int gn  = n0 + c;
+            const int gk  = kBase + (v32 << 5);      // multiple of 32
+
+            uint32_t *col = reinterpret_cast<uint32_t *>(dst_u32 + ((size_t)c * LD_B >> 1));
+            const int offPairs = ((gk - kBase) >> 1);
+
+            if (gn < N && gk < K) {
+                const size_t idx0   = (size_t)gn * (size_t)K + (size_t)gk;
+                const size_t byteOf = idx0 >> 1;     // 2 nibbles/byte
+                const size_t blk32  = idx0 >> 5;     // /32 for scale
+                const float  X      = S_f32_e[blk32];
+
+                if ((gk + 31) < K && is_aligned_16B(&W_packed_e[byteOf])) {
+                    const uint4 v = *reinterpret_cast<const uint4 *>(&W_packed_e[byteOf]);
+                    deq32_stream_store_from_u128(v, X, col + offPairs);
+                } else {
+#pragma unroll
+                    for (int j = 0; j < 16; ++j) {
+                        const int kEven = gk + (j << 1);
+                        col[offPairs + j] = (kEven < K)
+                          ? deq2_pack_bf16_u32_fscale(W_packed_e, S_f32_e, idx0 + (j << 1), K, N)
+                          : 0u;
+                    }
+                }
+            } else {
+#pragma unroll
+                for (int j = 0; j < 16; ++j) col[offPairs + j] = 0u;
+            }
+        }
+    } else {
+        // BK==32 path: coalesced p-major dequant
+        constexpr int pairsPerCol = BLOCK_K >> 1;
+        constexpr int totalPairs  = BLOCK_N * pairsPerCol;
+
+        for (int t = linearT; t < totalPairs; t += threadsPerBlock)
+        {
+            const int c  = t / pairsPerCol;             // 0..BLOCK_N-1
+            const int p  = t % pairsPerCol;             // 0..pairsPerCol-1
+            const int gn = n0 + c;
+            const int gk = kBase + (p << 1);
+
+            uint32_t out = 0u;
+            if (gn < N && gk < K) {
+                const size_t idx0 = (size_t)gn * (size_t)K + (size_t)gk;
+                out = deq2_pack_bf16_u32_fscale(W_packed_e, S_f32_e, idx0, K, N);
+            }
+            reinterpret_cast<uint32_t *>(dst_u32 + ((size_t)c * LD_B >> 1))[p] = out;
+        }
+    }
+}
+
+// ========== unified MXFP4 kernel (indexes match your bf16 version exactly) ==========
+template <
+    // MFMA micro-tile
+    int WM, int WN, int WK,
+    // Block waves (logical)
+    int WAVES_M, int WAVES_N, int WAVES_K,
+    // Tiles per wave (multi-tile per wave)
+    int TW_M, int TW_N,
+    // Padding along K in LDS
+    int PAD_K_MC>
+__global__ __launch_bounds__(64 * ((WAVES_M / TW_M) * (WAVES_N / TW_N)), 2)
+void grouped_mlp1_mxfp4_kernel_unified(
+    float *__restrict__ C,                         // [sum_tokens, N]
+    const float *__restrict__ A,                   // [sum_tokens, K]
+    const uint8_t *__restrict__ W_packed_layer,    // [E, ceil(N*K/2)]
+    const float   *__restrict__ S_scales_f32_layer,// [E, ceil(N*K/32)]
+    const int *__restrict__ expert_offsets,        // [E]
+    const int *__restrict__ expert_counts,         // [E]
+    const int *__restrict__ tile2expert,           // [num_mtiles]
+    const int *__restrict__ tile2local,            // [num_mtiles]
+    int E, int K, int N)
+{
+    static_assert(WM == 16 && WN == 16 && WK == 16, "MFMA 16x16x16");
+    static_assert((WAVES_M % TW_M) == 0 && (WAVES_N % TW_N) == 0, "TW must divide WAVES");
+    constexpr int BLOCK_M = WM * WAVES_M;
+    constexpr int BLOCK_N = WN * WAVES_N;
+    constexpr int BLOCK_K = WK * WAVES_K;
+    constexpr int WAVES_M_E = WAVES_M / TW_M;
+    constexpr int WAVES_N_E = WAVES_N / TW_N;
+    constexpr int WAVES_PER_BLOCK_E = WAVES_M_E * WAVES_N_E;
+    static_assert((BLOCK_K % 2) == 0, "BLOCK_K even");
+    static_assert((PAD_K_MC % 2) == 0, "PAD_K_MC even");
+
+    // which expert / M tile
+    const int mtile_id = blockIdx.y;
+    const int e        = tile2expert[mtile_id];
+    const int tile_m   = tile2local[mtile_id];
+    const int m_start  = expert_offsets[e] + tile_m * BLOCK_M;
+    const int m_left   = expert_counts[e] - tile_m * BLOCK_M;
+    if (m_left <= 0) return;
+
+    const int n0 = blockIdx.x * BLOCK_N;
+    const int m0 = m_start;
+
+    // unified indexing
+    const int lane = threadIdx.x;                 // 0..63
+    const int wave = threadIdx.y;                 // 0..WAVES_PER_BLOCK_E-1
+    const int wave_m_eff = wave / WAVES_N_E;
+    const int wave_n_eff = wave % WAVES_N_E;
+
+    const int tile_m0 = wave_m_eff * TW_M;
+    const int tile_n0 = wave_n_eff * TW_N;
+
+    const int aBase0 = tile_m0 * WM;
+    const int bBase0 = tile_n0 * WN;
+
+    // single-buffer LDS
+    extern __shared__ uint8_t smemRaw[];
+    constexpr int ldA = BLOCK_K + PAD_K_MC;
+    constexpr int ldB = BLOCK_K + PAD_K_MC;
+
+    uint16_t *sA_u16 = reinterpret_cast<uint16_t *>(smemRaw);
+    uint16_t *sB_u16 = sA_u16 + (BLOCK_M * ldA);
+
+    uint32_t *sA_u32 = reinterpret_cast<uint32_t *>(sA_u16);
+    uint32_t *sB_u32 = reinterpret_cast<uint32_t *>(sB_u16);
+
+    // accumulators (multi-tile)
+    f32x4 acc[TW_M][TW_N];
+#pragma unroll
+    for (int tm = 0; tm < TW_M; ++tm)
+#pragma unroll
+        for (int tn = 0; tn < TW_N; ++tn)
+            acc[tm][tn] = {0.f, 0.f, 0.f, 0.f};
+
+    const int threadsPerBlock = blockDim.x * blockDim.y;
+    const int linearT         = wave * blockDim.x + lane;
+
+    // per-expert segment bases
+    const size_t seg_elems  = (size_t)N * (size_t)K;
+    const size_t seg_bytes  = (seg_elems + 1) / 2;
+    const size_t seg_blocks = (seg_elems + 31) / 32;
+    const uint8_t *__restrict__ W_e_packed = W_packed_layer    + (size_t)e * seg_bytes;
+    const float   *__restrict__ S_f32_e    = S_scales_f32_layer + (size_t)e * seg_blocks;
+
+    const int M_bound = m_start + m_left;
+
+    // K loop
+    for (int k0 = 0; k0 < K; k0 += BLOCK_K)
+    {
+        // A: fp32 -> bf16 (128b vectorized)
+        copy_A_tile_vec128_fp32<BLOCK_M, BLOCK_K, ldA>(
+            sA_u32, A, m0, M_bound, K, k0, linearT, threadsPerBlock);
+
+        // B: MXFP4 -> bf16 (hybrid)
+        copy_B_tile_vec_MXFP4_hybrid<BLOCK_N, BLOCK_K, ldB>(
+            sB_u32, W_e_packed, S_f32_e, n0, N, K, k0, linearT, threadsPerBlock);
+
+        __syncthreads();
+
+#pragma unroll
+        for (int kk = 0; kk < BLOCK_K; kk += WK)
+        {
+            bf16x4 avec[TW_M];
+#pragma unroll
+            for (int tm = 0; tm < TW_M; ++tm) {
+                const int aRowBase = aBase0 + tm * WM;
+                avec[tm] = make_a_vec_k(sA_u16, ldA, aRowBase, kk, lane);
+            }
+            bf16x4 bvec[TW_N];
+#pragma unroll
+            for (int tn = 0; tn < TW_N; ++tn) {
+                const int bColBase = bBase0 + tn * WN;
+                bvec[tn] = make_b_vec_k(sB_u16, ldB, bColBase, kk, lane);
+            }
+#pragma unroll
+            for (int tm = 0; tm < TW_M; ++tm)
+#pragma unroll
+                for (int tn = 0; tn < TW_N; ++tn)
+                    acc[tm][tn] = mfma_16x16x16_bf16(avec[tm], bvec[tn], acc[tm][tn]);
+        }
+
+        __syncthreads();
+    }
+
+    // stores (identical to your bf16 path)
+    const bool interior =
+        ((m0 + BLOCK_M) <= (m_start + m_left)) &&
+        ((n0 + BLOCK_N) <= N);
+#pragma unroll
+    for (int tm = 0; tm < TW_M; ++tm)
+    {
+#pragma unroll
+        for (int tn = 0; tn < TW_N; ++tn)
+        {
+            const int wmt = tile_m0 + tm;
+            const int wnt = tile_n0 + tn;
+            if (interior)
+                store_c_tile<WM, WN, true>(acc[tm][tn], C, m_start + m_left, N, m0, n0, wmt, wnt, lane);
+            else
+                store_c_tile<WM, WN, false>(acc[tm][tn], C, m_start + m_left, N, m0, n0, wmt, wnt, lane);
+        }
+    }
+}
+
+
+
+
+template <
+    int WM = 16, int WN = 16, int WK = 16,
+    int WAVES_M = 1, int WAVES_N = 8, int WAVES_K = 2,
+    int TW_M = 1, int TW_N = 2,
+    int PAD_K_MC = 16>
+inline void mlp1_mxfp4_optimized_unified(
+    float *C, const float *A,
+    const uint8_t *W1_packed, const float *S1_scales_f32,
+    const int *expert_offsets, const int *expert_counts,
+    const int *tile2expert, const int *tile2local,
+    int E, int K, int N, int cur_tiles, hipStream_t s = nullptr)
+{
+    constexpr int BLOCK_M = WM * WAVES_M;
+    constexpr int BLOCK_N = WN * WAVES_N;
+    constexpr int BLOCK_K = WK * WAVES_K;
+
+    // grid over N and the logical M tiles
+    dim3 grid((N + BLOCK_N - 1) / BLOCK_N, cur_tiles);
+    dim3 block(64, (WAVES_M / TW_M) * (WAVES_N / TW_N));  // effective waves (matches kernel)
+
+    constexpr int ldA = BLOCK_K + PAD_K_MC;
+    constexpr int ldB = BLOCK_K + PAD_K_MC;
+    const size_t shmem_bytes =
+        sizeof(uint16_t) * (size_t)(BLOCK_M * ldA + ldB * BLOCK_N);
+
+#ifdef assert_smem_or_die
+    assert_smem_or_die(shmem_bytes, "grouped_mlp1_mxfp4_kernel_unified");
+#endif
+
+    hipLaunchKernelGGL(
+        (grouped_mlp1_mxfp4_kernel_unified<
+            WM, WN, WK,
+            WAVES_M, WAVES_N, WAVES_K,
+            TW_M, TW_N,
+            PAD_K_MC>),
+        grid, block, shmem_bytes, s,
+        C, A, W1_packed, S1_scales_f32,
         expert_offsets, expert_counts,
         tile2expert, tile2local,
         E, K, N);
