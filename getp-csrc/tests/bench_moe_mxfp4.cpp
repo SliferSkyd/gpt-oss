@@ -55,6 +55,21 @@ static inline uint8_t enc_fp4_e2m1_nearest_host(float x) {
     return best;
 }
 
+static inline __hip_bfloat16 float_to_bf16(float x) {
+#if defined(__HIP_PLATFORM_AMD__)
+    return __float2bfloat16(x);
+#else
+    uint32_t u;
+    std::memcpy(&u, &x, sizeof(u));
+    uint32_t rounding_bias = ((u >> 16) & 1u) + 0x7FFFu;
+    u += rounding_bias;
+    uint16_t b = static_cast<uint16_t>(u >> 16);
+    __hip_bfloat16 out;
+    std::memcpy(&out, &b, sizeof(b));
+    return out;
+#endif
+}
+
 // ── Routing structures ─────────────────────────────────────────────────────────
 struct Routing {
     std::vector<int> counts;   // per expert
@@ -169,7 +184,7 @@ static void launch_grouped_mlp1_baseline(
     const int* d_tile2expert, const int* d_tile2local,
     int N, int Kdim, int cur_tiles, hipStream_t stream)
 {
-    return;
+    // return;
     dim3 grid((N + BLOCK_N_MLP - 1) / BLOCK_N_MLP, cur_tiles);
     dim3 block(LANE_PER_WAVE, WAVES_PER_BLOCK_MLP);
 
@@ -187,37 +202,21 @@ static void launch_grouped_mlp1_baseline(
 }
 
 static void launch_grouped_mlp1_optimized(
-    float* dC, const float* dA,
+    float* dC, const __hip_bfloat16* dA_bf16,
     const uint8_t* dW_packed, const float* dScales,
     const int* d_expert_offsets, const int* d_expert_counts,
     const int* d_tile2expert, const int* d_tile2local,
     int E, int N, int Kdim, int cur_tiles, hipStream_t stream)
 {
-    // Match your current macros: WM=WN=WK=16, WAVES_M/N/K = WAVES_*_MLP, TW_M=1, TW_N=2
-    constexpr int WM=16, WN=16, WK=16;
-    dim3 grid((N + BLOCK_N_MLP - 1) / BLOCK_N_MLP, cur_tiles);
-    dim3 block(64, (WAVES_M_MLP / 1) * (WAVES_N_MLP / 2));
-    const int ldA = BLOCK_K_MLP + PAD_K_MLP;
-    const int ldB = BLOCK_K_MLP + PAD_K_MLP;
-    const size_t shmem_bytes =
-        sizeof(uint16_t) * (size_t)(BLOCK_M_MLP * ldA + ldB * BLOCK_N_MLP);
-
-#ifdef assert_smem_or_die
-    assert_smem_or_die(shmem_bytes, "grouped_mlp1_mxfp4_kernel_unified");
-#endif
-
-    hipLaunchKernelGGL(
-        (grouped_mlp1_mxfp4_kernel_unified<
-            WM, WN, WK,
-            WAVES_M_MLP, WAVES_N_MLP, WAVES_K_MLP,
-            /*TW_M=*/1, /*TW_N=*/2,
-            /*PAD_K_MC=*/PAD_K_MLP>),
-        grid, block, shmem_bytes, stream,
-        dC, dA, dW_packed, dScales,
-        d_expert_offsets, d_expert_counts,
-        d_tile2expert, d_tile2local,
-        E, /*K=*/Kdim, /*N=*/N);
-    HIP_CHECK(hipGetLastError());
+    mlp1_mxfp4_optimized_unified_A_bf16<
+        16, 16, 16,
+        WAVES_M_MLP, WAVES_N_MLP, WAVES_K_MLP,
+        1, 2,
+        PAD_K_MLP>(
+            dC, dA_bf16, dW_packed, dScales,
+            d_expert_offsets, d_expert_counts,
+            d_tile2expert, d_tile2local,
+            E, Kdim, N, cur_tiles, stream);
 }
 
 
@@ -281,6 +280,10 @@ int main(int argc, char** argv) {
     // A buffer: [total_pairs, H] in expert-concatenated order (what grouped kernel expects)
     std::vector<float> hA((size_t)total_pairs * H);
     for (auto& v : hA) v = dist(rng);
+    std::vector<__hip_bfloat16> hA_bf16(hA.size());
+    for (size_t i = 0; i < hA.size(); ++i) {
+        hA_bf16[i] = float_to_bf16(hA[i]);
+    }
 
     // Per-expert float weights: row-major [N=o_len, K=H]
     std::vector<std::vector<float>> hW_e_row(E);
@@ -310,6 +313,7 @@ int main(int argc, char** argv) {
     HIP_CHECK(hipStreamCreate(&stream));
 
     float*    dA = nullptr;
+    __hip_bfloat16* dA_bf16 = nullptr;
     float*    dC_base = nullptr;
     float*    dC_opt  = nullptr;
     uint8_t*  dW_packed = nullptr;
@@ -325,8 +329,11 @@ int main(int argc, char** argv) {
     HIP_CHECK(hipMalloc(&d_offsets, E * sizeof(int)));
     HIP_CHECK(hipMalloc(&d_t2e,     tile2expert.size() * sizeof(int)));
     HIP_CHECK(hipMalloc(&d_t2l,     tile2local.size() * sizeof(int)));
+    HIP_CHECK(hipMalloc(&dA_bf16,   hA_bf16.size() * sizeof(__hip_bfloat16)));
 
     HIP_CHECK(hipMemcpyAsync(dA, hA.data(), hA.size() * sizeof(float),
+                             hipMemcpyHostToDevice, stream));
+    HIP_CHECK(hipMemcpyAsync(dA_bf16, hA_bf16.data(), hA_bf16.size() * sizeof(__hip_bfloat16),
                              hipMemcpyHostToDevice, stream));
     HIP_CHECK(hipMemcpyAsync(dW_packed, hW_layer_packed.data(), hW_layer_packed.size(),
                              hipMemcpyHostToDevice, stream));
@@ -381,7 +388,7 @@ int main(int argc, char** argv) {
     // ── Timing: optimized (currently same kernel) ─────────────────────────────
     for (int w = 0; w < 5; ++w) {
         launch_grouped_mlp1_optimized(
-            dC_opt, dA, dW_packed, dS_scales,
+            dC_opt, dA_bf16, dW_packed, dS_scales,
             d_offsets, d_counts, d_t2e, d_t2l, E,
             o_len, H, cur_tiles, stream);
     }
@@ -390,7 +397,7 @@ int main(int argc, char** argv) {
     HIP_CHECK(hipEventRecord(e0, stream));
     for (int it = 0; it < args.iters; ++it) {
         launch_grouped_mlp1_optimized(
-            dC_opt, dA, dW_packed, dS_scales,
+            dC_opt, dA_bf16, dW_packed, dS_scales,
             d_offsets, d_counts, d_t2e, d_t2l, E,
             o_len, H, cur_tiles, stream);
     }
@@ -422,7 +429,8 @@ int main(int argc, char** argv) {
     // ── Cleanup ───────────────────────────────────────────────────────────────
     hipEventDestroy(e0); hipEventDestroy(e1);
     hipStreamDestroy(stream);
-    hipFree(dA); hipFree(dC_base); hipFree(dC_opt);
+    hipFree(dA); hipFree(dA_bf16);
+    hipFree(dC_base); hipFree(dC_opt);
     hipFree(dW_packed); hipFree(dS_scales);
     hipFree(d_counts); hipFree(d_offsets);
     hipFree(d_t2e); hipFree(d_t2l);
