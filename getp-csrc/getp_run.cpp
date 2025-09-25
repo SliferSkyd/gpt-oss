@@ -127,7 +127,7 @@ typedef struct
     // expert input/output (union)
     __hip_bfloat16 *expert_input_buffer_g;   // [pairs_max, H]         pairs_max = Bgrp_max * K
     float *mlp1_out_g;              // [pairs_max, o_len_max] o_len_max = ceil(2D/TP)
-    float *gate_up_g;               // [pairs_max, Dloc_max]  Dloc_max  = ceil(D/TP)
+    __hip_bfloat16 *gate_up_bf16_g;               // [pairs_max, Dloc_max]  Dloc_max  = ceil(D/TP)
     float *expert_output_partial_g; // [pairs_max, H]         this-rank partial
     float *expert_output_gather_g;  // [TP * pairs_max, H]    workspace for emulate all-reduce
 
@@ -332,7 +332,7 @@ void malloc_gpu_run_state(GPURunState *s, Config *p)
 
     HIP_CHECK(hipMalloc((void **)&s->expert_input_buffer_g, (size_t)pairs_max * H * sizeof(__hip_bfloat16)));
     HIP_CHECK(hipMalloc((void **)&s->mlp1_out_g, (size_t)pairs_max * o_len_max * sizeof(float)));
-    HIP_CHECK(hipMalloc((void **)&s->gate_up_g, (size_t)pairs_max * Dloc_max * sizeof(float)));
+    HIP_CHECK(hipMalloc((void **)&s->gate_up_bf16_g, (size_t)pairs_max * Dloc_max * sizeof(__hip_bfloat16)));
     HIP_CHECK(hipMalloc((void **)&s->expert_output_partial_g, (size_t)pairs_max * H * sizeof(float)));
     HIP_CHECK(hipMalloc((void **)&s->expert_output_gather_g, (size_t)TP * pairs_max * H * sizeof(float)));
     
@@ -1734,7 +1734,7 @@ void free_gpu_run_state(GPURunState *s)
     df(s->e_agg_g);
     df(s->expert_input_buffer_g);
     df(s->mlp1_out_g);
-    df(s->gate_up_g);
+    df(s->gate_up_bf16_g);
     df(s->expert_output_partial_g);
     df(s->expert_output_gather_g);
     df(s->d_tile2expert_g);
@@ -2117,6 +2117,7 @@ void moe_gpu_120b(GPUTransformer *gpu_t, int layer_idx, int batch_size,
      // 4) FUSED deterministic routing + packing (no atomics)  -> write BF16 expert inputs
     if (total_tokens > 0)
     {
+        // TIMER_BLOCK("route_and_pack_fused_kernel_bf16");
         int threads = 1;
         while (threads < (TP * bs_local)) threads <<= 1;
         threads = min(threads, 1024);
@@ -2140,6 +2141,7 @@ void moe_gpu_120b(GPUTransformer *gpu_t, int layer_idx, int batch_size,
     // 5) MLP1 (column-parallel O=2D): local shard, MXFP4;  A is now BF16
     int o_len = 0;
     {
+        // TIMER_BLOCK("grouped_mlp1_mxfp4_kernel_unified_A_bf16(TP)");
         const int twoD = 2 * D;
         const int base = twoD / TP;
         const int rem  = twoD % TP;
@@ -2182,41 +2184,39 @@ void moe_gpu_120b(GPUTransformer *gpu_t, int layer_idx, int batch_size,
             /*E,K,N*/ E, /*K=*/H, /*N=*/o_len);
         HIP_CHECK(hipGetLastError());
     }
-    // 7) MLP2 (row-parallel on input D) (+bias H full, pre-scaled by 1/TP), MXFP4
-    // 6) SwiGLU + bias for local columns -> gate_up_g with Dloc = o_len/2
+    // ...
+// 6) SwiGLU + bias for local columns -> gate_up_bf16_g with Dloc = o_len/2
 const int Dloc = o_len / 2;
 {
-    // b_mlp1 is sharded the same as o_len
+    // TIMER_BLOCK("bias_swiglu_epilogue_kernel_bf16");
     const __hip_bfloat16 *b1 = w->b_mlp1 + (size_t)layer_idx * (size_t)E * (size_t)o_len;
-
     const size_t work = (size_t)total_tokens * (size_t)Dloc;
-    if (work > 0)
-    {
+    if (work > 0) {
         const int T = 256;
         dim3 grid2((int)((work + T - 1) / T)), block2(T);
-        bias_swiglu_epilogue_kernel<<<grid2, block2, 0, sMoe>>>(
+        bias_swiglu_epilogue_kernel_bf16<<<grid2, block2, 0, sMoe>>>(
             s->mlp1_out_g, b1,
             s->d_expert_offsets, s->d_expert_counts, E,
-            s->gate_up_g, /*D=*/Dloc, total_tokens, p->swiglu_limit, 1.702f);
+            /*OUT*/ s->gate_up_bf16_g,   // <<< bf16 buffer
+            /*D=*/Dloc, total_tokens, p->swiglu_limit, 1.702f);
         HIP_CHECK(hipGetLastError());
     }
 }
 
 // 7) MLP2 (row-parallel on input D) (+bias H full, pre-scaled by 1/TP), MXFP4
 {
+    // TIMER_BLOCK("grouped_mlp2_mxfp4_bias_kernel_unified_A_bf16(TP)");
     int i_len, i_start;
     {
         const int base = D / TP, rem = D % TP;
         i_len = base + (rank_in_group < rem ? 1 : 0);
         i_start = rank_in_group * base + (rank_in_group < rem ? rank_in_group : rem);
     }
-    if (i_len != Dloc)
-    {
+    if (i_len != Dloc) {
         fprintf(stderr, "MLP2 shard mismatch: i_len=%d vs Dloc=%d\n", i_len, Dloc);
         abort();
     }
 
-    // Local-shard MXFP4 segment sizes: N=H, K=i_len
     const size_t seg2_elems_loc        = (size_t)H * (size_t)i_len;
     const size_t seg2_packed_bytes_loc = (seg2_elems_loc + 1) / 2;
     const size_t seg2_blocks_loc       = (seg2_elems_loc + 31) / 32;
@@ -2224,39 +2224,37 @@ const int Dloc = o_len / 2;
     const size_t layer_pack_off = (size_t)layer_idx * (size_t)E * seg2_packed_bytes_loc;
     const size_t layer_sc_off   = (size_t)layer_idx * (size_t)E * seg2_blocks_loc;
 
-    const uint8_t *__restrict__ W2_packed_layer = w->w_mlp2_mxfp4 + layer_pack_off; // local shard
-    const float   *__restrict__ S2_layer        = w->w_mlp2_scales_f32 + layer_sc_off; // local shard
+    const uint8_t *__restrict__ W2_packed_layer = w->w_mlp2_mxfp4 + layer_pack_off;
+    const float   *__restrict__ S2_layer        = w->w_mlp2_scales_f32 + layer_sc_off;
     const __hip_bfloat16 *__restrict__ b2s      = w->b_mlp2 + (size_t)layer_idx * (size_t)E * (size_t)H;
 
-    // Grid/block: effective waves for TW_M=1, TW_N=2 (matches unified indexing)
     dim3 grid((H + BLOCK_N_MLP - 1) / BLOCK_N_MLP, cur_tiles);
     dim3 block(LANE_PER_WAVE, (WAVES_M_MLP / 1) * (WAVES_N_MLP / 2));
 
     const int ldA = BLOCK_K_MLP + PAD_K_MLP;
     const int ldB = BLOCK_K_MLP + PAD_K_MLP;
-
-    // Single-buffer LDS (sA + sB)
     const size_t shmem =
         sizeof(uint16_t) * (size_t)(BLOCK_M_MLP * ldA + ldB * BLOCK_N_MLP);
 
-    assert_smem_or_die(shmem, "grouped_mlp2_mxfp4_bias_kernel_unified(TP)");
+    assert_smem_or_die(shmem, "grouped_mlp2_mxfp4_bias_kernel_unified_A_bf16(TP)");
     hipLaunchKernelGGL(
-        (grouped_mlp2_mxfp4_bias_kernel_unified<
+        (grouped_mlp2_mxfp4_bias_kernel_unified_A_bf16<
             /*WM,WN,WK*/ 16, 16, 16,
             /*WAVES_M,N,K*/ WAVES_M_MLP, WAVES_N_MLP, WAVES_K_MLP,
             /*TW_M,TW_N*/ 1, 2,
             /*PAD_K_MC*/ PAD_K_MLP>),
         grid, block, shmem, sMoe,
-        /*C*/ s->expert_output_partial_g, // [total_tokens, H] float (partial)
-        /*A*/ s->gate_up_g,               // [total_tokens, i_len] float
-        /*W*/ W2_packed_layer,            // MXFP4 local shard
-        /*S*/ S2_layer,                   // f32 scales per-32
-        /*b*/ b2s,                        // bf16 bias [E,H]
+        /*C*/ s->expert_output_partial_g,     // [total_tokens, H] float
+        /*A*/ s->gate_up_bf16_g,              // [total_tokens, i_len] bf16  <<<
+        /*W*/ W2_packed_layer,
+        /*S*/ S2_layer,
+        /*b*/ b2s,
         /*routing*/ s->d_expert_offsets, s->d_expert_counts,
-        /*tiles*/ s->d_tile2expert_g, s->d_tile2local_g,
+        /*tiles*/   s->d_tile2expert_g, s->d_tile2local_g,
         /*E,K,N*/ E, /*K=*/i_len, /*N=*/H);
     HIP_CHECK(hipGetLastError());
 }
+
 
     // 9) Reduce over experts back to tokens (union) -> e_agg_g[Bgrp,H]
     {
