@@ -26,6 +26,7 @@
 #include "kernels/swiglu.hpp"
 #include "kernels/rope.hpp"
 #include "memory/mxfp4.hpp"
+#include "memory/fp8_e4m3.hpp"
 #include <omp.h>
 #include <algorithm>
 #include <numeric>
@@ -81,6 +82,7 @@ typedef struct
 } GPUTransformerWeights;
 
 // GPU Run State struct - stores all activation buffers on GPU
+// GPU Run State struct - stores all activation buffers on GPU
 typedef struct
 {
     // Basic activation buffers
@@ -98,20 +100,26 @@ typedef struct
     float *att;  // attention scores (batch_size, n_attn_heads, seq_len)
     float *mask; // attention mask (seq_len, seq_len)
 
-    // KV cache
-    __hip_bfloat16 *key_cache;   // (batch_size, n_layers, seq_len, kv_dim)
-    __hip_bfloat16 *value_cache; // (batch_size, n_layers, seq_len, kv_dim)
+    // KV cache (Hybrid BF16/FP8 for keys and values)
+    uint8_t *key_cache;   // (batch_size, n_layers, seq_len, kv_dim) - FP8 E4M3
+    __hip_bfloat16 *key_cache_bf16; // (batch_size, n_layers, BF16_KEY_TOKENS, kv_dim) - BF16 for first tokens
+    uint8_t *value_cache; // (batch_size, n_layers, seq_len, kv_dim) - FP8 E4M3
+    __hip_bfloat16 *value_cache_bf16; // (batch_size, n_layers, BF16_VALUE_TOKENS, kv_dim) - BF16 for first tokens
+
+    // FP8 quantization scales (per-layer for dynamic range)
+    float *key_cache_scales;   // (n_layers) - scale factors for key cache
+    float *value_cache_scales; // (n_layers) - scale factors for value cache
 
     // RoPE buffers
     float *cos_vals; // (head_dim/2, seq_len)
     float *sin_vals; // (head_dim/2, seq_len)
 
     // === legacy MoE (kept for shared kernels/utilities) ===
-    float *router_score; // (batch_size, n_experts)
+    float *router_score;         // (batch_size, n_experts)
 
     // Persistent routing buffers
-    int *d_expert_counts;  // (n_experts)
-    int *d_expert_offsets; // (n_experts)
+    int *d_expert_counts;    // (n_experts)
+    int *d_expert_offsets;   // (n_experts)
 
     // === NEW: TP-union MoE buffers (per rank) ===
     // union batch (within a TP group) = Bgrp_max = TENSOR_PARALLEL_SIZE * BATCH_SIZE
@@ -275,9 +283,10 @@ void malloc_gpu_run_state(GPURunState *s, Config *p)
     const size_t layers_capacity =
         (size_t)n_even * (size_t)even_cap + (size_t)n_odd * (size_t)MAX_SEQ_LEN;
 
-    size_t kv_cache_size = (size_t)BATCH_SIZE * layers_capacity * (size_t)kv_dim * sizeof(__hip_bfloat16);
+    // FP8 uses 1 byte per element (vs 2 bytes for BF16)
+    size_t kv_cache_size = (size_t)BATCH_SIZE * layers_capacity * (size_t)kv_dim * sizeof(uint8_t);
 
-    printf("KV cache (fp32) total capacity: layers_capacity=%zu positions/layer-stack\n",
+    printf("KV cache (FP8 E4M3) total capacity: layers_capacity=%zu positions/layer-stack\n",
            layers_capacity);
     printf("KV cache size per batch: %zu MB\n", kv_cache_size / (1024 * 1024));
 
@@ -291,15 +300,32 @@ void malloc_gpu_run_state(GPURunState *s, Config *p)
     HIP_CHECK(hipMalloc((void **)&s->k, BATCH_SIZE * kv_dim * sizeof(float)));
     HIP_CHECK(hipMalloc((void **)&s->v, BATCH_SIZE * kv_dim * sizeof(float)));
 
+    // Routing & expert buffers (legacy/local)
     // Persistent routing buffers
     HIP_CHECK(hipMalloc((void **)&s->d_expert_counts, E * sizeof(int)));
     HIP_CHECK(hipMalloc((void **)&s->d_expert_offsets, E * sizeof(int)));
 
     int total_mtiles = BATCH_SIZE * K;
 
-    // KV cache
+    // KV cache (Hybrid BF16/FP8 for keys and values)
     HIP_CHECK(hipMalloc((void **)&s->key_cache, kv_cache_size));
+    // BF16 key cache for first tokens (higher precision)
+    // BF16_KEY_TOKENS is defined in attention.hpp as 128
+    size_t bf16_key_cache_size = (size_t)BATCH_SIZE * p->n_layers * BF16_KEY_TOKENS * kv_dim * sizeof(__hip_bfloat16);
+    HIP_CHECK(hipMalloc((void **)&s->key_cache_bf16, bf16_key_cache_size));
     HIP_CHECK(hipMalloc((void **)&s->value_cache, kv_cache_size));
+    // BF16 value cache for first tokens (higher precision)
+    // BF16_VALUE_TOKENS is defined in attention.hpp as 128
+    size_t bf16_value_cache_size = (size_t)BATCH_SIZE * p->n_layers * BF16_VALUE_TOKENS * kv_dim * sizeof(__hip_bfloat16);
+    HIP_CHECK(hipMalloc((void **)&s->value_cache_bf16, bf16_value_cache_size));
+
+    // FP8 scale factors (per-layer)
+    HIP_CHECK(hipMalloc((void **)&s->key_cache_scales, p->n_layers * sizeof(float)));
+    HIP_CHECK(hipMalloc((void **)&s->value_cache_scales, p->n_layers * sizeof(float)));
+
+    // Initialize scales to 1.0
+    HIP_CHECK(hipMemset(s->key_cache_scales, 0x3F800000, p->n_layers * sizeof(float)));  // 1.0 in float
+    HIP_CHECK(hipMemset(s->value_cache_scales, 0x3F800000, p->n_layers * sizeof(float)));
 
     HIP_CHECK(hipMalloc((void **)&s->att, BATCH_SIZE * p->n_attn_heads * MAX_SEQ_LEN * sizeof(float)));
     HIP_CHECK(hipMalloc((void **)&s->logits, BATCH_SIZE * p->vocab_size * sizeof(float)));
@@ -309,6 +335,7 @@ void malloc_gpu_run_state(GPURunState *s, Config *p)
     HIP_CHECK(hipMalloc((void **)&s->n_local, BATCH_SIZE * sizeof(int)));
 
     HIP_CHECK(hipMalloc((void **)&s->router_score, BATCH_SIZE * E * sizeof(float)));
+
     HIP_CHECK(hipMalloc((void **)&s->current_tokens, BATCH_SIZE * sizeof(int)));
     HIP_CHECK(hipMalloc((void **)&s->positions, BATCH_SIZE * sizeof(int)));
     HIP_CHECK(hipMalloc((void **)&s->cos_vals, (p->head_dim / 2) * MAX_SEQ_LEN * sizeof(float)));
@@ -335,6 +362,7 @@ void malloc_gpu_run_state(GPURunState *s, Config *p)
     HIP_CHECK(hipMalloc((void **)&s->expert_output_partial_g, (size_t)pairs_max * H * sizeof(float)));
     HIP_CHECK(hipMalloc((void **)&s->expert_output_gather_g, (size_t)TP * pairs_max * H * sizeof(float)));
 
+    // s->cap_tiles = (pairs_max + BLOCK_M_MLP - 1) / BLOCK_M_MLP + E;
     // Calculate maximum possible tiles needed
     // In worst case, all tokens could be distributed across experts
     // Each expert processes its tokens in tiles of size BLOCK_M_MLP
@@ -359,7 +387,11 @@ void malloc_gpu_run_state(GPURunState *s, Config *p)
     HIP_CHECK(hipMemset(s->k, 0, BATCH_SIZE * kv_dim * sizeof(float)));
     HIP_CHECK(hipMemset(s->v, 0, BATCH_SIZE * kv_dim * sizeof(float)));
     HIP_CHECK(hipMemset(s->key_cache, 0, kv_cache_size));
+    // Initialize BF16 key cache (same size calculation as above)
+    HIP_CHECK(hipMemset(s->key_cache_bf16, 0, (size_t)BATCH_SIZE * p->n_layers * BF16_KEY_TOKENS * kv_dim * sizeof(__hip_bfloat16)));
     HIP_CHECK(hipMemset(s->value_cache, 0, kv_cache_size));
+    // Initialize BF16 value cache
+    HIP_CHECK(hipMemset(s->value_cache_bf16, 0, (size_t)BATCH_SIZE * p->n_layers * BF16_VALUE_TOKENS * kv_dim * sizeof(__hip_bfloat16)));
     HIP_CHECK(hipMemset(s->att, 0, BATCH_SIZE * p->n_attn_heads * MAX_SEQ_LEN * sizeof(float)));
     HIP_CHECK(hipMemset(s->logits, 0, (size_t)BATCH_SIZE * p->vocab_size * sizeof(float)));
 
@@ -397,6 +429,7 @@ void malloc_gpu_run_state(GPURunState *s, Config *p)
         HIP_CHECK(hipMalloc((void **)&s->d_recv, TILE_ELEMS * sizeof(float)));
     }
 }
+
 
 void malloc_gpu_weights_20b(GPUTransformerWeights *w, Config *p)
 {
@@ -1613,7 +1646,7 @@ void warm_up(Transformer *transformer, Tokenizer *tokenizer)
     if (IS_20B_MODEL)
         BATCH_SIZE = 1024, TENSOR_PARALLEL_SIZE = 2;
     else
-        BATCH_SIZE = 896, TENSOR_PARALLEL_SIZE = 4;
+        BATCH_SIZE = 1408, TENSOR_PARALLEL_SIZE = 4;
 
     HIP_CHECK(hipGetDeviceCount(&num_gpus));
     if (num_gpus > MAX_GPUS)
@@ -1765,176 +1798,175 @@ void finish(Transformer *transformer, Tokenizer *tokenizer)
 void attention_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size,
                    int row_offset, hipStream_t sAttn)
 {
-    if (batch_size <= 0)
-        return;
+    if (batch_size <= 0) return;
 
     Config *p = &gpu_t->config;
     GPURunState *s = &gpu_t->state;
     GPUTransformerWeights *w = &gpu_t->weights;
 
-    const int H = p->hidden_dim;
-    const int Hd = p->head_dim;
-    const int NA = p->n_attn_heads;
-    const int NK = p->n_kv_heads;
-    const int KV = Hd * NK;
+    const int H   = p->hidden_dim;
+    const int Hd  = p->head_dim;
+    const int NA  = p->n_attn_heads;
+    const int NK  = p->n_kv_heads;
+    const int KV  = Hd * NK;
     const int QKV = Hd * (NA + 2 * NK);
 
     const int even_cap = (p->sliding_window > 0 ? SW_WINDOW : MAX_SEQ_LEN);
 
     size_t layers_capacity = 0;
-    for (int L = 0; L < p->n_layers; ++L)
-    {
+    for (int L = 0; L < p->n_layers; ++L) {
         const bool evenL = ((L & 1) == 0);
         layers_capacity += (size_t)(evenL ? even_cap : MAX_SEQ_LEN);
     }
     const size_t kv_slice = layers_capacity * (size_t)KV;
 
     size_t layer_pos_offset = 0;
-    for (int L = 0; L < layer_idx; ++L)
-    {
+    for (int L = 0; L < layer_idx; ++L) {
         const bool evenL = ((L & 1) == 0);
         layer_pos_offset += (size_t)(evenL ? even_cap : MAX_SEQ_LEN);
     }
     const size_t layer_elem_offset = layer_pos_offset * (size_t)KV;
 
-    float *x_mb = s->x + (size_t)row_offset * H;
-    float *t_mb = s->t + (size_t)row_offset * H;
-    float *tb_mb = s->tb + (size_t)row_offset * (Hd * NA);
+    float *x_mb   = s->x   + (size_t)row_offset * H;
+    float *t_mb   = s->t   + (size_t)row_offset * H;
+    float *tb_mb  = s->tb  + (size_t)row_offset * (Hd * NA);
     float *qkv_mb = s->qkv + (size_t)row_offset * QKV;
-    float *q_mb = s->q + (size_t)row_offset * (Hd * NA);
-    float *k_mb = s->k + (size_t)row_offset * KV;
-    float *v_mb = s->v + (size_t)row_offset * KV;
-    int *pos_mb = s->positions + row_offset;
+    float *q_mb   = s->q   + (size_t)row_offset * (Hd * NA);
+    float *k_mb   = s->k   + (size_t)row_offset * KV;
+    float *v_mb   = s->v   + (size_t)row_offset * KV;
+    int   *pos_mb = s->positions + row_offset;
 
-    __hip_bfloat16 *key_cache_mb = s->key_cache + (size_t)row_offset * kv_slice;
-    __hip_bfloat16 *value_cache_mb = s->value_cache + (size_t)row_offset * kv_slice;
+    // ---- FP8 ring/raster KV caches (byte) + BF16 slabs (compact) ----
+    uint8_t        *key_cache_mb   = s->key_cache   + (size_t)row_offset * kv_slice; // FP8 E4M3
+    uint8_t        *value_cache_mb = s->value_cache + (size_t)row_offset * kv_slice; // FP8 E4M3
+    __hip_bfloat16 *key_cache_bf16   = s->key_cache_bf16;
+    __hip_bfloat16 *value_cache_bf16 = s->value_cache_bf16;
 
     // 1) RMSNorm
     {
-        // TIMER_BLOCK("rmsnorm_kernel_attention");
         dim3 grid(batch_size), block(THREADS_PER_BLOCK);
         rmsnorm_kernel<<<grid, block, 0, sAttn>>>(t_mb, x_mb,
-                                                  w->rms_attn_w + (size_t)layer_idx * H, batch_size, H);
+            w->rms_attn_w + (size_t)layer_idx * H, batch_size, H);
         HIP_CHECK(hipGetLastError());
     }
     // 2) QKV
     {
-        // TIMER_BLOCK("matmul_mc_attention");
         const int woff = layer_idx * H * QKV;
         matmul_vec128_singlebuf<
-            /*WM,WN,WK*/ 16, 16, 16,
-            /*WAVES_M,N,K*/ 4, 4, 4,
-            /*TW_M,TW_N*/ 1, 2,
-            /*PAD_K*/ 8,
-            /*FUSED*/ false>(qkv_mb, t_mb, w->w_qkv + woff, batch_size, H, QKV, nullptr, sAttn);
+            16,16,16, 4,4,4, 1,2, 8, /*FUSED*/ false
+        >(qkv_mb, t_mb, w->w_qkv + woff, batch_size, H, QKV, nullptr, sAttn);
         HIP_CHECK(hipGetLastError());
     }
     // 3) bias
     {
-        // TIMER_BLOCK("add_bias_kernel_attention");
         const int boff = (size_t)layer_idx * QKV;
         const int elems = batch_size * QKV;
-        if (elems > 0)
-        {
+        if (elems > 0) {
             dim3 grid((elems + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK);
-            add_bias_kernel<<<grid, THREADS_PER_BLOCK, 0, sAttn>>>(qkv_mb, w->b_qkv + boff, batch_size, QKV);
+            add_bias_kernel<<<grid, THREADS_PER_BLOCK, 0, sAttn>>>(
+                qkv_mb, w->b_qkv + boff, batch_size, QKV);
             HIP_CHECK(hipGetLastError());
         }
     }
     // 4) split + RoPE
     {
-        // TIMER_BLOCK("launch_split_qkv_apply_rotary");
         launch_split_qkv_apply_rotary(
             qkv_mb, q_mb, k_mb, v_mb,
             s->cos_vals, s->sin_vals, pos_mb,
             batch_size, NA, NK, Hd, sAttn);
         HIP_CHECK(hipGetLastError());
     }
-    // 5) KV cache update
+    // 5) KV cache update with FP8 quantization (compute scales, then write FP8+BF16)
     {
-        // TIMER_BLOCK("update_kv_cache_kernel");
+        // Compute per-layer optimal scales (same as attention_gpu_fp8_kv)
+        dim3 scale_grid((batch_size * KV + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK);
+        size_t scale_shmem = 2 * THREADS_PER_BLOCK * sizeof(float);
+        compute_kv_cache_scales_kernel<<<scale_grid, THREADS_PER_BLOCK, scale_shmem, sAttn>>>(
+            s->key_cache_scales, s->value_cache_scales,
+            k_mb, v_mb, batch_size, KV, layer_idx);
+
+        // Quantize/update FP8 ring and BF16 slabs
         dim3 grid(batch_size, (KV + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK);
         dim3 block(1, THREADS_PER_BLOCK);
         update_kv_cache_kernel<<<grid, block, 0, sAttn>>>(
-            key_cache_mb, value_cache_mb, k_mb, v_mb, pos_mb,
-            batch_size, p->n_layers, layer_idx, MAX_SEQ_LEN, KV,
-            /* batch_kv_stride = */ layers_capacity * (size_t)KV,
-            /* layer_kv_offset = */ layer_elem_offset);
+            /* fp8 K/V ring */   key_cache_mb, key_cache_bf16,
+                                 value_cache_mb, value_cache_bf16,
+            /* src K/V fp32 */   k_mb, v_mb,
+            /* per-layer scales*/s->key_cache_scales, s->value_cache_scales,
+            /* positions */      pos_mb,
+            /* shape/meta */     batch_size, p->n_layers, layer_idx,
+                                 MAX_SEQ_LEN, KV,
+            /* strides */        /* batch_kv_stride = */ layers_capacity * (size_t)KV,
+            /* offsets */        /* layer_kv_offset = */ layer_elem_offset);
+        HIP_CHECK(hipGetLastError());
     }
-    // 6) fused attention
-    // --- optimized launch (tile_t = 48, same policy as launch_optimized) ---
+    // 6) fused attention (Flash-decoding fast-merge, reading FP8+BF16 with scales)
     {
-        // TIMER_BLOCK("flashdecoding_fused");
-        // --- Fused Flash-Decoding (fast-merge, no K/V staging) launch --------------------
-        // Uses 4 warps/block (256 threads). Tune WARPS if needed (e.g., 2 or 6).
-        const int B = batch_size;
-        const int H = NA;   // n_attn_heads
-        const int NKv = NK; // n_kv_heads
-        const int D = Hd;
+        const int B   = batch_size;
+        const int Hh  = NA;
+        const int NKv = NK;
+        const int D   = Hd;
 
-        // GQA ratio (should be 8 for this kernel path)
-        const int kv_mul = H / NKv; // == 8
-        if (kv_mul != 8 || D != 64)
-        {
-            // Fall back to your baseline if you want, or assert.
-            // For now, just return to avoid a bad launch.
+        const int kv_mul = Hh / NKv; // expect 8 for this kernel path
+        if (kv_mul != 8 || D != 64) {
             HIP_CHECK(hipSuccess);
-        }
-        else
-        {
-            // Block/grid mapping: multi-warp per (b, kv_h)
-            const int WARPS = 4;          // <<< tune knob
-            dim3 block(64 * WARPS, 1, 1); // 64 = AMD warp size
+        } else {
+            const int WARPS = 4;
+            dim3 block(64 * WARPS, 1, 1);
             dim3 grid(NKv, B, 1);
 
-            // Shared memory only for fast-merge reduction:
-            // (m,l): 2 * WARPS * 8 floats  +  numerators: WARPS * 64 * 8 floats
             const size_t shmem =
                 (size_t)((2 * WARPS * 8) + (WARPS * 64 * 8)) * sizeof(float);
 
-            // Request dynamic LDS (ignore return; optional on some stacks)
             (void)hipFuncSetAttribute(
-                (const void *)flashdecoding_fused_fastmerge_nostage_1warp8q,
+                (const void*)flashdecoding_fused_fastmerge_nostage_1warp8q,
                 hipFuncAttributeMaxDynamicSharedMemorySize,
                 (int)shmem);
 
             hipLaunchKernelGGL(
                 flashdecoding_fused_fastmerge_nostage_1warp8q,
                 grid, block, shmem, sAttn,
-                /* output      */ tb_mb,
-                /* q           */ q_mb,
-                /* key_cache   */ key_cache_mb,
-                /* value_cache */ value_cache_mb,
-                /* sinks       */ w->attn_sinks + (size_t)layer_idx * NA,
-                /* mask        */ s->mask,
-                /* seq_lengths */ pos_mb,
-                /* B,H,KVH,D   */ batch_size, NA, NKv, Hd,
-                /* seq_len,L   */ MAX_SEQ_LEN, p->n_layers,
-                /* layer_idx   */ layer_idx,
-                /* use_sw      */ p->sliding_window > 0,
-                /* strides     */ /* batch_kv_stride = */ layers_capacity * (size_t)KV,
-                /* offsets     */ /* layer_kv_offset  = */ layer_elem_offset,
-                /* tile_t_unused */ 0);
+                /* output             */ tb_mb,
+                /* q                  */ q_mb,
+                /* ---- KV (FP8+BF16) with scales ---- */
+                /* key_cache_fp8      */ key_cache_mb,
+                /* key_cache_bf16     */ key_cache_bf16,
+                /* value_cache_fp8    */ value_cache_mb,
+                /* value_cache_bf16   */ value_cache_bf16,
+                /* key_scales         */ s->key_cache_scales,
+                /* value_scales       */ s->value_cache_scales,
+                /* sinks              */ w->attn_sinks + (size_t)layer_idx * NA,
+                /* mask (unused)      */ s->mask,
+                /* seq_lengths        */ pos_mb,
+                /* B,H,KVH,D          */ batch_size, NA, NKv, Hd,
+                /* seq_len,L          */ MAX_SEQ_LEN, p->n_layers,
+                /* layer_idx          */ layer_idx,
+                /* use_sw             */ p->sliding_window > 0,
+                /* batch_kv_stride    */ layers_capacity * (size_t)KV,
+                /* layer_kv_offset    */ layer_elem_offset,
+                /* tile_t_unused      */ 0);
 
             HIP_CHECK(hipGetLastError());
         }
     }
-
     // 7) fused output projection
     {
-        // TIMER_BLOCK("fused_output_projection_kernel_optimized");
         const int Kproj = Hd * NA;
         const int N = H;
         const int woff = (size_t)layer_idx * Kproj * H;
         const int boff = (size_t)layer_idx * H;
 
         matmul_vec128_singlebuf<
-            16, 16, 16,
-            4, 4, 4,
-            1, 2,
+            16,16,16,
+            4,4,4,
+            1,2,
             8,
-            /*FUSED*/ true>(x_mb, tb_mb, w->w_o + woff, /*M=*/batch_size, /*K=*/Hd * NA, /*N=*/H,
-                            /*bias=*/w->b_o + boff, /*stream=*/sAttn);
+            /*FUSED*/ true
+        >(s->x + (size_t)row_offset * H,
+          s->tb + (size_t)row_offset * Kproj,
+          w->w_o + woff,
+          /*M=*/batch_size, /*K=*/Kproj, /*N=*/N,
+          /*bias=*/w->b_o + boff, /*stream=*/sAttn);
         HIP_CHECK(hipGetLastError());
     }
 }
