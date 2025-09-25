@@ -1823,7 +1823,7 @@ void attention_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size,
             /*WM,WN,WK*/ 16, 16, 16,
             /*WAVES_M,N,K*/ 4, 4, 4,
             /*TW_M,TW_N*/ 1, 2,
-            /*PAD_K*/ 8,
+            /*PAD_K*/ 4,
             /*FUSED*/ false>(qkv_mb, t_mb, w->w_qkv + woff, batch_size, H, QKV, nullptr, sAttn);
         HIP_CHECK(hipGetLastError());
     }
@@ -1930,7 +1930,7 @@ void attention_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size,
             16, 16, 16,
             4, 4, 4,
             1, 2,
-            8,
+            4,
             /*FUSED*/ true>(x_mb, tb_mb, w->w_o + woff, /*M=*/batch_size, /*K=*/Hd * NA, /*N=*/H,
                             /*bias=*/w->b_o + boff, /*stream=*/sAttn);
         HIP_CHECK(hipGetLastError());
@@ -2051,7 +2051,7 @@ void moe_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size,
             16,16,16,
             4,4,4,
             1,2,
-            8,
+            4,
             /*FUSED*/ false
         >(s->router_score_g, s->gather_x_g,
             w->w_router + (size_t)layer_idx * H * E,
@@ -2163,7 +2163,7 @@ void moe_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size,
 
         mlp1_optimized<16,16,16,  /*WAVES_M,N,K*/ 4,4,4,
             /*TW_M,TW_N*/ 1,2,
-            /*PAD_K*/ 8>(
+            /*PAD_K*/ 4>(
             s->mlp1_out_g, s->expert_input_buffer_g, W1,
             s->d_expert_offsets, s->d_expert_counts,
             s->d_tile2expert_g, s->d_tile2local_g,
@@ -2209,7 +2209,7 @@ void moe_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size,
         
         mlp2_optimized<16,16,16,  /*WAVES_M,N,K*/ 4,4,4,
             /*TW_M,TW_N*/ 1,2,
-            /*PAD_K*/ 8>(
+            /*PAD_K*/ 4>(
                 s->expert_output_partial_g, s->gate_up_g, W2, b2s,
                            s->d_expert_offsets, s->d_expert_counts,
                            s->d_tile2expert_g, s->d_tile2local_g,
@@ -2353,7 +2353,7 @@ void moe_gpu_120b(GPUTransformer *gpu_t, int layer_idx, int batch_size,
             16,16,16,
             4,4,4,
             1,2,
-            8,
+            4,
             /*FUSED*/ false
         >(s->router_score_g, s->gather_x_g,
             w->w_router + (size_t)layer_idx * H * E,
@@ -2730,7 +2730,7 @@ int *forward_batch_gpu(GPUTransformer *gpu_t, int *tokens, int batch_size)
             16,16,16,
             4,4,4,
             1,2,
-            8,
+            4,
             false>(s->logits, s->x, w->out, B, H, p->vocab_size);
         HIP_CHECK(hipGetLastError());
     }
