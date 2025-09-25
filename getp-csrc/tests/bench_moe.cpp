@@ -1,5 +1,5 @@
 // bench_moe.cpp
-// Benchmark mlp1 vs mlp1_optimized (currently identical to mlp1)
+// Benchmark the legacy fp32 MLP1 path vs the bf16 unified grouped kernel
 // Uses the MoE microkernel path from moe.hpp
 
 #include <hip/hip_runtime.h>
@@ -76,6 +76,165 @@ static inline __hip_bfloat16 f2bf16(float x) {
 #endif
 }
 
+struct TuneResult {
+  const char *name;
+  float avg_ms;
+  double gflops;
+  double speedup;
+  double max_abs;
+  double max_rel;
+};
+
+static float time_baseline_kernel(
+    float *dC,
+    const float *dA,
+    const __hip_bfloat16 *dW1,
+    const int *d_offsets,
+    const int *d_counts,
+    const int *d_t2e,
+    const int *d_t2l,
+    int E, int K, int N, int cur_tiles,
+    hipStream_t stream,
+    hipEvent_t ev_start,
+    hipEvent_t ev_stop,
+    int warmup, int iters)
+{
+  for (int i = 0; i < warmup; ++i) {
+    mlp1<16,16,16, 2,4,2, 1,1, 8>(
+        dC, dA, dW1, d_offsets, d_counts, d_t2e, d_t2l,
+        E, K, N, cur_tiles, stream);
+  }
+  HIP_CHECK(hipStreamSynchronize(stream));
+
+  HIP_CHECK(hipEventRecord(ev_start, stream));
+  for (int i = 0; i < iters; ++i) {
+    mlp1<16,16,16, 4,4,2, 1,1, 8>(
+        dC, dA, dW1, d_offsets, d_counts, d_t2e, d_t2l,
+        E, K, N, cur_tiles, stream);
+  }
+  HIP_CHECK(hipEventRecord(ev_stop, stream));
+  HIP_CHECK(hipEventSynchronize(ev_stop));
+
+  float ms = 0.f;
+  HIP_CHECK(hipEventElapsedTime(&ms, ev_start, ev_stop));
+  HIP_CHECK(hipGetLastError());
+  return ms / static_cast<float>(iters);
+}
+
+template <
+    int WM, int WN, int WK,
+    int WAVES_M, int WAVES_N, int WAVES_K,
+    int TW_M, int TW_N,
+    int PAD_K_MC>
+static float time_unified_variant(
+    float *dC,
+    const __hip_bfloat16 *dA,
+    const __hip_bfloat16 *dW1,
+    const int *d_offsets,
+    const int *d_counts,
+    const int *d_t2e,
+    const int *d_t2l,
+    int E, int K, int N, int cur_tiles,
+    hipStream_t stream,
+    hipEvent_t ev_start,
+    hipEvent_t ev_stop,
+    int warmup, int iters)
+{
+  for (int i = 0; i < warmup; ++i) {
+    mlp1_optimized<WM, WN, WK, WAVES_M, WAVES_N, WAVES_K, TW_M, TW_N, PAD_K_MC>(
+        dC, dA, dW1,
+        d_offsets, d_counts,
+        d_t2e, d_t2l,
+        E, K, N, cur_tiles, stream);
+  }
+  HIP_CHECK(hipStreamSynchronize(stream));
+
+  HIP_CHECK(hipEventRecord(ev_start, stream));
+  for (int i = 0; i < iters; ++i) {
+    mlp1_optimized<WM, WN, WK, WAVES_M, WAVES_N, WAVES_K, TW_M, TW_N, PAD_K_MC>(
+        dC, dA, dW1,
+        d_offsets, d_counts,
+        d_t2e, d_t2l,
+        E, K, N, cur_tiles, stream);
+  }
+  HIP_CHECK(hipEventRecord(ev_stop, stream));
+  HIP_CHECK(hipEventSynchronize(ev_stop));
+
+  float ms = 0.f;
+  HIP_CHECK(hipEventElapsedTime(&ms, ev_start, ev_stop));
+  HIP_CHECK(hipGetLastError());
+  return ms / static_cast<float>(iters);
+}
+
+template <
+    int WM, int WN, int WK,
+    int WAVES_M, int WAVES_N, int WAVES_K,
+    int TW_M, int TW_N,
+    int PAD_K_MC>
+static TuneResult benchmark_variant(
+    const char *name,
+    float *d_C_opt,
+    const __hip_bfloat16 *d_A_bf16,
+    const __hip_bfloat16 *d_W1,
+    const int *d_offsets,
+    const int *d_counts,
+    const int *d_t2e,
+    const int *d_t2l,
+    int E, int K, int N, int cur_tiles,
+    hipStream_t stream,
+    hipEvent_t ev_start,
+    hipEvent_t ev_stop,
+    int warmup, int iters,
+    std::vector<float> &h_C_opt,
+    const std::vector<float> &h_C_ref,
+    double flops,
+    float baseline_ms,
+    size_t bytes_out)
+{
+  TuneResult result{name, 0.f, 0.0, 0.0, 0.0, 0.0};
+
+  HIP_CHECK(hipMemset(d_C_opt, 0, bytes_out));
+  mlp1_optimized<WM, WN, WK, WAVES_M, WAVES_N, WAVES_K, TW_M, TW_N, PAD_K_MC>(
+      d_C_opt, d_A_bf16, d_W1,
+      d_offsets, d_counts,
+      d_t2e, d_t2l,
+      E, K, N, cur_tiles, stream);
+  HIP_CHECK(hipGetLastError());
+
+  HIP_CHECK(hipStreamSynchronize(stream));
+  HIP_CHECK(hipMemcpy(h_C_opt.data(), d_C_opt, bytes_out, hipMemcpyDeviceToHost));
+
+  double max_abs = 0.0;
+  double max_rel = 0.0;
+  for (size_t i = 0; i < h_C_opt.size(); ++i) {
+    const double a = static_cast<double>(h_C_ref[i]);
+    const double b = static_cast<double>(h_C_opt[i]);
+    const double ad = std::abs(a - b);
+    const double rd = ad / (std::abs(a) + 1e-7);
+    max_abs = std::max(max_abs, ad);
+    max_rel = std::max(max_rel, rd);
+  }
+
+  const float ms = time_unified_variant<
+      WM, WN, WK, WAVES_M, WAVES_N, WAVES_K, TW_M, TW_N, PAD_K_MC>(
+          d_C_opt, d_A_bf16, d_W1,
+          d_offsets, d_counts,
+          d_t2e, d_t2l,
+          E, K, N, cur_tiles,
+          stream, ev_start, ev_stop,
+          warmup, iters);
+
+  const double gflops = (flops * 1e-9) / (ms * 1e-3);
+
+  result.avg_ms = ms;
+  result.gflops = gflops;
+  result.speedup = baseline_ms / ms;
+  result.max_abs = max_abs;
+  result.max_rel = max_rel;
+
+  return result;
+}
+
 int main(int argc, char** argv)
 {
   // CLI
@@ -94,6 +253,8 @@ int main(int argc, char** argv)
   const int Bgrp = cfg.TP * cfg.BATCH_SIZE; // 512
   const int K_topk = cfg.experts_per_token; // 4
   const int total_pairs = Bgrp * K_topk;    // 2048
+  const size_t out_elems = static_cast<size_t>(total_pairs) * static_cast<size_t>(o_len);
+  const size_t out_bytes = sizeof(float) * out_elems;
 
   printf("=== MoE MLP1 Benchmark ===\n");
   printf("E=%d, H=%d, D=%d, o_len=%d, Bgrp=%d, K_topk=%d, total_pairs=%d\n",
@@ -133,11 +294,16 @@ int main(int argc, char** argv)
   // Host input/output and weights
   std::mt19937 rng(42);
   std::vector<float>  h_A((size_t)total_pairs * H);
+  std::vector<__hip_bfloat16> h_A_bf16((size_t)total_pairs * H);
   std::vector<__hip_bfloat16> h_W1((size_t)E * o_len * H);
   std::vector<float>  h_C_ref((size_t)total_pairs * o_len, 0.f);
   std::vector<float>  h_C_opt((size_t)total_pairs * o_len, 0.f);
 
-  for (auto &v : h_A) v = frand(rng);
+  for (size_t i = 0; i < h_A.size(); ++i) {
+    float v = frand(rng);
+    h_A[i] = v;
+    h_A_bf16[i] = f2bf16(v);
+  }
   for (size_t e = 0; e < (size_t)E; ++e) {
     for (size_t i = 0; i < (size_t)o_len * H; ++i) {
       float x = frand(rng);
@@ -146,21 +312,24 @@ int main(int argc, char** argv)
   }
 
   // Device allocations
-  float *d_A = nullptr, *d_C_ref = nullptr, *d_C_opt = nullptr;
-  __hip_bfloat16 *d_W1 = nullptr;
+  float *d_A_fp32 = nullptr, *d_C_ref = nullptr, *d_C_opt = nullptr;
+  __hip_bfloat16 *d_A_bf16 = nullptr, *d_W1 = nullptr;
   int *d_counts = nullptr, *d_offsets = nullptr, *d_t2e = nullptr, *d_t2l = nullptr;
 
-  HIP_CHECK(hipMalloc(&d_A,      sizeof(float) * (size_t)total_pairs * H));
-  HIP_CHECK(hipMalloc(&d_C_ref,  sizeof(float) * (size_t)total_pairs * o_len));
-  HIP_CHECK(hipMalloc(&d_C_opt,  sizeof(float) * (size_t)total_pairs * o_len));
+  HIP_CHECK(hipMalloc(&d_A_fp32, sizeof(float) * (size_t)total_pairs * H));
+  HIP_CHECK(hipMalloc(&d_A_bf16, sizeof(__hip_bfloat16) * (size_t)total_pairs * H));
+  HIP_CHECK(hipMalloc(&d_C_ref,  out_bytes));
+  HIP_CHECK(hipMalloc(&d_C_opt,  out_bytes));
   HIP_CHECK(hipMalloc(&d_W1,     sizeof(__hip_bfloat16) * (size_t)E * o_len * H));
   HIP_CHECK(hipMalloc(&d_counts, sizeof(int) * E));
   HIP_CHECK(hipMalloc(&d_offsets,sizeof(int) * E));
   HIP_CHECK(hipMalloc(&d_t2e,    sizeof(int) * cur_tiles));
   HIP_CHECK(hipMalloc(&d_t2l,    sizeof(int) * cur_tiles));
 
-  HIP_CHECK(hipMemcpy(d_A, h_A.data(),
+  HIP_CHECK(hipMemcpy(d_A_fp32, h_A.data(),
       sizeof(float) * (size_t)total_pairs * H, hipMemcpyHostToDevice));
+  HIP_CHECK(hipMemcpy(d_A_bf16, h_A_bf16.data(),
+      sizeof(__hip_bfloat16) * (size_t)total_pairs * H, hipMemcpyHostToDevice));
   HIP_CHECK(hipMemcpy(d_W1, h_W1.data(),
       sizeof(__hip_bfloat16) * (size_t)E * o_len * H, hipMemcpyHostToDevice));
   HIP_CHECK(hipMemcpy(d_counts, h_expert_counts.data(),
@@ -176,20 +345,12 @@ int main(int argc, char** argv)
   HIP_CHECK(hipStreamCreate(&stream));
 
   // --- Correctness run (single execution each) ---
-  HIP_CHECK(hipMemset(d_C_ref, 0, sizeof(float) * (size_t)total_pairs * o_len));
-  HIP_CHECK(hipMemset(d_C_opt, 0, sizeof(float) * (size_t)total_pairs * o_len));
+  HIP_CHECK(hipMemset(d_C_ref, 0, out_bytes));
+  HIP_CHECK(hipMemset(d_C_opt, 0, out_bytes));
 
   // Baseline
   mlp1<16,16,16, 4,4,2, 1,1, 8>(
-      d_C_ref, d_A, d_W1,
-      d_offsets, d_counts,
-      d_t2e, d_t2l,
-      /*E=*/E, /*K=H*/H, /*N=o_len*/o_len, /*cur_tiles=*/cur_tiles, stream);
-  HIP_CHECK(hipGetLastError());
-
-  // Optimized (currently identical)
-  mlp1_optimized<16,16,16, 4,4,4, 1,1, 8>(
-      d_C_opt, d_A, d_W1,
+      d_C_ref, d_A_fp32, d_W1,
       d_offsets, d_counts,
       d_t2e, d_t2l,
       /*E=*/E, /*K=H*/H, /*N=o_len*/o_len, /*cur_tiles=*/cur_tiles, stream);
@@ -197,87 +358,97 @@ int main(int argc, char** argv)
 
   HIP_CHECK(hipStreamSynchronize(stream));
   HIP_CHECK(hipMemcpy(h_C_ref.data(), d_C_ref,
-      sizeof(float) * (size_t)total_pairs * o_len, hipMemcpyDeviceToHost));
-  HIP_CHECK(hipMemcpy(h_C_opt.data(), d_C_opt,
-      sizeof(float) * (size_t)total_pairs * o_len, hipMemcpyDeviceToHost));
-
-  double max_abs = 0.0, max_rel = 0.0;
-  for (size_t i = 0; i < h_C_ref.size(); ++i) {
-    double a = (double)h_C_ref[i];
-    double b = (double)h_C_opt[i];
-    double ad = std::abs(a - b);
-    double rd = ad / (std::abs(a) + 1e-7);
-    max_abs = std::max(max_abs, ad);
-    max_rel = std::max(max_rel, rd);
-  }
-  printf("[Check] max_abs=%.6g  max_rel=%.6g  %s\n",
-         max_abs, max_rel,
-         (max_abs < 1e-4 && max_rel < 1e-6) ? "OK" : "WARNING");
+      out_bytes, hipMemcpyDeviceToHost));
 
   // --- Timing ---
   hipEvent_t ev_start, ev_stop;
   HIP_CHECK(hipEventCreate(&ev_start));
   HIP_CHECK(hipEventCreate(&ev_stop));
 
-  auto time_kernel = [&](bool optimized, int warmupN, int itN) -> float {
-    // Choose out buffer
-    float *dC = optimized ? d_C_opt : d_C_ref;
-
-    // Warmup
-    for (int i = 0; i < warmupN; ++i) {
-      if (optimized) {
-        mlp1_optimized<16,16,16, 4,4,4, 1,1, 8>(
-            dC, d_A, d_W1, d_offsets, d_counts, d_t2e, d_t2l, E, H, o_len, cur_tiles, stream);
-      } else {
-        mlp1<16,16,16, 2,4,2, 1,1, 8>(
-            dC, d_A, d_W1, d_offsets, d_counts, d_t2e, d_t2l, E, H, o_len, cur_tiles, stream);
-      }
-    }
-    HIP_CHECK(hipStreamSynchronize(stream));
-
-    HIP_CHECK(hipEventRecord(ev_start, stream));
-    for (int i = 0; i < itN; ++i) {
-      if (optimized) {
-        mlp1_optimized<16,16,16, 4,4,4, 1,1, 8>(
-            dC, d_A, d_W1, d_offsets, d_counts, d_t2e, d_t2l, E, H, o_len, cur_tiles, stream);
-      } else {
-        mlp1<16,16,16, 4,4,2, 1,1, 8>(
-            dC, d_A, d_W1, d_offsets, d_counts, d_t2e, d_t2l, E, H, o_len, cur_tiles, stream);
-      }
-    }
-    HIP_CHECK(hipEventRecord(ev_stop, stream));
-    HIP_CHECK(hipEventSynchronize(ev_stop));
-    float ms = 0.f;
-    HIP_CHECK(hipEventElapsedTime(&ms, ev_start, ev_stop));
-    return ms / itN; // ms per iter
-  };
-
-  const float t_base_ms = time_kernel(/*optimized=*/false, warmup, iters);
-  const float t_opt_ms  = time_kernel(/*optimized=*/true,  warmup, iters);
+  const float t_base_ms = time_baseline_kernel(
+      d_C_ref, d_A_fp32, d_W1,
+      d_offsets, d_counts, d_t2e, d_t2l,
+      E, H, o_len, cur_tiles,
+      stream, ev_start, ev_stop,
+      warmup, iters);
 
   // FLOPs: sum over experts of counts[e] * (2 * H * o_len)
   double flops = 0.0;
   for (int e = 0; e < E; ++e) {
-    flops += 2.0 * (double)h_expert_counts[e] * (double)H * (double)o_len;
+    flops += 2.0 * static_cast<double>(h_expert_counts[e]) * static_cast<double>(H) * static_cast<double>(o_len);
   }
   auto gflops = [&](float ms_per_iter) {
     return (flops * 1e-9) / (ms_per_iter * 1e-3);
   };
 
   const double base_gflops = gflops(t_base_ms);
-  const double opt_gflops  = gflops(t_opt_ms);
-  const double speedup     = t_base_ms / t_opt_ms;
+
+  std::vector<TuneResult> tune_results;
+  tune_results.reserve(6);
+
+#define RUN_VARIANT(NAME, WM, WN, WK, WMV, WNV, WKV, TWM, TWN, PAD) \
+  do { \
+    tune_results.push_back(benchmark_variant<WM, WN, WK, WMV, WNV, WKV, TWM, TWN, PAD>( \
+        NAME, \
+        d_C_opt, d_A_bf16, d_W1, \
+        d_offsets, d_counts, \
+        d_t2e, d_t2l, \
+        E, H, o_len, cur_tiles, \
+        stream, ev_start, ev_stop, \
+        warmup, iters, \
+        h_C_opt, h_C_ref, \
+        flops, t_base_ms, \
+        out_bytes)); \
+  } while (0)
+
+  RUN_VARIANT("waves=4x4x4 tw=1x1 pad=8", 16,16,16, 4,4,4, 1,1, 8);
+  RUN_VARIANT("waves=4x4x4 tw=1x2 pad=8", 16,16,16, 4,4,4, 1,2, 8);
+  RUN_VARIANT("waves=2x8x4 tw=1x1 pad=8", 16,16,16, 2,8,4, 1,1, 8);
+  RUN_VARIANT("waves=2x8x4 tw=1x2 pad=8", 16,16,16, 2,8,4, 1,2, 8);
+  RUN_VARIANT("waves=4x4x2 tw=1x1 pad=0", 16,16,16, 4,4,2, 1,1, 0);
+  RUN_VARIANT("waves=4x4x4 tw=2x1 pad=16", 16,16,16, 4,4,4, 2,1, 16);
+
+#undef RUN_VARIANT
+
+  const TuneResult *best = tune_results.empty() ? nullptr : &tune_results.front();
+  if (best) {
+    for (const auto &res : tune_results) {
+      if (res.avg_ms < best->avg_ms) {
+        best = &res;
+      }
+    }
+  }
 
   printf("\n--- Results ---\n");
-  printf("Baseline (mlp1):    %.3f ms  |  %.2f GFLOP/s\n", t_base_ms, base_gflops);
-  printf("Optimized (mlp1*):  %.3f ms  |  %.2f GFLOP/s\n", t_opt_ms,  opt_gflops);
-  printf("Speedup vs baseline: %.3fx\n", speedup);
+  printf("Baseline (mlp1 fp32):    %.3f ms  |  %.2f GFLOP/s\n", t_base_ms, base_gflops);
+
+  if (!tune_results.empty()) {
+    printf("\n--- Unified Kernel Autotune ---\n");
+    for (const auto &res : tune_results) {
+      const bool ok = (res.max_abs < 1e-4) && (res.max_rel < 1e-6);
+      printf("%-32s  %.3f ms  |  %.2f GFLOP/s  |  speedup %.3fx  |  max_abs=%.3g  max_rel=%.3g  %s\n",
+             res.name,
+             res.avg_ms,
+             res.gflops,
+             res.speedup,
+             res.max_abs,
+             res.max_rel,
+             ok ? "OK" : "WARN");
+    }
+    if (best) {
+      printf("\nBest config: %s (%.3f ms, speedup %.3fx)\n",
+             best->name,
+             best->avg_ms,
+             best->speedup);
+    }
+  }
 
   // Cleanup
   HIP_CHECK(hipEventDestroy(ev_start));
   HIP_CHECK(hipEventDestroy(ev_stop));
   HIP_CHECK(hipStreamDestroy(stream));
-  HIP_CHECK(hipFree(d_A));
+  HIP_CHECK(hipFree(d_A_fp32));
+  HIP_CHECK(hipFree(d_A_bf16));
   HIP_CHECK(hipFree(d_C_ref));
   HIP_CHECK(hipFree(d_C_opt));
   HIP_CHECK(hipFree(d_W1));
