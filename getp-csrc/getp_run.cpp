@@ -130,6 +130,7 @@ typedef struct
     float *gate_up_g;               // [pairs_max, Dloc_max]  Dloc_max  = ceil(D/TP)
     float *expert_output_partial_g; // [pairs_max, H]         this-rank partial
     float *expert_output_gather_g;  // [TP * pairs_max, H]    workspace for emulate all-reduce
+    int *expert_row_token_g; // [pairs_max]
 
     // tile maps for union
     int cap_tiles;        // capacity for tile maps
@@ -335,7 +336,8 @@ void malloc_gpu_run_state(GPURunState *s, Config *p)
     HIP_CHECK(hipMalloc((void **)&s->gate_up_g, (size_t)pairs_max * Dloc_max * sizeof(float)));
     HIP_CHECK(hipMalloc((void **)&s->expert_output_partial_g, (size_t)pairs_max * H * sizeof(float)));
     HIP_CHECK(hipMalloc((void **)&s->expert_output_gather_g, (size_t)TP * pairs_max * H * sizeof(float)));
-    
+    HIP_CHECK(hipMalloc((void **)&s->expert_row_token_g, (size_t)pairs_max * sizeof(int)));
+
     // Calculate maximum possible tiles needed
     // In worst case, all tokens could be distributed across experts
     // Each expert processes its tokens in tiles of size BLOCK_M_MLP
@@ -2129,19 +2131,26 @@ void moe_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size,
     {
         // TIMER_BLOCK("route_and_pack_fused_kernel");
         int threads = 1;
-        while (threads < Bgrp)
-            threads <<= 1;
-        threads = min(threads, 1024); // hardware cap
+        while (threads < Bgrp) threads <<= 1;
+        threads = max(64, min(threads, 1024));             // wave-aligned
+        const int nwarps = (threads + 63) / 64;
+        size_t shmem = sizeof(int) * (nwarps /*counts*/ + nwarps /*prefix*/ + 1 /*carry*/);
 
-        // 5 arrays of int[T] + 1 int for carry
-        size_t shmem = (size_t)threads * 5 * sizeof(int) + sizeof(int);
-
-        route_and_pack_fused_kernel<<<E, threads, shmem, sMoe>>>(
-            s->gather_x_g, Bgrp, H,
-            s->topk_i_g, s->topk_v_g, K,
+        route_build_index_kernel<<<E, threads, shmem, sMoe>>>(
+            s->topk_i_g, s->topk_v_g, Bgrp, K,
             s->d_expert_offsets, E,
             s->local_ids_g, s->local_wts_g,
-            s->expert_input_buffer_g);
+            s->expert_row_token_g  // NEW: int[sum_tokens] in GPURunState
+        );
+        // Tune: big grid to keep all CUs busy; 256–512 threads per block is fine
+        const int pack_block = 256;
+        const int pack_grid  = min( (total_tokens + 63) / 64, 8 * 120 ); // e.g., up to ~8x CUs
+        pack_rows_kernel<<<pack_grid, pack_block, 0, sMoe>>>(
+            s->gather_x_g, H,
+            s->expert_row_token_g, total_tokens,
+            s->expert_input_buffer_g
+        );
+
     }
     else
     {

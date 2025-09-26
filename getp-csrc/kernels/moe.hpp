@@ -2344,3 +2344,139 @@ inline void mlp2_optimized(
         E, K, N);
     HIP_CHECK(hipGetLastError());
 }
+
+// ====== Kernel B: copy expert rows from x[token,:] -> expert_in[row,:] ======
+__global__ void pack_rows_kernel(
+    const float *__restrict__ x,            // [B, H]
+    int H,
+    const int   *__restrict__ expert_tokidx,// [sum_tokens] row -> token
+    int sum_tokens,
+    float *__restrict__ expert_in           // [sum_tokens, H]
+){
+    // Grid-stride over rows
+    for (int row = blockIdx.x; row < sum_tokens; row += gridDim.x)
+    {
+        const int tkn = expert_tokidx[row];
+        const float* __restrict__ src = x + (size_t)tkn * H;
+        float*       __restrict__ dst = expert_in + (size_t)row * H;
+
+        // Cooperative intra-row copy by threads in the block
+        // Try vectorized float4 if aligned and H%4==0
+        bool vec4_ok = (((uintptr_t)src | (uintptr_t)dst) & 0xF) == 0 && (H & 3) == 0;
+        if (vec4_ok) {
+            const int H4 = H >> 2;
+            const float4* __restrict__ s4 = reinterpret_cast<const float4*>(src);
+            float4*       __restrict__ d4 = reinterpret_cast<float4*>(dst);
+            for (int i4 = threadIdx.x; i4 < H4; i4 += blockDim.x) {
+                float4 v = s4[i4];
+                d4[i4] = v;
+            }
+        } else {
+            for (int i = threadIdx.x; i < H; i += blockDim.x) {
+                dst[i] = src[i];
+            }
+        }
+        __syncthreads(); // keep blocks well-ordered per row
+    }
+}
+
+// ====== Kernel A: build per-expert compact index + global row -> token map ======
+__device__ __forceinline__ int lane_id_amd() {
+#if defined(__HIP_PLATFORM_AMD__)
+    return threadIdx.x & 63; // wave64
+#else
+    return threadIdx.x & 31; // fallback
+#endif
+}
+__device__ __forceinline__ unsigned long long warp_ballot_int(int pred) {
+#if defined(__HIP_PLATFORM_AMD__)
+    return __ballot(pred);   // 64-bit
+#else
+    return __ballot_sync(0xFFFFFFFF, pred);
+#endif
+}
+__device__ __forceinline__ int popc64(unsigned long long x) { return __popcll(x); }
+
+__global__ void route_build_index_kernel(
+    const int   *__restrict__ topk_i,      // [B,K]
+    const float *__restrict__ topk_v,      // [B,K]
+    int B, int K,
+    const int   *__restrict__ expert_offsets, // [E] exclusive prefix
+    int E,
+    // outputs
+    int   *__restrict__ local_ids,   // [B,K]
+    float *__restrict__ local_wts,   // [B,K]
+    int   *__restrict__ expert_tokidx // [sum_tokens]; write token id at compact row
+){
+    const int e = blockIdx.x;
+    if (e >= E) return;
+
+#if defined(__HIP_PLATFORM_AMD__)
+    const int WARP = 64;
+#else
+    const int WARP = 32;
+#endif
+    const int lane   = lane_id_amd();
+    const int wid    = threadIdx.x / WARP;
+    const int nwarps = (blockDim.x + WARP - 1) / WARP;
+
+    extern __shared__ int sm[]; // [warp_counts[nwarps]] [warp_prefix[nwarps]] [carry]
+    int* warp_counts  = sm;
+    int* warp_prefix  = warp_counts + nwarps;
+    int* carry_shared = warp_prefix + nwarps;
+
+    if (threadIdx.x == 0) carry_shared[0] = 0;
+    __syncthreads();
+
+    for (int base = 0; base < B; base += blockDim.x)
+    {
+        const int t_global = base + threadIdx.x;
+
+        // Flag + which k matched this expert
+        int kk = -1;
+        int flag = 0;
+        if (t_global < B) {
+            const int off = t_global * K;
+#pragma unroll
+            for (int i = 0; i < K; ++i) {
+                if (topk_i[off + i] == e) { kk = i; flag = 1; break; }
+            }
+        }
+
+        // Per-warp compaction
+        const unsigned long long m = warp_ballot_int(flag);
+        const unsigned long long lower = (lane == 0) ? 0ull : ((~0ull) >> (64 - lane));
+        const int rank_warp = popc64(m & lower);
+        const int warp_sel  = popc64(m);
+
+        if (lane == 0) warp_counts[wid] = warp_sel;
+        __syncthreads();
+
+        // small exclusive prefix over warps (computed by first nwarps threads)
+        if (threadIdx.x < nwarps) {
+            int acc = 0;
+            for (int w = 0; w < threadIdx.x; ++w) acc += warp_counts[w];
+            warp_prefix[threadIdx.x] = acc;
+        }
+        __syncthreads();
+
+        const int warp_base   = warp_prefix[wid];
+        const int chunk_total = warp_prefix[nwarps-1] + warp_counts[nwarps-1];
+
+        if (flag) {
+            const int compact = expert_offsets[e] + carry_shared[0] + warp_base + rank_warp;
+            const int lid     = t_global * K + kk;
+
+            // (b,k) outputs
+            local_ids[lid] = compact;
+            local_wts[lid] = topk_v[lid];
+
+            // row -> token map
+            expert_tokidx[compact] = t_global;
+        }
+        __syncthreads();
+
+        if (threadIdx.x == 0) carry_shared[0] += chunk_total;
+        __syncthreads();
+    }
+}
