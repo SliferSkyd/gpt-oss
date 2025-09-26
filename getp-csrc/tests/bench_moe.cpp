@@ -49,7 +49,7 @@ struct SimConfig {
   // Benchmark harness knobs:
   int BATCH_SIZE = 1024;
   int _MAX_SEQ_LEN = 1024;
-  int TP = 1;
+  int TP = 2;
 };
 
 
@@ -248,7 +248,7 @@ int main(int argc, char** argv)
   SimConfig cfg;
   const int E  = cfg.num_experts;
   const int H  = cfg.hidden_size;           // K dimension of GEMM
-  const int D  = cfg.intermediate_size;     // per-expert MLP width
+  const int D  = cfg.intermediate_size / cfg.TP;     // per-expert MLP width
   const int o_len = 2 * D / cfg.TP;         // with TP=1, o_len = 5760
   const int Bgrp = cfg.TP * cfg.BATCH_SIZE; // 512
   const int K_topk = cfg.experts_per_token; // 4
@@ -444,7 +444,7 @@ int main(int argc, char** argv)
 // RUN_VARIANT("waves=4x4x4 tw=4x2 pad=8", 16,16,16, 4,4,4, 4,2, 4);
 // RUN_VARIANT("waves=4x4x4 tw=4x4 pad=8", 16,16,16, 4,4,4, 4,4, 4);
 // // RUN_VARIANT("waves=4x8x4 tw=1x1 pad=8", 16,16,16, 4,8,4, 1,1, 8);
-RUN_VARIANT("waves=4x8x4 tw=1x2 pad=8", 16,16,16, 4,8,4, 1,2, 4);
+// RUN_VARIANT("waves=4x8x4 tw=1x2 pad=8", 16,16,16, 4,8,4, 1,2, 4);
 // RUN_VARIANT("waves=4x8x4 tw=1x4 pad=8", 16,16,16, 4,8,4, 1,4, 4);
 // // RUN_VARIANT("waves=4x8x4 tw=2x1 pad=8", 16,16,16, 4,8,4, 2,1, 8);
 // RUN_VARIANT("waves=4x8x4 tw=2x2 pad=8", 16,16,16, 4,8,4, 2,2, 4);
@@ -460,11 +460,18 @@ RUN_VARIANT("waves=4x8x4 tw=1x2 pad=8", 16,16,16, 4,8,4, 1,2, 4);
 // RUN_VARIANT("waves=4x8x4 tw=1x2 pad=8", 16,16,16, 8,32,4, 2,8, 4);
 
 
-RUN_VARIANT("waves=4x8x4 tw=1x2 pad=8", 16,16,16, 4,8,4, 1,2, 4);
-RUN_VARIANT("waves=4x8x4 tw=1x2 pad=8", 16,16,16, 4,8,4, 1,2, 6);
+// RUN_VARIANT("waves=4x8x4 tw=1x2 pad=8", 16,16,16, 4,8,4, 1,2, 4);
+// RUN_VARIANT("waves=4x8x4 tw=1x2 pad=8", 16,16,16, 4,8,4, 1,2, 6);
 
 
-
+ RUN_VARIANT("waves=4x4x4 tw=1x2 pad=4", 16,16,16, 4,4,4, 1,2, 4);
+  RUN_VARIANT("waves=4x4x4 tw=1x2 pad=4", 16,16,16, 4,4,4, 1,2, 6);
+  RUN_VARIANT("waves=4x4x4 tw=1x2 pad=4", 16,16,16, 4,4,4, 1,2, 4);
+  RUN_VARIANT("waves=4x4x4 tw=1x2 pad=4", 16,16,16, 4,4,4, 1,2, 8);
+  RUN_VARIANT("waves=4x8x4 tw=1x2 pad=4", 16,16,16, 4,8,4, 1,2, 4);
+  RUN_VARIANT("waves=4x8x4 tw=1x2 pad=4", 16,16,16, 4,8,4, 1,2, 6);
+  RUN_VARIANT("waves=4x8x4 tw=1x2 pad=4", 16,16,16, 4,8,4, 1,2, 4);
+  RUN_VARIANT("waves=4x8x4 tw=1x2 pad=4", 16,16,16, 4,8,4, 1,2, 8);
 
 
 
