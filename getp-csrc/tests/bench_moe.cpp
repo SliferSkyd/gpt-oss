@@ -47,7 +47,7 @@ struct SimConfig {
   int rope_ntk_alpha = 1;
   int rope_ntk_beta  = 32;
   // Benchmark harness knobs:
-  int BATCH_SIZE = 512;
+  int BATCH_SIZE = 1024;
   int _MAX_SEQ_LEN = 1024;
   int TP = 1;
 };
@@ -401,12 +401,220 @@ int main(int argc, char** argv)
         out_bytes)); \
   } while (0)
 
-  RUN_VARIANT("waves=4x4x4 tw=1x1 pad=8", 16,16,16, 4,4,4, 1,1, 8);
-  RUN_VARIANT("waves=4x4x4 tw=1x2 pad=8", 16,16,16, 4,4,4, 1,2, 8);
-  RUN_VARIANT("waves=2x8x4 tw=1x1 pad=8", 16,16,16, 2,8,4, 1,1, 8);
-  RUN_VARIANT("waves=2x8x4 tw=1x2 pad=8", 16,16,16, 2,8,4, 1,2, 8);
-  RUN_VARIANT("waves=4x4x2 tw=1x1 pad=0", 16,16,16, 4,4,2, 1,1, 0);
-  RUN_VARIANT("waves=4x4x4 tw=2x1 pad=16", 16,16,16, 4,4,4, 2,1, 16);
+  // ===== Group 1: Comprehensive Sweep (p6=4, p9=8) - 121 variants =====
+// --- p4 = 2 ---
+// RUN_VARIANT("waves=2x2x4 tw=1x1 pad=8", 16,16,16, 2,2,4, 1,1, 8);
+// RUN_VARIANT("waves=2x2x4 tw=1x2 pad=8", 16,16,16, 2,2,4, 1,2, 8);
+// RUN_VARIANT("waves=2x2x4 tw=2x1 pad=8", 16,16,16, 2,2,4, 2,1, 8);
+// RUN_VARIANT("waves=2x2x4 tw=2x2 pad=8", 16,16,16, 2,2,4, 2,2, 8);
+// RUN_VARIANT("waves=2x4x4 tw=1x1 pad=8", 16,16,16, 2,4,4, 1,1, 8);
+// RUN_VARIANT("waves=2x4x4 tw=1x2 pad=8", 16,16,16, 2,4,4, 1,2, 8);
+// RUN_VARIANT("waves=2x4x4 tw=1x4 pad=8", 16,16,16, 2,4,4, 1,4, 8);
+// RUN_VARIANT("waves=2x4x4 tw=2x1 pad=8", 16,16,16, 2,4,4, 2,1, 8);
+// RUN_VARIANT("waves=2x4x4 tw=2x2 pad=8", 16,16,16, 2,4,4, 2,2, 8);
+// RUN_VARIANT("waves=2x4x4 tw=2x4 pad=8", 16,16,16, 2,4,4, 2,4, 8);
+// RUN_VARIANT("waves=2x8x4 tw=1x1 pad=8", 16,16,16, 2,8,4, 1,1, 8);
+// RUN_VARIANT("waves=2x8x4 tw=1x2 pad=8", 16,16,16, 2,8,4, 1,2, 8);
+// RUN_VARIANT("waves=2x8x4 tw=1x4 pad=8", 16,16,16, 2,8,4, 1,4, 8);
+// RUN_VARIANT("waves=2x8x4 tw=2x1 pad=8", 16,16,16, 2,8,4, 2,1, 8);
+// RUN_VARIANT("waves=2x8x4 tw=2x2 pad=8", 16,16,16, 2,8,4, 2,2, 8);
+// RUN_VARIANT("waves=2x8x4 tw=2x4 pad=8", 16,16,16, 2,8,4, 2,4, 8);
+// RUN_VARIANT("waves=2x16x4 tw=1x1 pad=8", 16,16,16, 2,16,4, 1,1, 8);
+// RUN_VARIANT("waves=2x16x4 tw=1x2 pad=8", 16,16,16, 2,16,4, 1,2, 8);
+// RUN_VARIANT("waves=2x16x4 tw=1x4 pad=8", 16,16,16, 2,16,4, 1,4, 8);
+// RUN_VARIANT("waves=2x16x4 tw=2x1 pad=8", 16,16,16, 2,16,4, 2,1, 8);
+// RUN_VARIANT("waves=2x16x4 tw=2x2 pad=8", 16,16,16, 2,16,4, 2,2, 8);
+// RUN_VARIANT("waves=2x16x4 tw=2x4 pad=8", 16,16,16, 2,16,4, 2,4, 8);
+
+
+// --- p4 = 4 ---
+// RUN_VARIANT("waves=4x2x4 tw=1x1 pad=8", 16,16,16, 4,2,4, 1,1, 4);
+// RUN_VARIANT("waves=4x2x4 tw=1x2 pad=8", 16,16,16, 4,2,4, 1,2, 4);
+// RUN_VARIANT("waves=4x2x4 tw=2x1 pad=8", 16,16,16, 4,2,4, 2,1, 4);
+// RUN_VARIANT("waves=4x2x4 tw=2x2 pad=8", 16,16,16, 4,2,4, 2,2, 4);
+// RUN_VARIANT("waves=4x2x4 tw=4x1 pad=8", 16,16,16, 4,2,4, 4,1, 4);
+// RUN_VARIANT("waves=4x2x4 tw=4x2 pad=8", 16,16,16, 4,2,4, 4,2, 4);
+// RUN_VARIANT("waves=4x4x4 tw=1x1 pad=8", 16,16,16, 4,4,4, 1,1, 4);
+// RUN_VARIANT("waves=4x4x4 tw=1x2 pad=8", 16,16,16, 4,4,4, 1,2, 4);
+// RUN_VARIANT("waves=4x4x4 tw=1x4 pad=8", 16,16,16, 4,4,4, 1,4, 4);
+// RUN_VARIANT("waves=4x4x4 tw=2x1 pad=8", 16,16,16, 4,4,4, 2,1, 4);
+// RUN_VARIANT("waves=4x4x4 tw=2x2 pad=8", 16,16,16, 4,4,4, 2,2, 4);
+// RUN_VARIANT("waves=4x4x4 tw=2x4 pad=8", 16,16,16, 4,4,4, 2,4, 4);
+// RUN_VARIANT("waves=4x4x4 tw=4x1 pad=8", 16,16,16, 4,4,4, 4,1, 4);
+// RUN_VARIANT("waves=4x4x4 tw=4x2 pad=8", 16,16,16, 4,4,4, 4,2, 4);
+// RUN_VARIANT("waves=4x4x4 tw=4x4 pad=8", 16,16,16, 4,4,4, 4,4, 4);
+// // RUN_VARIANT("waves=4x8x4 tw=1x1 pad=8", 16,16,16, 4,8,4, 1,1, 8);
+RUN_VARIANT("waves=4x8x4 tw=1x2 pad=8", 16,16,16, 4,8,4, 1,2, 4);
+// RUN_VARIANT("waves=4x8x4 tw=1x4 pad=8", 16,16,16, 4,8,4, 1,4, 4);
+// // RUN_VARIANT("waves=4x8x4 tw=2x1 pad=8", 16,16,16, 4,8,4, 2,1, 8);
+// RUN_VARIANT("waves=4x8x4 tw=2x2 pad=8", 16,16,16, 4,8,4, 2,2, 4);
+// RUN_VARIANT("waves=4x8x4 tw=2x4 pad=8", 16,16,16, 4,8,4, 2,4, 4);
+// // RUN_VARIANT("waves=4x8x4 tw=4x1 pad=8", 16,16,16, 4,8,4, 4,1, 8);
+// RUN_VARIANT("waves=4x8x4 tw=4x2 pad=8", 16,16,16, 4,8,4, 4,2, 4);
+// RUN_VARIANT("waves=4x8x4 tw=4x4 pad=8", 16,16,16, 4,8,4, 4,4, 4);
+
+
+// RUN_VARIANT("waves=4x8x4 tw=1x2 pad=8", 16,16,16, 8,16,4, 2,4, 4);
+// RUN_VARIANT("waves=4x8x4 tw=1x2 pad=8", 16,16,16, 4,16,4, 1,4, 4);
+// RUN_VARIANT("waves=4x8x4 tw=1x2 pad=8", 16,16,16, 4,32,4, 1,8, 4);
+// RUN_VARIANT("waves=4x8x4 tw=1x2 pad=8", 16,16,16, 8,32,4, 2,8, 4);
+
+
+RUN_VARIANT("waves=4x8x4 tw=1x2 pad=8", 16,16,16, 4,8,4, 1,2, 4);
+RUN_VARIANT("waves=4x8x4 tw=1x2 pad=8", 16,16,16, 4,8,4, 1,2, 6);
+
+
+
+
+
+
+
+
+
+
+
+
+// --- p4 = 8 ---
+// RUN_VARIANT("waves=8x2x4 tw=1x1 pad=8", 16,16,16, 8,2,4, 1,1, 8);
+// RUN_VARIANT("waves=8x2x4 tw=1x2 pad=8", 16,16,16, 8,2,4, 1,2, 8);
+// RUN_VARIANT("waves=8x2x4 tw=2x1 pad=8", 16,16,16, 8,2,4, 2,1, 8);
+// RUN_VARIANT("waves=8x2x4 tw=2x2 pad=8", 16,16,16, 8,2,4, 2,2, 8);
+// RUN_VARIANT("waves=8x2x4 tw=4x1 pad=8", 16,16,16, 8,2,4, 4,1, 8);
+// RUN_VARIANT("waves=8x2x4 tw=4x2 pad=8", 16,16,16, 8,2,4, 4,2, 8);
+// RUN_VARIANT("waves=8x4x4 tw=1x1 pad=8", 16,16,16, 8,4,4, 1,1, 8);
+// RUN_VARIANT("waves=8x4x4 tw=1x2 pad=8", 16,16,16, 8,4,4, 1,2, 8);
+// RUN_VARIANT("waves=8x4x4 tw=1x4 pad=8", 16,16,16, 8,4,4, 1,4, 8);
+// RUN_VARIANT("waves=8x4x4 tw=2x1 pad=8", 16,16,16, 8,4,4, 2,1, 8);
+// RUN_VARIANT("waves=8x4x4 tw=2x2 pad=8", 16,16,16, 8,4,4, 2,2, 8);
+// RUN_VARIANT("waves=8x4x4 tw=2x4 pad=8", 16,16,16, 8,4,4, 2,4, 8);
+// RUN_VARIANT("waves=8x4x4 tw=4x1 pad=8", 16,16,16, 8,4,4, 4,1, 8);
+// RUN_VARIANT("waves=8x4x4 tw=4x2 pad=8", 16,16,16, 8,4,4, 4,2, 8);
+// RUN_VARIANT("waves=8x4x4 tw=4x4 pad=8", 16,16,16, 8,4,4, 4,4, 8);
+// RUN_VARIANT("waves=8x8x4 tw=1x1 pad=8", 16,16,16, 8,8,4, 1,1, 8);
+// RUN_VARIANT("waves=8x8x4 tw=1x2 pad=8", 16,16,16, 8,8,4, 1,2, 8);
+// RUN_VARIANT("waves=8x8x4 tw=1x4 pad=8", 16,16,16, 8,8,4, 1,4, 8);
+// RUN_VARIANT("waves=8x8x4 tw=2x1 pad=8", 16,16,16, 8,8,4, 2,1, 8);
+// RUN_VARIANT("waves=8x8x4 tw=2x2 pad=8", 16,16,16, 8,8,4, 2,2, 8);
+// RUN_VARIANT("waves=8x8x4 tw=2x4 pad=8", 16,16,16, 8,8,4, 2,4, 8);
+// RUN_VARIANT("waves=8x8x4 tw=4x1 pad=8", 16,16,16, 8,8,4, 4,1, 8);
+// RUN_VARIANT("waves=8x8x4 tw=4x2 pad=8", 16,16,16, 8,8,4, 4,2, 8);
+// RUN_VARIANT("waves=8x8x4 tw=4x4 pad=8", 16,16,16, 8,8,4, 4,4, 8);
+
+// // --- p4 = 16 ---
+// RUN_VARIANT("waves=16x2x4 tw=1x1 pad=8", 16,16,16, 16,2,4, 1,1, 8);
+// RUN_VARIANT("waves=16x2x4 tw=1x2 pad=8", 16,16,16, 16,2,4, 1,2, 8);
+// RUN_VARIANT("waves=16x2x4 tw=2x1 pad=8", 16,16,16, 16,2,4, 2,1, 8);
+// RUN_VARIANT("waves=16x2x4 tw=2x2 pad=8", 16,16,16, 16,2,4, 2,2, 8);
+// RUN_VARIANT("waves=16x2x4 tw=4x1 pad=8", 16,16,16, 16,2,4, 4,1, 8);
+// RUN_VARIANT("waves=16x2x4 tw=4x2 pad=8", 16,16,16, 16,2,4, 4,2, 8);
+// RUN_VARIANT("waves=16x4x4 tw=1x1 pad=8", 16,16,16, 16,4,4, 1,1, 8);
+// RUN_VARIANT("waves=16x4x4 tw=1x2 pad=8", 16,16,16, 16,4,4, 1,2, 8);
+// RUN_VARIANT("waves=16x4x4 tw=1x4 pad=8", 16,16,16, 16,4,4, 1,4, 8);
+// RUN_VARIANT("waves=16x4x4 tw=2x1 pad=8", 16,16,16, 16,4,4, 2,1, 8);
+// RUN_VARIANT("waves=16x4x4 tw=2x2 pad=8", 16,16,16, 16,4,4, 2,2, 8);
+// RUN_VARIANT("waves=16x4x4 tw=2x4 pad=8", 16,16,16, 16,4,4, 2,4, 8);
+// RUN_VARIANT("waves=16x4x4 tw=4x1 pad=8", 16,16,16, 16,4,4, 4,1, 8);
+// RUN_VARIANT("waves=16x4x4 tw=4x2 pad=8", 16,16,16, 16,4,4, 4,2, 8);
+// RUN_VARIANT("waves=16x4x4 tw=4x4 pad=8", 16,16,16, 16,4,4, 4,4, 8);
+// RUN_VARIANT("waves=16x8x4 tw=1x1 pad=8", 16,16,16, 16,8,4, 1,1, 8);
+// RUN_VARIANT("waves=16x8x4 tw=1x2 pad=8", 16,16,16, 16,8,4, 1,2, 8);
+// RUN_VARIANT("waves=16x8x4 tw=1x4 pad=8", 16,16,16, 16,8,4, 1,4, 8);
+// RUN_VARIANT("waves=16x8x4 tw=2x1 pad=8", 16,16,16, 16,8,4, 2,1, 8);
+// RUN_VARIANT("waves=16x8x4 tw=2x2 pad=8", 16,16,16, 16,8,4, 2,2, 8);
+// RUN_VARIANT("waves=16x8x4 tw=2x4 pad=8", 16,16,16, 16,8,4, 2,4, 8);
+// RUN_VARIANT("waves=16x8x4 tw=4x1 pad=8", 16,16,16, 16,8,4, 4,1, 8);
+// RUN_VARIANT("waves=16x8x4 tw=4x2 pad=8", 16,16,16, 16,8,4, 4,2, 8);
+// RUN_VARIANT("waves=16x8x4 tw=4x4 pad=8", 16,16,16, 16,8,4, 4,4, 8);
+// RUN_VARIANT("waves=16x16x4 tw=1x1 pad=8", 16,16,16, 16,16,4, 1,1, 8);
+// RUN_VARIANT("waves=16x16x4 tw=1x2 pad=8", 16,16,16, 16,16,4, 1,2, 8);
+// RUN_VARIANT("waves=16x16x4 tw=1x4 pad=8", 16,16,16, 16,16,4, 1,4, 8);
+// RUN_VARIANT("waves=16x16x4 tw=2x1 pad=8", 16,16,16, 16,16,4, 2,1, 8);
+// RUN_VARIANT("waves=16x16x4 tw=2x2 pad=8", 16,16,16, 16,16,4, 2,2, 8);
+// RUN_VARIANT("waves=16x16x4 tw=2x4 pad=8", 16,16,16, 16,16,4, 2,4, 8);
+// RUN_VARIANT("waves=16x16x4 tw=4x1 pad=8", 16,16,16, 16,16,4, 4,1, 8);
+// RUN_VARIANT("waves=16x16x4 tw=4x2 pad=8", 16,16,16, 16,16,4, 4,2, 8);
+// RUN_VARIANT("waves=16x16x4 tw=4x4 pad=8", 16,16,16, 16,16,4, 4,4, 8);
+
+// // ===== Group 2: Varying p6 and p9 for select cases - 48 variants =====
+// // --- Case: waves~4x4, tw~2x2 ---
+// RUN_VARIANT("waves=4x4x2 tw=2x2 pad=0", 16,16,16, 4,4,2, 2,2, 0);
+// RUN_VARIANT("waves=4x4x2 tw=2x2 pad=4", 16,16,16, 4,4,2, 2,2, 4);
+// RUN_VARIANT("waves=4x4x2 tw=2x2 pad=16", 16,16,16, 4,4,2, 2,2, 16);
+// RUN_VARIANT("waves=4x4x2 tw=2x2 pad=28", 16,16,16, 4,4,2, 2,2, 28);
+// RUN_VARIANT("waves=4x4x8 tw=2x2 pad=0", 16,16,16, 4,4,8, 2,2, 0);
+// RUN_VARIANT("waves=4x4x8 tw=2x2 pad=4", 16,16,16, 4,4,8, 2,2, 4);
+// RUN_VARIANT("waves=4x4x8 tw=2x2 pad=16", 16,16,16, 4,4,8, 2,2, 16);
+// RUN_VARIANT("waves=4x4x8 tw=2x2 pad=28", 16,16,16, 4,4,8, 2,2, 28);
+// RUN_VARIANT("waves=4x4x16 tw=2x2 pad=0", 16,16,16, 4,4,16, 2,2, 0);
+// RUN_VARIANT("waves=4x4x16 tw=2x2 pad=4", 16,16,16, 4,4,16, 2,2, 4);
+// RUN_VARIANT("waves=4x4x16 tw=2x2 pad=16", 16,16,16, 4,4,16, 2,2, 16);
+// RUN_VARIANT("waves=4x4x16 tw=2x2 pad=28", 16,16,16, 4,4,16, 2,2, 28);
+// // --- Case: waves~16x4, tw~4x2 ---
+// RUN_VARIANT("waves=16x4x2 tw=4x2 pad=0", 16,16,16, 16,4,2, 4,2, 0);
+// RUN_VARIANT("waves=16x4x2 tw=4x2 pad=4", 16,16,16, 16,4,2, 4,2, 4);
+// RUN_VARIANT("waves=16x4x2 tw=4x2 pad=16", 16,16,16, 16,4,2, 4,2, 16);
+// RUN_VARIANT("waves=16x4x2 tw=4x2 pad=28", 16,16,16, 16,4,2, 4,2, 28);
+// RUN_VARIANT("waves=16x4x8 tw=4x2 pad=0", 16,16,16, 16,4,8, 4,2, 0);
+// RUN_VARIANT("waves=16x4x8 tw=4x2 pad=4", 16,16,16, 16,4,8, 4,2, 4);
+// RUN_VARIANT("waves=16x4x8 tw=4x2 pad=16", 16,16,16, 16,4,8, 4,2, 16);
+// RUN_VARIANT("waves=16x4x8 tw=4x2 pad=28", 16,16,16, 16,4,8, 4,2, 28);
+// RUN_VARIANT("waves=16x4x16 tw=4x2 pad=0", 16,16,16, 16,4,16, 4,2, 0);
+// RUN_VARIANT("waves=16x4x16 tw=4x2 pad=4", 16,16,16, 16,4,16, 4,2, 4);
+// RUN_VARIANT("waves=16x4x16 tw=4x2 pad=16", 16,16,16, 16,4,16, 4,2, 16);
+// RUN_VARIANT("waves=16x4x16 tw=4x2 pad=28", 16,16,16, 16,4,16, 4,2, 28);
+// // --- Case: waves~8x8, tw~1x1 ---
+// RUN_VARIANT("waves=8x8x2 tw=1x1 pad=0", 16,16,16, 8,8,2, 1,1, 0);
+// RUN_VARIANT("waves=8x8x2 tw=1x1 pad=4", 16,16,16, 8,8,2, 1,1, 4);
+// RUN_VARIANT("waves=8x8x2 tw=1x1 pad=16", 16,16,16, 8,8,2, 1,1, 16);
+// RUN_VARIANT("waves=8x8x2 tw=1x1 pad=28", 16,16,16, 8,8,2, 1,1, 28);
+// RUN_VARIANT("waves=8x8x8 tw=1x1 pad=0", 16,16,16, 8,8,8, 1,1, 0);
+// RUN_VARIANT("waves=8x8x8 tw=1x1 pad=4", 16,16,16, 8,8,8, 1,1, 4);
+// RUN_VARIANT("waves=8x8x8 tw=1x1 pad=16", 16,16,16, 8,8,8, 1,1, 16);
+// RUN_VARIANT("waves=8x8x8 tw=1x1 pad=28", 16,16,16, 8,8,8, 1,1, 28);
+// RUN_VARIANT("waves=8x8x16 tw=1x1 pad=0", 16,16,16, 8,8,16, 1,1, 0);
+// RUN_VARIANT("waves=8x8x16 tw=1x1 pad=4", 16,16,16, 8,8,16, 1,1, 4);
+// RUN_VARIANT("waves=8x8x16 tw=1x1 pad=16", 16,16,16, 8,8,16, 1,1, 16);
+// RUN_VARIANT("waves=8x8x16 tw=1x1 pad=28", 16,16,16, 8,8,16, 1,1, 28);
+// // --- Case: waves~2x16, tw~1x4 ---
+// RUN_VARIANT("waves=2x16x2 tw=1x4 pad=0", 16,16,16, 2,16,2, 1,4, 0);
+// RUN_VARIANT("waves=2x16x2 tw=1x4 pad=4", 16,16,16, 2,16,2, 1,4, 4);
+// RUN_VARIANT("waves=2x16x2 tw=1x4 pad=16", 16,16,16, 2,16,2, 1,4, 16);
+// RUN_VARIANT("waves=2x16x2 tw=1x4 pad=28", 16,16,16, 2,16,2, 1,4, 28);
+// RUN_VARIANT("waves=2x16x8 tw=1x4 pad=0", 16,16,16, 2,16,8, 1,4, 0);
+// RUN_VARIANT("waves=2x16x8 tw=1x4 pad=4", 16,16,16, 2,16,8, 1,4, 4);
+// RUN_VARIANT("waves=2x16x8 tw=1x4 pad=16", 16,16,16, 2,16,8, 1,4, 16);
+// RUN_VARIANT("waves=2x16x8 tw=1x4 pad=28", 16,16,16, 2,16,8, 1,4, 28);
+// RUN_VARIANT("waves=2x16x16 tw=1x4 pad=0", 16,16,16, 2,16,16, 1,4, 0);
+// RUN_VARIANT("waves=2x16x16 tw=1x4 pad=4", 16,16,16, 2,16,16, 1,4, 4);
+// RUN_VARIANT("waves=2x16x16 tw=1x4 pad=16", 16,16,16, 2,16,16, 1,4, 16);
+// RUN_VARIANT("waves=2x16x16 tw=1x4 pad=28", 16,16,16, 2,16,16, 1,4, 28);
+
+// // ===== Group 3: Additional targeted variants - 20 variants =====
+// // --- Case: Large waves (16x16), large tile (4x4) ---
+// RUN_VARIANT("waves=16x16x4 tw=4x4 pad=0", 16,16,16, 16,16,4, 4,4, 0);
+// RUN_VARIANT("waves=16x16x4 tw=4x4 pad=10", 16,16,16, 16,16,4, 4,4, 10);
+// RUN_VARIANT("waves=16x16x4 tw=4x4 pad=20", 16,16,16, 16,16,4, 4,4, 20);
+// RUN_VARIANT("waves=16x16x4 tw=4x4 pad=30", 16,16,16, 16,16,4, 4,4, 30);
+// RUN_VARIANT("waves=16x16x16 tw=4x4 pad=0", 16,16,16, 16,16,16, 4,4, 0);
+// RUN_VARIANT("waves=16x16x16 tw=4x4 pad=10", 16,16,16, 16,16,16, 4,4, 10);
+// RUN_VARIANT("waves=16x16x16 tw=4x4 pad=20", 16,16,16, 16,16,16, 4,4, 20);
+// RUN_VARIANT("waves=16x16x16 tw=4x4 pad=30", 16,16,16, 16,16,16, 4,4, 30);
+
+// // --- Case: Small waves (2x2), small tile (1x1) ---
+// RUN_VARIANT("waves=2x2x2 tw=1x1 pad=0", 16,16,16, 2,2,2, 1,1, 0);
+// RUN_VARIANT("waves=2x2x2 tw=1x1 pad=2", 16,16,16, 2,2,2, 1,1, 2);
+// RUN_VARIANT("waves=2x2x2 tw=1x1 pad=4", 16,16,16, 2,2,2, 1,1, 4);
+// RUN_VARIANT("waves=2x2x2 tw=1x1 pad=6", 16,16,16, 2,2,2, 1,1, 6);
+// RUN_VARIANT("waves=2x2x4 tw=1x1 pad=0", 16,16,16, 2,2,4, 1,1, 0);
+// RUN_VARIANT("waves=2x2x4 tw=1x1 pad=2", 16,16,16, 2,2,4, 1,1, 2);
+// RUN_VARIANT("waves=2x2x4 tw=1x1 pad=4", 16,16,16, 2,2,4, 1,1, 4);
+// RUN_VARIANT("waves=2x2x4 tw=1x1 pad=6", 16,16,16, 2,2,4, 1,1, 6);
+
+// // --- Case: Mixed waves (16x2), tw (2x2) ---
+// RUN_VARIANT("waves=16x2x8 tw=2x2 pad=8", 16,16,16, 16,2,8, 2,2, 8);
+// RUN_VARIANT("waves=16x2x8 tw=2x2 pad=12", 16,16,16, 16,2,8, 2,2, 12);
+// RUN_VARIANT("waves=16x2x8 tw=2x2 pad=18", 16,16,16, 16,2,8, 2,2, 18);
+// RUN_VARIANT("waves=16x2x8 tw=2x2 pad=26", 16,16,16, 16,2,8, 2,2, 26);
 
 #undef RUN_VARIANT
 

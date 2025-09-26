@@ -4,7 +4,7 @@
 #include <hip/hip_bfloat16.h>
 #include <hip/hip_fp16.h>
 #include <stdint.h>
-
+#include "../utils.hpp"
 // ===================================
 // Vector types and small helpers
 // ===================================
@@ -674,6 +674,10 @@ inline void matmul_vec128_singlebuf(
     const __hip_bfloat16* __restrict__ bias=nullptr,
     hipStream_t stream=nullptr)
 {
+
+    char timer_name[256];
+    snprintf(timer_name, sizeof(timer_name), "matmul_vec128_singlebuf_M%d_K%d_N%d", M, K, N);
+    TIMER_BLOCK(timer_name);
     static_assert(WM==16 && WN==16 && WK==16, "16x16x16 bf16 MFMA required.");
     constexpr int BLOCK_M = WM * WAVES_M;
     constexpr int BLOCK_N = WN * WAVES_N;

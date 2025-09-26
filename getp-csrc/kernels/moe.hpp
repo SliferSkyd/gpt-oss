@@ -12,11 +12,11 @@ constexpr int LANE_PER_WAVE = 64;
 #define WAVES_M_MLP 4
 #endif
 #ifndef WAVES_N_MLP
-#define WAVES_N_MLP 4
+#define WAVES_N_MLP 8
 #endif
 
 #ifndef WAVES_K_MLP
-#define WAVES_K_MLP 2
+#define WAVES_K_MLP 4
 #endif
 
 static_assert(WM == 16 && WN == 16 && WK == 16, "This MFMA microkernel assumes 16x16x16 bf16 tiles.");
@@ -1922,54 +1922,6 @@ __device__ inline void copy_A_tile_vec128_fp32(uint32_t *__restrict__ dst_u32,
     }
 }
 
-// ---- B: global bf16 -> LDS bf16 (vectorized) ----
-// Loads uint4 (16B = 8 bf16) and stores as 4×u32 pairs.
-template <int BLOCK_N, int BLOCK_K, int LD_B>
-__device__ inline void copy_B_tile_vec128_bf16(uint32_t *__restrict__ dst_u32,
-                                               const __hip_bfloat16 *__restrict__ W, // [N,K] row-major
-                                               int n0, int N, int K, int kBase,
-                                               int linearT, int threadsPerBlock)
-{
-    static_assert((BLOCK_K % 8) == 0, "copy_B_tile_vec128_bf16: BLOCK_K must be multiple of 8 (bf16 per 16B).");
-
-    constexpr int quadsPerCol = BLOCK_K / 8; // 8 bf16 per 16B
-    const int totalQuads = BLOCK_N * quadsPerCol;
-
-    for (int t = linearT; t < totalQuads; t += threadsPerBlock)
-    {
-        const int c = t / quadsPerCol; // col within BLOCK_N
-        const int q = t % quadsPerCol; // 16B unit along K
-        const int gn = n0 + c;
-        const int gk8 = kBase + (q << 3); // bf16 index (8 per 16B)
-
-        uint4 v = {0, 0, 0, 0};
-        if (gn < N)
-        {
-            const size_t base = (size_t)gn * K + gk8;
-            if ((gk8 + 7) < K && is_aligned_16B(&W[base]))
-            {
-                v = *reinterpret_cast<const uint4 *>(&W[base]); // 16B coalesced
-            }
-            else
-            {
-                __hip_bfloat16 tmp[8] = {};
-#pragma unroll
-                for (int i = 0; i < 8 && (gk8 + i) < K; ++i)
-                    tmp[i] = W[base + i];
-                const uint32_t *p = reinterpret_cast<const uint32_t *>(tmp);
-                v = make_uint4(p[0], p[1], p[2], p[3]);
-            }
-        }
-
-        // write 4×u32 pairs for this 16B chunk
-        uint32_t *col = reinterpret_cast<uint32_t *>(dst_u32 + ((size_t)c * LD_B >> 1));
-        const int off = (q << 2);
-        col[off + 0] = v.x;
-        col[off + 1] = v.y;
-        col[off + 2] = v.z;
-        col[off + 3] = v.w;
-    }
-}
 
 // ===================================
 // Grouped MLP1 (bf16 weights, no bias) in unified-MFMA style
@@ -2003,7 +1955,7 @@ __global__ __launch_bounds__(64 * ((WAVES_M / TW_M) * (WAVES_N / TW_N)), 2) void
     constexpr int WAVES_N_E = WAVES_N / TW_N;
     constexpr int WAVES_PER_BLOCK_E = WAVES_M_E * WAVES_N_E;
     static_assert((BLOCK_K % 2) == 0, "BLOCK_K must be even");
-    static_assert((PAD_K_MC % 2) == 0, "PAD_K_MC must be even");
+    // static_assert((PAD_K_MC % 2) == 0, "PAD_K_MC must be even");
 
     // ---- which expert / which M tile am I serving? ----
     const int mtile_id = blockIdx.y; // your scheduler sets this
@@ -2371,7 +2323,7 @@ __device__ __forceinline__ void deq32_stream_store_from_u128(
 // ---- A (global bf16) -> LDS (bf16; write u32 pairs) ----
 // One 16B unit = 8 bf16 => 4 u32 pairs.
 template<int BLOCK_M, int BLOCK_K, int LD_A>
-__device__ inline void copy_A_tile_vec128_bf16(
+__device__ __forceinline__ void copy_A_tile_vec128_bf16(
     uint32_t* __restrict__ dst_u32,
     const __hip_bfloat16* __restrict__ A, // [M,K] row-major
     int m_start, int M, int K, int kBase,
@@ -2381,31 +2333,110 @@ __device__ inline void copy_A_tile_vec128_bf16(
     constexpr int quadsPerRow = BLOCK_K / 8;   // 8 bf16 per 16B
     const int totalQuads      = BLOCK_M * quadsPerRow;
 
+    // Entire tile's K-range is fully in-bounds?
+    const bool fullK = (kBase + BLOCK_K) <= K;
+
     for (int t = linearT; t < totalQuads; t += threadsPerBlock) {
-        const int r   = t / quadsPerRow;      // 0..BLOCK_M-1
-        const int q   = t % quadsPerRow;      // 16B unit along K
-        const int gm  = m_start + r;          // global row
-        const int gk8 = kBase + (q << 3);     // bf16 index (×8)
+        const int r  = t / quadsPerRow;       // 0..BLOCK_M-1
+        const int q  = t % quadsPerRow;       // 16B unit along K
+        const int gm = m_start + r;           // global row
+
+        // LDS row base (u32-pair addressing: LD_A is in bf16 elems)
+        uint32_t* __restrict__ row_out = dst_u32 + (((size_t)r * LD_A) >> 1);
+        uint32_t* __restrict__ out     = row_out + (q << 2); // 4 u32 per 16B
 
         uint4 v = {0,0,0,0};
+
         if (gm < M) {
-            const size_t base = (size_t)gm * K + gk8;
-            if ((gk8 + 7) < K && is_aligned_16B(&A[base])) {
-                v = *reinterpret_cast<const uint4*>(&A[base]);  // coalesced 16B
+            const size_t rowBase     = (size_t)gm * K + kBase;
+            const __hip_bfloat16* gp = A + rowBase;
+
+            // Fast path: entire K-slab fits and the row start is 16B-aligned.
+            if (fullK && is_aligned_16B(gp)) {
+                const uint4* p128 = reinterpret_cast<const uint4*>(gp);
+                v = p128[q];
             } else {
-                __hip_bfloat16 tmp[8] = {};
-                #pragma unroll
-                for (int i=0;i<8 && (gk8+i)<K;++i) tmp[i] = A[base + i];
-                const uint32_t* p = reinterpret_cast<const uint32_t*>(tmp);
-                v = make_uint4(p[0], p[1], p[2], p[3]);
+                // Per-chunk path (handles partial K and/or misalignment gracefully).
+                const int gk8 = kBase + (q << 3); // bf16 index (×8)
+                if ((gk8 + 7) < K) {
+                    const __hip_bfloat16* chunk = gp + (q << 3);
+                    if (is_aligned_16B(chunk)) {
+                        v = *reinterpret_cast<const uint4*>(chunk);
+                    } else {
+                        __hip_bfloat16 tmp[8] = {};
+                        #pragma unroll
+                        for (int i = 0; i < 8; ++i) {
+                            const int kk = gk8 + i;
+                            if (kk < K) tmp[i] = A[(size_t)gm * K + kk];
+                        }
+                        const uint32_t* p = reinterpret_cast<const uint32_t*>(tmp);
+                        v = make_uint4(p[0], p[1], p[2], p[3]);
+                    }
+                }
+                // else: keep zeros
             }
         }
-        uint32_t* row = dst_u32 + ((size_t)r * LD_A >> 1);  // u32-pair addressing
-        const int off = (q << 2);
-        row[off + 0] = v.x;
-        row[off + 1] = v.y;
-        row[off + 2] = v.z;
-        row[off + 3] = v.w;
+        // Always write (zero-fill for out-of-bounds gm/q).
+        out[0] = v.x; out[1] = v.y; out[2] = v.z; out[3] = v.w;
+    }
+}
+
+
+// ---- B: global bf16 -> LDS bf16 (vectorized) ----
+// Loads uint4 (16B = 8 bf16) and stores as 4×u32 pairs.
+template <int BLOCK_N, int BLOCK_K, int LD_B>
+__device__ __forceinline__ void copy_B_tile_vec128_bf16(
+    uint32_t *__restrict__ dst_u32,
+    const __hip_bfloat16 *__restrict__ W,   // [N,K] row-major
+    int n0, int N, int K, int kBase,
+    int linearT, int threadsPerBlock)
+{
+    static_assert((BLOCK_K % 8) == 0, "copy_B_tile_vec128_bf16: BLOCK_K must be multiple of 8 (bf16 per 16B).");
+
+    constexpr int quadsPerCol = BLOCK_K / 8; // 8 bf16 per 16B
+    const int totalQuads      = BLOCK_N * quadsPerCol;
+
+    const bool fullK = (kBase + BLOCK_K) <= K;
+
+    for (int t = linearT; t < totalQuads; t += threadsPerBlock) {
+        const int c  = t / quadsPerCol;      // col within BLOCK_N
+        const int q  = t % quadsPerCol;      // 16B unit along K
+        const int gn = n0 + c;
+
+        // LDS col base (u32-pair addressing: LD_B is in bf16 elems)
+        uint32_t* __restrict__ col_out = dst_u32 + (((size_t)c * LD_B) >> 1);
+        uint32_t* __restrict__ out     = col_out + (q << 2); // 4 u32 per 16B
+
+        uint4 v = {0,0,0,0};
+
+        if (gn < N) {
+            const size_t rowBase     = (size_t)gn * K + kBase;
+            const __hip_bfloat16* gp = W + rowBase;
+
+            if (fullK && is_aligned_16B(gp)) {
+                const uint4* p128 = reinterpret_cast<const uint4*>(gp);
+                v = p128[q];
+            } else {
+                const int gk8 = kBase + (q << 3);
+                if ((gk8 + 7) < K) {
+                    const __hip_bfloat16* chunk = gp + (q << 3);
+                    if (is_aligned_16B(chunk)) {
+                        v = *reinterpret_cast<const uint4*>(chunk);
+                    } else {
+                        __hip_bfloat16 tmp[8] = {};
+                        #pragma unroll
+                        for (int i = 0; i < 8; ++i) {
+                            const int kk = gk8 + i;
+                            if (kk < K) tmp[i] = W[(size_t)gn * K + kk];
+                        }
+                        const uint32_t* p = reinterpret_cast<const uint32_t*>(tmp);
+                        v = make_uint4(p[0], p[1], p[2], p[3]);
+                    }
+                }
+            }
+        }
+        // Always write (zero-fill for out-of-bounds gn/q).
+        out[0] = v.x; out[1] = v.y; out[2] = v.z; out[3] = v.w;
     }
 }
 
@@ -2475,7 +2506,7 @@ void grouped_mlp1_bf16_kernel_unified(
     constexpr int WAVES_N_E = WAVES_N / TW_N;
     constexpr int WAVES_PER_BLOCK_E = WAVES_M_E * WAVES_N_E;
     static_assert((BLOCK_K % 2) == 0, "BLOCK_K must be even");
-    static_assert((PAD_K_MC % 2) == 0, "PAD_K_MC must be even");
+    // static_assert((PAD_K_MC % 2) == 0, "PAD_K_MC must be even");
 
     const int mtile_id = blockIdx.y;
     const int e = tile2expert[mtile_id];
