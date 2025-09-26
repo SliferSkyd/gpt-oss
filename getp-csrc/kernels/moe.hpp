@@ -12,11 +12,11 @@ constexpr int LANE_PER_WAVE = 64;
 #define WAVES_M_MLP 4
 #endif
 #ifndef WAVES_N_MLP
-#define WAVES_N_MLP 8
+#define WAVES_N_MLP 4
 #endif
 
 #ifndef WAVES_K_MLP
-#define WAVES_K_MLP 4
+#define WAVES_K_MLP 2
 #endif
 
 static_assert(WM == 16 && WN == 16 && WK == 16, "This MFMA microkernel assumes 16x16x16 bf16 tiles.");
