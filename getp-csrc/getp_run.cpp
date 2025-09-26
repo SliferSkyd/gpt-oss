@@ -1823,10 +1823,10 @@ void attention_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size,
     {
         // // TIMER_BLOCK("matmul_mc_attention");
         const int woff = layer_idx * H * QKV;
-        matmul_vec128_singlebuf<
-            /*WM,WN,WK*/ 16, 16, 16,
-            /*WAVES_M,N,K*/ 4, 8, 4,
-            /*TW_M,TW_N*/ 1, 2,
+        matmul32x32x8_vec128_singlebuf<
+            /*WM,WN,WK*/ 32, 32, 8,
+            /*WAVES_M,N,K*/ 4, 16, 4,
+            /*TW_M,TW_N*/ 1, 4,
             /*PAD_K*/ 4,
             /*FUSED*/ false>(qkv_mb, t_mb, w->w_qkv + woff, batch_size, H, QKV, nullptr, sAttn);
         HIP_CHECK(hipGetLastError());
@@ -2767,10 +2767,10 @@ int *forward_batch_gpu(GPUTransformer *gpu_t, int *tokens, int batch_size)
     }
     {
         // // TIMER_BLOCK("final_matmul");
-        matmul_vec128_singlebuf<
-            16, 16, 16,
-            4, 8, 4,
-            1, 2,
+        matmul32x32x8_vec128_singlebuf<
+            32, 32, 8,
+            4, 16, 4,
+            1, 4,
             4,
             false>(s->logits, s->x, w->out, B, H, p->vocab_size);
         HIP_CHECK(hipGetLastError());
