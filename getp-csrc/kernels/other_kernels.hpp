@@ -14,6 +14,22 @@ __global__ void accumulate_kernel(float *a, const float *b, float factor,
     }
 }
 
+
+__global__ void axpy_inplace_b_bf16(
+    float *__restrict__ a,
+    const __hip_bfloat16 *__restrict__ b,  // <<< b in BF16
+    float factor,
+    int batch_size, int size)
+{
+    size_t idx = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    size_t total_size = (size_t)batch_size * (size_t)size;
+
+    if (idx < total_size)
+    {
+        const float bv = __bfloat162float(b[idx]); // BF16 -> FP32
+        a[idx] += bv * factor;                     // accumulate in FP32
+    }
+}
 // NEW: Kernel to add bias to matrix multiplication result with bfloat16 bias
 __global__ void add_bias_kernel(float *output, const __hip_bfloat16 *bias, int batch_size, int size)
 {
