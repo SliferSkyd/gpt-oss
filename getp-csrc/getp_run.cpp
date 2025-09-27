@@ -46,7 +46,7 @@ bool IS_20B_MODEL = 1;
 typedef struct
 {
     // Embedding weights
-    float *token_embedding_table; // (vocab_size, hidden_dim)
+    __hip_bfloat16 *token_embedding_table; // (vocab_size, hidden_dim)
 
     // RMSNorm weights
     __hip_bfloat16 *rms_attn_w; // (n_layers, hidden_dim)
@@ -84,21 +84,19 @@ typedef struct
 typedef struct
 {
     // Basic activation buffers
-    float *x;           // activation at current time stamp (batch_size, hidden_dim)
-    float *t;           // residual branch buffer (batch_size, hidden_dim)
-    __hip_bfloat16 *t_bf16; // residual branch buffer in bf16 (batch_size, hidden_dim)
-    float *tb;          // temp buffer (batch_size, head_dim * n_attn_heads)
-    __hip_bfloat16 *tb_bf16; // temp buffer in bf16 (batch_size, head_dim * n_attn_heads)
-    float *tb2;         // temp buffer (batch_size, hidden_dim)
-    float *temp_buffer; // general purpose temp buffer (batch_size, hidden_dim)
+    __hip_bfloat16 *x;           // activation at current time stamp (batch_size, hidden_dim)
+    __hip_bfloat16 *t;           // residual branch buffer (batch_size, hidden_dim)
+    __hip_bfloat16 *tb;          // temp buffer (batch_size, head_dim * n_attn_heads)
+    __hip_bfloat16 *tb2;         // temp buffer (batch_size, hidden_dim)
+    __hip_bfloat16 *temp_buffer; // general purpose temp buffer (batch_size, hidden_dim)
 
     // Attention buffers
-    float *qkv;  // QKV buffer (batch_size, head_dim * (n_attn_heads + 2 * n_kv_heads))
-    float *q;    // query buffer (batch_size, n_attn_heads * head_dim)
-    float *k;    // key buffer (batch_size, n_kv_heads * head_dim)
-    float *v;    // value buffer (batch_size, n_kv_heads * head_dim)
-    float *att;  // attention scores (batch_size, n_attn_heads, seq_len)
-    float *mask; // attention mask (seq_len, seq_len)
+    __hip_bfloat16 *qkv;  // QKV buffer (batch_size, head_dim * (n_attn_heads + 2 * n_kv_heads))
+    __hip_bfloat16 *q;    // query buffer (batch_size, n_attn_heads * head_dim)
+    __hip_bfloat16 *k;    // key buffer (batch_size, n_kv_heads * head_dim)
+    __hip_bfloat16 *v;    // value buffer (batch_size, n_kv_heads * head_dim)
+    __hip_bfloat16 *att;  // attention scores (batch_size, n_attn_heads, seq_len)
+    __hip_bfloat16 *mask; // attention mask (seq_len, seq_len)
 
     // KV cache
     __hip_bfloat16 *key_cache;   // (batch_size, n_layers, seq_len, kv_dim)
@@ -109,8 +107,6 @@ typedef struct
     float *sin_vals; // (head_dim/2, seq_len)
 
     // === legacy MoE (kept for shared kernels/utilities) ===
-    float *router_score; // (batch_size, n_experts)
-
     // Persistent routing buffers
     int *d_expert_counts;  // (n_experts)
     int *d_expert_offsets; // (n_experts)
@@ -118,11 +114,11 @@ typedef struct
     // === NEW: TP-union MoE buffers (per rank) ===
     // union batch (within a TP group) = Bgrp_max = TENSOR_PARALLEL_SIZE * BATCH_SIZE
     __hip_bfloat16 *gather_x_g;     // [Bgrp_max, H]       — allgathered normalized inputs
-    float *router_score_g; // [Bgrp_max, E]
-    float *topk_v_g;       // [Bgrp_max, K]
+    __hip_bfloat16 *router_score_g; // [Bgrp_max, E]
+    __hip_bfloat16 *topk_v_g;       // [Bgrp_max, K]
     int *topk_i_g;         // [Bgrp_max, K]
     int *local_ids_g;      // [Bgrp_max, K]
-    float *local_wts_g;    // [Bgrp_max, K]
+    __hip_bfloat16 *local_wts_g;    // [Bgrp_max, K]
     __hip_bfloat16 *e_agg_g;        // [Bgrp_max, H]
 
     // expert input/output (union)
@@ -143,7 +139,7 @@ typedef struct
     int *positions;      // current positions (batch_size)
 
     // Output buffer
-    float *logits; // output logits (batch_size, vocab_size)
+    __hip_bfloat16 *logits; // output logits (batch_size, vocab_size)
 
     // Continuous batching fields
     int *seq_lengths;     // Current sequence length for each slot [BATCH_SIZE]
@@ -151,9 +147,8 @@ typedef struct
     int *request_mapping; // Maps batch slot -> request index in Requests [BATCH_SIZE]
 
     int *local_ids;   // [BATCH_SIZE * K]
-    float *local_wts; // [BATCH_SIZE * K]
     int *n_local;     // [BATCH_SIZE]
-    float *d_recv;
+    __hip_bfloat16 *d_recv;
 } GPURunState;
 
 // CPU buffers for warmup and host-side operations
@@ -168,7 +163,7 @@ typedef struct
     int *prompt_lens;    // prompt lengths
     int *expert_counts;
     int *expert_offsets;
-    float *logits;
+    __hip_bfloat16 *logits;
 
     // host bounce for TP copies
     void *tp_host_stage;
@@ -267,8 +262,8 @@ void malloc_gpu_run_state(GPURunState *s, Config *p)
     s->d_expert_offsets = NULL;
 
     // Check memory requirements
-    size_t batch_hidden = BATCH_SIZE * H * sizeof(float);
-    size_t batch_qkv = BATCH_SIZE * p->head_dim * (p->n_attn_heads + 2 * p->n_kv_heads) * sizeof(float);
+    size_t batch_hidden = BATCH_SIZE * H * sizeof(__hip_bfloat16);
+    size_t batch_qkv = BATCH_SIZE * p->head_dim * (p->n_attn_heads + 2 * p->n_kv_heads) * sizeof(__hip_bfloat16);
 
     // per-layer capacities: even layers use SW_WINDOW (if sliding enabled), odd are full
     const int n_even = (p->n_layers + 1) / 2;
@@ -287,14 +282,12 @@ void malloc_gpu_run_state(GPURunState *s, Config *p)
     // Base activations
     HIP_CHECK(hipMalloc((void **)&s->x, batch_hidden));
     HIP_CHECK(hipMalloc((void **)&s->t, batch_hidden));
-    HIP_CHECK(hipMalloc((void **)&s->t_bf16, batch_hidden / 2));
-    HIP_CHECK(hipMalloc((void **)&s->tb, BATCH_SIZE * p->head_dim * p->n_attn_heads * sizeof(float)));
-    HIP_CHECK(hipMalloc((void **)&s->tb_bf16, BATCH_SIZE * p->head_dim * p->n_attn_heads * sizeof(__hip_bfloat16)));
+    HIP_CHECK(hipMalloc((void **)&s->tb, BATCH_SIZE * p->head_dim * p->n_attn_heads * sizeof(__hip_bfloat16)));
     HIP_CHECK(hipMalloc((void **)&s->tb2, batch_hidden));
     HIP_CHECK(hipMalloc((void **)&s->qkv, batch_qkv));
-    HIP_CHECK(hipMalloc((void **)&s->q, BATCH_SIZE * p->n_attn_heads * p->head_dim * sizeof(float)));
-    HIP_CHECK(hipMalloc((void **)&s->k, BATCH_SIZE * kv_dim * sizeof(float)));
-    HIP_CHECK(hipMalloc((void **)&s->v, BATCH_SIZE * kv_dim * sizeof(float)));
+    HIP_CHECK(hipMalloc((void **)&s->q, BATCH_SIZE * p->n_attn_heads * p->head_dim * sizeof(__hip_bfloat16)));
+    HIP_CHECK(hipMalloc((void **)&s->k, BATCH_SIZE * kv_dim * sizeof(__hip_bfloat16)));
+    HIP_CHECK(hipMalloc((void **)&s->v, BATCH_SIZE * kv_dim * sizeof(__hip_bfloat16)));
 
     // Persistent routing buffers
     HIP_CHECK(hipMalloc((void **)&s->d_expert_counts, E * sizeof(int)));
@@ -306,14 +299,12 @@ void malloc_gpu_run_state(GPURunState *s, Config *p)
     HIP_CHECK(hipMalloc((void **)&s->key_cache, kv_cache_size));
     HIP_CHECK(hipMalloc((void **)&s->value_cache, kv_cache_size));
 
-    HIP_CHECK(hipMalloc((void **)&s->att, BATCH_SIZE * p->n_attn_heads * MAX_SEQ_LEN * sizeof(float)));
-    HIP_CHECK(hipMalloc((void **)&s->logits, BATCH_SIZE * p->vocab_size * sizeof(float)));
+    HIP_CHECK(hipMalloc((void **)&s->att, BATCH_SIZE * p->n_attn_heads * MAX_SEQ_LEN * sizeof(__hip_bfloat16)));
+    HIP_CHECK(hipMalloc((void **)&s->logits, BATCH_SIZE * p->vocab_size * sizeof(__hip_bfloat16)));
 
     HIP_CHECK(hipMalloc((void **)&s->local_ids, BATCH_SIZE * K * sizeof(int)));
-    HIP_CHECK(hipMalloc((void **)&s->local_wts, BATCH_SIZE * K * sizeof(float)));
     HIP_CHECK(hipMalloc((void **)&s->n_local, BATCH_SIZE * sizeof(int)));
 
-    HIP_CHECK(hipMalloc((void **)&s->router_score, BATCH_SIZE * E * sizeof(float)));
     HIP_CHECK(hipMalloc((void **)&s->current_tokens, BATCH_SIZE * sizeof(int)));
     HIP_CHECK(hipMalloc((void **)&s->positions, BATCH_SIZE * sizeof(int)));
     HIP_CHECK(hipMalloc((void **)&s->cos_vals, (p->head_dim / 2) * MAX_SEQ_LEN * sizeof(float)));
@@ -327,11 +318,11 @@ void malloc_gpu_run_state(GPURunState *s, Config *p)
 
     // === NEW: TP-union allocations ===
     HIP_CHECK(hipMalloc((void **)&s->gather_x_g, (size_t)Bgrp_max * H * sizeof(__hip_bfloat16)));
-    HIP_CHECK(hipMalloc((void **)&s->router_score_g, (size_t)Bgrp_max * E * sizeof(float)));
-    HIP_CHECK(hipMalloc((void **)&s->topk_v_g, (size_t)Bgrp_max * K * sizeof(float)));
+    HIP_CHECK(hipMalloc((void **)&s->router_score_g, (size_t)Bgrp_max * E * sizeof(__hip_bfloat16)));
+    HIP_CHECK(hipMalloc((void **)&s->topk_v_g, (size_t)Bgrp_max * K * sizeof(__hip_bfloat16)));
     HIP_CHECK(hipMalloc((void **)&s->topk_i_g, (size_t)Bgrp_max * K * sizeof(int)));
     HIP_CHECK(hipMalloc((void **)&s->local_ids_g, (size_t)Bgrp_max * K * sizeof(int)));
-    HIP_CHECK(hipMalloc((void **)&s->local_wts_g, (size_t)Bgrp_max * K * sizeof(float)));
+    HIP_CHECK(hipMalloc((void **)&s->local_wts_g, (size_t)Bgrp_max * K * sizeof(__hip_bfloat16)));
     HIP_CHECK(hipMalloc((void **)&s->e_agg_g, (size_t)Bgrp_max * H * sizeof(__hip_bfloat16)));
 
     HIP_CHECK(hipMalloc((void **)&s->expert_input_buffer_bf16_g, (size_t)pairs_max * H * sizeof(__hip_bfloat16)));
@@ -358,44 +349,21 @@ void malloc_gpu_run_state(GPURunState *s, Config *p)
     // Initialize to zero
     HIP_CHECK(hipMemset(s->x, 0, batch_hidden));
     HIP_CHECK(hipMemset(s->t, 0, batch_hidden));
-    HIP_CHECK(hipMemset(s->tb, 0, BATCH_SIZE * p->head_dim * p->n_attn_heads * sizeof(float)));
+    HIP_CHECK(hipMemset(s->tb, 0, BATCH_SIZE * p->head_dim * p->n_attn_heads * sizeof(__hip_bfloat16)));
     HIP_CHECK(hipMemset(s->tb2, 0, batch_hidden));
     HIP_CHECK(hipMemset(s->qkv, 0, batch_qkv));
-    HIP_CHECK(hipMemset(s->q, 0, BATCH_SIZE * p->n_attn_heads * p->head_dim * sizeof(float)));
-    HIP_CHECK(hipMemset(s->k, 0, BATCH_SIZE * kv_dim * sizeof(float)));
-    HIP_CHECK(hipMemset(s->v, 0, BATCH_SIZE * kv_dim * sizeof(float)));
+    HIP_CHECK(hipMemset(s->q, 0, BATCH_SIZE * p->n_attn_heads * p->head_dim * sizeof(__hip_bfloat16)));
+    HIP_CHECK(hipMemset(s->k, 0, BATCH_SIZE * kv_dim * sizeof(__hip_bfloat16)));
+    HIP_CHECK(hipMemset(s->v, 0, BATCH_SIZE * kv_dim * sizeof(__hip_bfloat16)));
     HIP_CHECK(hipMemset(s->key_cache, 0, kv_cache_size));
     HIP_CHECK(hipMemset(s->value_cache, 0, kv_cache_size));
-    HIP_CHECK(hipMemset(s->att, 0, BATCH_SIZE * p->n_attn_heads * MAX_SEQ_LEN * sizeof(float)));
-    HIP_CHECK(hipMemset(s->logits, 0, (size_t)BATCH_SIZE * p->vocab_size * sizeof(float)));
+    HIP_CHECK(hipMemset(s->att, 0, BATCH_SIZE * p->n_attn_heads * MAX_SEQ_LEN * sizeof(__hip_bfloat16)));
+    HIP_CHECK(hipMemset(s->logits, 0, (size_t)BATCH_SIZE * p->vocab_size * sizeof(__hip_bfloat16)));
 
     // Continuous batching fields
     HIP_CHECK(hipMemset(s->seq_lengths, 0, BATCH_SIZE * sizeof(int)));
     HIP_CHECK(hipMemset(s->slot_active, 0, BATCH_SIZE * sizeof(bool)));
     HIP_CHECK(hipMemset(s->request_mapping, -1, BATCH_SIZE * sizeof(int)));
-
-    // Sliding window mask (optional)
-    if (p->sliding_window > 0)
-    {
-        size_t mask_size = MAX_SEQ_LEN * MAX_SEQ_LEN * sizeof(float);
-        HIP_CHECK(hipMalloc((void **)&s->mask, mask_size));
-
-        float *h_mask = (float *)malloc(mask_size);
-        if (!h_mask)
-        {
-            fprintf(stderr, "Failed to allocate host memory for mask\n");
-            exit(EXIT_FAILURE);
-        }
-        for (int i = 0; i < MAX_SEQ_LEN; i++)
-        {
-            for (int j = 0; j < MAX_SEQ_LEN; j++)
-            {
-                h_mask[i * MAX_SEQ_LEN + j] = (i - j >= p->sliding_window) ? -INFINITY : 0.0f;
-            }
-        }
-        HIP_CHECK(hipMemcpy(s->mask, h_mask, mask_size, hipMemcpyHostToDevice));
-        free(h_mask);
-    }
 
     if (!IS_20B_MODEL)
     {
@@ -436,7 +404,7 @@ void malloc_gpu_weights_20b(GPUTransformerWeights *w, Config *p)
     mlp2_shard_input(D, TP, r, Istart, Kloc); // local input cols for MLP2
 
     // Unchanged allocs
-    HIP_CHECK(hipMalloc((void **)&w->token_embedding_table, p->vocab_size * p->hidden_dim * sizeof(float)));
+    HIP_CHECK(hipMalloc((void **)&w->token_embedding_table, p->vocab_size * p->hidden_dim * sizeof(__hip_bfloat16)));
     HIP_CHECK(hipMalloc((void **)&w->rms_attn_w, p->n_layers * p->hidden_dim * sizeof(__hip_bfloat16)));
     HIP_CHECK(hipMalloc((void **)&w->rms_ffn_w, p->n_layers * p->hidden_dim * sizeof(__hip_bfloat16)));
     HIP_CHECK(hipMalloc((void **)&w->rms_out_w, p->hidden_dim * sizeof(__hip_bfloat16)));
@@ -504,7 +472,7 @@ void malloc_gpu_weights_120b(GPUTransformerWeights *w, Config *p)
     mlp2_shard_input(D, TP, r, Istart, Kloc); // local input cols for MLP2
 
     // Unchanged allocs
-    HIP_CHECK(hipMalloc((void **)&w->token_embedding_table, p->vocab_size * p->hidden_dim * sizeof(float)));
+    HIP_CHECK(hipMalloc((void **)&w->token_embedding_table, p->vocab_size * p->hidden_dim * sizeof(__hip_bfloat16)));
     HIP_CHECK(hipMalloc((void **)&w->rms_attn_w, p->n_layers * p->hidden_dim * sizeof(__hip_bfloat16)));
     HIP_CHECK(hipMalloc((void **)&w->rms_ffn_w, p->n_layers * p->hidden_dim * sizeof(__hip_bfloat16)));
     HIP_CHECK(hipMalloc((void **)&w->rms_out_w, p->hidden_dim * sizeof(__hip_bfloat16)));
@@ -574,8 +542,10 @@ void copy_weights_to_gpu_20b(Transformer *transformer, GPUTransformerWeights *gp
     // Embeddings
     {
         size_t embedding_size = (size_t)p->vocab_size * p->hidden_dim;
-        HIP_CHECK(hipMemcpy(gpu_weights->token_embedding_table, w->token_embedding_table,
-                            embedding_size * sizeof(float), hipMemcpyHostToDevice));
+        __hip_bfloat16 *h_emb_bf16 = (__hip_bfloat16 *)malloc(embedding_size * sizeof(__hip_bfloat16));
+        convert_float_array_to_bfloat16(w->token_embedding_table, h_emb_bf16, embedding_size);
+        HIP_CHECK(hipMemcpy(gpu_weights->token_embedding_table, h_emb_bf16, embedding_size * sizeof(__hip_bfloat16), hipMemcpyHostToDevice));
+        free(h_emb_bf16);
     }
 
     // Norms
@@ -1261,9 +1231,13 @@ void copy_weights_to_gpu_120b(Transformer *transformer, GPUTransformerWeights *g
     // ===== Unchanged copies (embeddings, norms, attention, router, sinks, out) =====
     {
         // Embeddings
+        {
         size_t embedding_size = (size_t)p->vocab_size * p->hidden_dim;
-        HIP_CHECK(hipMemcpy(gpu_weights->token_embedding_table, w->token_embedding_table,
-                            embedding_size * sizeof(float), hipMemcpyHostToDevice));
+        __hip_bfloat16 *h_emb_bf16 = (__hip_bfloat16 *)malloc(embedding_size * sizeof(__hip_bfloat16));
+        convert_float_array_to_bfloat16(w->token_embedding_table, h_emb_bf16, embedding_size);
+        HIP_CHECK(hipMemcpy(gpu_weights->token_embedding_table, h_emb_bf16, embedding_size * sizeof(__hip_bfloat16), hipMemcpyHostToDevice));
+        free(h_emb_bf16);
+     }
         // Norms
         {
             size_t n = (size_t)p->n_layers * p->hidden_dim;
@@ -1526,7 +1500,7 @@ void malloc_cpu_buffers(CPUBuffers *cpu_buf, Config *p)
     HIP_CHECK(hipHostMalloc((void **)&cpu_buf->tp_host_stage, cpu_buf->tp_host_stage_bytes));
 
     // Not pinned
-    cpu_buf->logits = (float *)malloc((size_t)BATCH_SIZE * p->vocab_size * sizeof(float));
+    cpu_buf->logits = (__hip_bfloat16 *)malloc((size_t)BATCH_SIZE * p->vocab_size * sizeof(__hip_bfloat16));
 
     // Initialize
     std::fill_n(cpu_buf->slot_active_cpu, BATCH_SIZE, false);
@@ -1617,7 +1591,7 @@ void warm_up(Transformer *transformer, Tokenizer *tokenizer)
         IS_20B_MODEL = 0;
 
     if (IS_20B_MODEL)
-        BATCH_SIZE = 1408, TENSOR_PARALLEL_SIZE = 2;
+        BATCH_SIZE = 1536, TENSOR_PARALLEL_SIZE = 2;
     else
         BATCH_SIZE = 920, TENSOR_PARALLEL_SIZE = 4;
 
@@ -1720,7 +1694,6 @@ void free_gpu_run_state(GPURunState *s)
     df(s->cos_vals);
     df(s->sin_vals);
 
-    df(s->router_score);
 
     df(s->d_expert_counts);
     df(s->d_expert_offsets);
@@ -1803,15 +1776,13 @@ void attention_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size,
     }
     const size_t layer_elem_offset = layer_pos_offset * (size_t)KV;
 
-    float *x_mb = s->x + (size_t)row_offset * H;
-    float *t_mb = s->t + (size_t)row_offset * H;
-    __hip_bfloat16 *t_mb_bf16 = s->t_bf16 + (size_t)row_offset * H;
-    float *tb_mb = s->tb + (size_t)row_offset * (Hd * NA);
-    __hip_bfloat16 *tb_mb_bf16 = s->tb_bf16 + (size_t)row_offset * (Hd * NA);
-    float *qkv_mb = s->qkv + (size_t)row_offset * QKV;
-    float *q_mb = s->q + (size_t)row_offset * (Hd * NA);
-    float *k_mb = s->k + (size_t)row_offset * KV;
-    float *v_mb = s->v + (size_t)row_offset * KV;
+    __hip_bfloat16 *x_mb = s->x + (size_t)row_offset * H;
+    __hip_bfloat16 *t_mb = s->t + (size_t)row_offset * H;
+    __hip_bfloat16 *tb_mb = s->tb + (size_t)row_offset * (Hd * NA);
+    __hip_bfloat16 *qkv_mb = s->qkv + (size_t)row_offset * QKV;
+    __hip_bfloat16 *q_mb = s->q + (size_t)row_offset * (Hd * NA);
+    __hip_bfloat16 *k_mb = s->k + (size_t)row_offset * KV;
+    __hip_bfloat16 *v_mb = s->v + (size_t)row_offset * KV;
     int *pos_mb = s->positions + row_offset;
 
     __hip_bfloat16 *key_cache_mb = s->key_cache + (size_t)row_offset * kv_slice;
@@ -1821,7 +1792,7 @@ void attention_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size,
     {
         // TIMER_BLOCK("rmsnorm_kernel_attention");
         dim3 grid(batch_size), block(THREADS_PER_BLOCK);
-        rmsnorm_kernel_bf16_out<<<grid, block, 0, sAttn>>>(t_mb_bf16, x_mb,
+        rmsnorm_kernel_bf16_io<<<grid, block, 0, sAttn>>>(t_mb, x_mb,
                                                   w->rms_attn_w + (size_t)layer_idx * H, batch_size, H);
         HIP_CHECK(hipGetLastError());
     }
@@ -1834,7 +1805,7 @@ void attention_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size,
             /*WAVES_M,N,K*/ 4, 16, 4,
             /*TW_M,TW_N*/ 1, 4,
             /*PAD_K*/ 4,
-            /*FUSED*/ false>(qkv_mb, t_mb_bf16, w->w_qkv + woff, batch_size, H, QKV, nullptr, sAttn);
+            /*FUSED*/ false>(qkv_mb, t_mb, w->w_qkv + woff, batch_size, H, QKV, nullptr, sAttn);
         HIP_CHECK(hipGetLastError());
     }
     // 3) bias
@@ -1852,7 +1823,7 @@ void attention_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size,
     // 4) split + RoPE
     {
         // TIMER_BLOCK("launch_split_qkv_apply_rotary");
-        launch_split_qkv_apply_rotary(
+        launch_split_qkv_apply_rotary_bf16(
             qkv_mb, q_mb, k_mb, v_mb,
             s->cos_vals, s->sin_vals, pos_mb,
             batch_size, NA, NK, Hd, sAttn);
@@ -1907,9 +1878,9 @@ void attention_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size,
                 (int)shmem);
 
             hipLaunchKernelGGL(
-                flashdecoding_fused_fastmerge_nostage_1warp8q_bf16out,
+                flashdecoding_fused_fastmerge_nostage_1warp8q_bf16q_bf16out,
                 grid, block, shmem, sAttn,
-                /* output      */ tb_mb_bf16,
+                /* output      */ tb_mb,
                 /* q           */ q_mb,
                 /* key_cache   */ key_cache_mb,
                 /* value_cache */ value_cache_mb,
@@ -1941,7 +1912,7 @@ void attention_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size,
             4, 8, 4,
             1, 2,
             4,
-            /*FUSED*/ true>(x_mb, tb_mb_bf16, w->w_o + woff, /*M=*/batch_size, /*K=*/Hd * NA, /*N=*/H,
+            /*FUSED*/ true>(x_mb, tb_mb, w->w_o + woff, /*M=*/batch_size, /*K=*/Hd * NA, /*N=*/H,
                             /*bias=*/w->b_o + boff, /*stream=*/sAttn);
         HIP_CHECK(hipGetLastError());
     }
@@ -2028,10 +1999,10 @@ void moe_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size,
     // 0) RMSNorm on local MB: t = RMS(x, w_ffn)
     {
         // TIMER_BLOCK("rmsnorm_kernel_moe");
-        float *x_mb = s->x + (size_t)row_offset * H;
-        __hip_bfloat16 *t_mb_bf16 = s->t_bf16 + (size_t)row_offset * H;
+        __hip_bfloat16 *x_mb = s->x + (size_t)row_offset * H;
+        __hip_bfloat16 *t_mb = s->t + (size_t)row_offset * H;
         dim3 grid(bs_local), block(THREADS_PER_BLOCK);
-        rmsnorm_kernel_bf16_out<<<grid, block, 0, sMoe>>>(t_mb_bf16, x_mb,
+        rmsnorm_kernel_bf16_io<<<grid, block, 0, sMoe>>>(t_mb, x_mb,
                                                  w->rms_ffn_w + (size_t)layer_idx * H, bs_local, H);
         HIP_CHECK(hipGetLastError());
     }
@@ -2043,7 +2014,7 @@ void moe_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size,
     {
         // TIMER_BLOCK("moe_allgather");
         __hip_bfloat16 *dst_self = s->gather_x_g + (size_t)rank_in_group * bs_local * H;
-        __hip_bfloat16 *src_self = s->t_bf16 + (size_t)row_offset * H;
+        __hip_bfloat16 *src_self = s->t + (size_t)row_offset * H;
         HIP_CHECK(hipMemcpyAsync(dst_self, src_self,
                                  (size_t)bs_local * H * sizeof(__hip_bfloat16),
                                  hipMemcpyDeviceToDevice, sMoe));
@@ -2053,7 +2024,7 @@ void moe_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size,
             if (peer_dev == my_dev)
                 continue;
             __hip_bfloat16 *dst = s->gather_x_g + (size_t)r * bs_local * H;
-            __hip_bfloat16 *peer_src = gpu_transformers[peer_dev]->state.t_bf16 + (size_t)row_offset * H;
+            __hip_bfloat16 *peer_src = gpu_transformers[peer_dev]->state.t + (size_t)row_offset * H;
             if (tp.p2p[rank_in_group][r])
             {
                 HIP_CHECK(hipMemcpyPeerAsync(dst, my_dev, peer_src, peer_dev,
@@ -2170,7 +2141,7 @@ void moe_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size,
         //     /*out*/ s->expert_input_buffer_bf16_g);   // <-- NEW bf16 buffer
         // HIP_CHECK(hipGetLastError());
 
-        route_build_index_kernel<<<E, threads, shmem, sMoe>>>(
+        route_build_index_kernel_bf16wts<<<E, threads, shmem, sMoe>>>(
             s->topk_i_g, s->topk_v_g, Bgrp, K,
             s->d_expert_offsets, E,
             s->local_ids_g, s->local_wts_g,
@@ -2259,7 +2230,7 @@ void moe_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size,
         // TIMER_BLOCK("reduce_tokenwise_expert_outputs");
         const int threads = 256;
         dim3 grid(Bgrp, (H + threads - 1) / threads);
-        reduce_tokenwise_expert_outputs_bf16<<<grid, threads, 0, sMoe>>>(
+        reduce_tokenwise_expert_outputs_bf16_bf16wts<<<grid, threads, 0, sMoe>>>(
             s->e_agg_g, s->expert_output_partial_g,
             s->local_ids_g, s->local_wts_g, Bgrp, H, K);
         HIP_CHECK(hipGetLastError());
@@ -2312,10 +2283,10 @@ void moe_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size,
     // 10) Scatter owner rows back and residual-add (unchanged)
     {
         // TIMER_BLOCK("scatter_add_moe_output");
-        float *x_mb = s->x + (size_t)row_offset * H;
+        __hip_bfloat16 *x_mb = s->x + (size_t)row_offset * H;
         __hip_bfloat16 *src_owner = s->e_agg_g + (size_t)rank_in_group * bs_local * H;
         const int elems = bs_local * H;
-        axpy_inplace_b_bf16<<<(elems + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK,
+        accumulate_kernel_bf16<<<(elems + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK,
                             THREADS_PER_BLOCK, 0, sMoe>>>(
             x_mb, src_owner, 1.0f, bs_local, H);
         HIP_CHECK(hipGetLastError());
@@ -2375,7 +2346,7 @@ int *forward_batch_gpu(GPUTransformer *gpu_t, int *tokens, int batch_size)
         if (elems > 0)
         {
             dim3 grid((elems + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK);
-            copy_embeddings_kernel<<<grid, THREADS_PER_BLOCK, 0, attn_stream>>>(
+            copy_embeddings_kernel_bf16<<<grid, THREADS_PER_BLOCK, 0, attn_stream>>>(
                 s->x, w->token_embedding_table, s->current_tokens, B, H);
             HIP_CHECK(hipGetLastError());
         }
@@ -2444,7 +2415,7 @@ int *forward_batch_gpu(GPUTransformer *gpu_t, int *tokens, int batch_size)
     // final norm + head on default stream
     {
         dim3 grid(B), block(THREADS_PER_BLOCK);
-        rmsnorm_kernel_bf16_out<<<grid, block>>>(s->t_bf16, s->x, w->rms_out_w, B, H);
+        rmsnorm_kernel_bf16_io<<<grid, block>>>(s->x, s->x, w->rms_out_w, B, H);
         HIP_CHECK(hipGetLastError());
     }
     {
@@ -2454,12 +2425,12 @@ int *forward_batch_gpu(GPUTransformer *gpu_t, int *tokens, int batch_size)
             4, 16, 4,
             1, 4,
             4,
-            false>(s->logits, s->t_bf16, w->out, B, H, p->vocab_size);
+            false>(s->logits, s->x, w->out, B, H, p->vocab_size);
         HIP_CHECK(hipGetLastError());
     }
     {
         // TIMER_BLOCK("sample_argmax");
-        sample_argmax(s->logits, s->current_tokens, B, p->vocab_size);
+        sample_argmax_bf16(s->logits, s->current_tokens, B, p->vocab_size);
         HIP_CHECK(hipGetLastError());
     }
 

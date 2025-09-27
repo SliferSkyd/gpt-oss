@@ -69,6 +69,33 @@ __device__ inline void store_c_tile(const f32x4& acc,
     }
 }
 
+
+
+
+// ===================================
+// bf16-output store helper
+// ===================================
+template<int WM, int WN, bool Interior>
+__device__ inline void store_c_tile_bf16(const f32x4& acc,
+                                         __hip_bfloat16* __restrict__ C,
+                                         int M, int N, int m0, int n0,
+                                         int wave_m_tile, int wave_n_tile, int lane) {
+    const int rowBase = m0 + wave_m_tile * WM + lane_group(lane) * 4;
+    const int col     = n0 + wave_n_tile * WN + lane_row(lane);
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        const int row = rowBase + i;
+        if constexpr (Interior) {
+            C[(size_t)row * N + col] = __float2bfloat16(acc[i]);
+        } else {
+            if (row < M && col < N) {
+                C[(size_t)row * N + col] = __float2bfloat16(acc[i]);
+            }
+        }
+    }
+}
+
+
 template<int WM, int WN, bool Interior>
 __device__ inline void store_and_fuse_tile(const f32x4& acc,
                                            float* __restrict__ X,                  // in/out [M,N]
@@ -85,6 +112,27 @@ __device__ inline void store_and_fuse_tile(const f32x4& acc,
         }
         float v = acc[i];
         v += __bfloat162float(bias[col]);      // bias (bf16 -> f32)
+        v += X[(size_t)row * N + col];         // residual
+        X[(size_t)row * N + col] = v;
+    }
+}
+
+template<int WM, int WN, bool Interior>
+__device__ inline void store_and_fuse_tile_bf16(const f32x4& acc,
+                                           __hip_bfloat16* __restrict__ X,                  // in/out [M,N]
+                                           const __hip_bfloat16* __restrict__ bias,// [N] bf16
+                                           int M, int N, int m0, int n0,
+                                           int wave_m_tile, int wave_n_tile, int lane) {
+    const int rowBase = m0 + wave_m_tile * WM + lane_group(lane) * 4;
+    const int col     = n0 + wave_n_tile * WN + lane_row(lane);
+    #pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        const int row = rowBase + i;
+        if constexpr (!Interior) {
+            if (row >= M || col >= N) continue;
+        }
+        __hip_bfloat16 v = acc[i];
+        v += bias[col];      // bias (bf16 -> f32)
         v += X[(size_t)row * N + col];         // residual
         X[(size_t)row * N + col] = v;
     }
@@ -879,7 +927,7 @@ __device__ inline bf16x4 make_b_vec_k32(const uint16_t* __restrict__ sB,
 // row = j*8 + (lane_half2()*4) + i ; column = lane_col32()
 template<int WM /*=32*/, int WN /*=32*/, bool Interior>
 __device__ inline void store_c_tile32(const f32x16& acc,
-                                      float* __restrict__ C,
+                                      __hip_bfloat16* __restrict__ C,
                                       int M, int N, int m0, int n0,
                                       int wmt, int wnt)
 {
@@ -893,9 +941,9 @@ __device__ inline void store_c_tile32(const f32x16& acc,
             const int elem = i + 4*j;  // selects which of the 16 acc elements
             const int row = m0 + wmt * WM + (j*8 + lane_half2()*4 + i);
             if constexpr (Interior) {
-                C[(size_t)row * N + col] = acc[elem];
+                C[(size_t)row * N + col] = __float2bfloat16(acc[elem]);
             } else {
-                if (row < M && col < N) C[(size_t)row * N + col] = acc[elem];
+                if (row < M && col < N) C[(size_t)row * N + col] = __float2bfloat16(acc[elem]);
             }
         }
     }
@@ -903,7 +951,7 @@ __device__ inline void store_c_tile32(const f32x16& acc,
 
 template<int WM /*=32*/, int WN /*=32*/, bool Interior>
 __device__ inline void store_and_fuse_tile32(const f32x16& acc,
-                                             float* __restrict__ X,  // in/out
+                                             __hip_bfloat16* __restrict__ X,  // in/out
                                              const __hip_bfloat16* __restrict__ bias,
                                              int M, int N, int m0, int n0,
                                              int wmt, int wnt)
@@ -920,8 +968,8 @@ __device__ inline void store_and_fuse_tile32(const f32x16& acc,
             if constexpr (!Interior) {
                 if (row >= M || col >= N) continue;
             }
-            float v = acc[elem];
-            v += __bfloat162float(bias[col]);
+            __hip_bfloat16 v = acc[elem];
+            v += bias[col];
             v += X[(size_t)row * N + col];
             X[(size_t)row * N + col] = v;
         }
@@ -1168,7 +1216,7 @@ template<
 >
 __global__ __launch_bounds__(64 * ((WAVES_M / TW_M) * (WAVES_N / TW_N)), 2)
 void mfma_bf16_kernel_vec128_singlebuf_Abf16(
-    float* __restrict__ C,                        // [M,N] (in/out if FUSED)
+    __hip_bfloat16* __restrict__ C,                        // [M,N] (in/out if FUSED)
     const __hip_bfloat16* __restrict__ A,         // [M,K] bf16  <-- changed
     const __hip_bfloat16* __restrict__ Wbf16,     // [N,K] bf16 row-major
     const __hip_bfloat16* __restrict__ bias,      // [N] (used iff FUSED)
@@ -1276,11 +1324,11 @@ void mfma_bf16_kernel_vec128_singlebuf_Abf16(
         {
             const int wnt = tile_n0 + tn;
             if constexpr (FUSED) {
-                if (interior) store_and_fuse_tile<WM,WN,true >(acc[tm][tn], C, bias, M, N, m0, n0, wmt, wnt, lane);
-                else          store_and_fuse_tile<WM,WN,false>(acc[tm][tn], C, bias, M, N, m0, n0, wmt, wnt, lane);
+                if (interior) store_and_fuse_tile_bf16<WM,WN,true >(acc[tm][tn], C, bias, M, N, m0, n0, wmt, wnt, lane);
+                else          store_and_fuse_tile_bf16<WM,WN,false>(acc[tm][tn], C, bias, M, N, m0, n0, wmt, wnt, lane);
             } else {
-                if (interior) store_c_tile<WM,WN,true >(acc[tm][tn], C, M, N, m0, n0, wmt, wnt, lane);
-                else          store_c_tile<WM,WN,false>(acc[tm][tn], C, M, N, m0, n0, wmt, wnt, lane);
+                if (interior) store_c_tile_bf16<WM,WN,true >(acc[tm][tn], C, M, N, m0, n0, wmt, wnt, lane);
+                else          store_c_tile_bf16<WM,WN,false>(acc[tm][tn], C, M, N, m0, n0, wmt, wnt, lane);
             }
         }
     }
@@ -1294,7 +1342,7 @@ template<
     bool FUSED=false
 >
 inline void matmul_vec128_singlebuf_Abf16(
-    float* __restrict__ C,                        // [M,N] (in/out if FUSED)
+    __hip_bfloat16* __restrict__ C,                        // [M,N] (in/out if FUSED)
     const __hip_bfloat16* __restrict__ A,         // [M,K] bf16  <-- changed
     const __hip_bfloat16* __restrict__ Wbf16,     // [N,K] bf16
     int M, int K, int N,
@@ -1392,7 +1440,7 @@ template<
 >
 __global__ __launch_bounds__(32 * (2 * ((WAVES_M / TW_M) * (WAVES_N / TW_N))), 2)
 void mfma_bf16_kernel32_vec128_singlebuf_Abf16(
-    float* __restrict__ C,
+    __hip_bfloat16* __restrict__ C,
     const __hip_bfloat16* __restrict__ A,          // [M,K] bf16  <-- changed
     const __hip_bfloat16* __restrict__ Wbf16,
     const __hip_bfloat16* __restrict__ bias,
@@ -1514,7 +1562,7 @@ template<
     bool FUSED=false
 >
 inline void matmul32x32x8_vec128_singlebuf_Abf16(
-    float* __restrict__ C,
+    __hip_bfloat16* __restrict__ C,
     const __hip_bfloat16* __restrict__ A,          // [M,K] bf16  <-- changed
     const __hip_bfloat16* __restrict__ Wbf16,
     int M, int K, int N,

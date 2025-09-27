@@ -233,3 +233,71 @@ inline void sample_argmax(
         d_probs, d_out_idx, batch_size, n
     );
 }
+
+
+
+// Re-use your existing ArgMaxPair / merge_argmax / warpReduceArgMax helpers.
+
+// One block per row: finds argmax over n columns for that row.
+// probs_bf16: [batch_size, n] in __hip_bfloat16 (row-major)
+__global__ void sample_argmax_kernel_bf16(
+    const __hip_bfloat16* __restrict__ probs_bf16,
+    int* __restrict__ out_idx,
+    int batch_size, int n)
+{
+    const int b = blockIdx.x;
+    if (b >= batch_size) return;
+
+    const __hip_bfloat16* row = probs_bf16 + (size_t)b * n;
+
+    // Each thread scans a strided chunk and keeps a local best.
+    ArgMaxPair best = {-INFINITY, INT_MAX};  // INT_MAX ensures "earlier index wins" on ties
+
+    for (int i = threadIdx.x; i < n; i += blockDim.x) {
+        float p = __bfloat162float(row[i]);   // bf16 -> fp32 for comparison
+        // If you want to treat NaNs as -inf (like many reductions), uncomment:
+        // if (!isfinite(p)) p = -INFINITY;
+        best = merge_argmax(best, {p, i});
+    }
+
+    // Warp reduce
+    best = warpReduceArgMax(best);
+
+    // Cross-warp reduce using shared memory
+    __shared__ float s_p[32];
+    __shared__ int   s_i[32];
+
+    const int lane = threadIdx.x & (warpSize - 1);
+    const int wid  = threadIdx.x / warpSize;
+
+    if (lane == 0) {
+        s_p[wid] = best.p;
+        s_i[wid] = best.i;
+    }
+    __syncthreads();
+
+    // Final reduce by warp 0
+    if (wid == 0) {
+        ArgMaxPair v;
+        const int nwarps = (blockDim.x + warpSize - 1) / warpSize;
+        v.p = (lane < nwarps) ? s_p[lane] : -INFINITY;
+        v.i = (lane < nwarps) ? s_i[lane] : INT_MAX;
+        v = warpReduceArgMax(v);
+        if (lane == 0) out_idx[b] = v.i;
+    }
+}
+
+inline void sample_argmax_bf16(
+    const __hip_bfloat16* d_probs_bf16, int* d_out_idx,
+    int batch_size, int n,
+    hipStream_t stream = nullptr,
+    int threads_per_block = 256)
+{
+    dim3 grid(batch_size);
+    dim3 block(threads_per_block);
+    hipLaunchKernelGGL(
+        sample_argmax_kernel_bf16,
+        grid, block, /*sharedMemBytes=*/0, stream,
+        d_probs_bf16, d_out_idx, batch_size, n
+    );
+}

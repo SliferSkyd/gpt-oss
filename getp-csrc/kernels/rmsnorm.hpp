@@ -1,5 +1,7 @@
 #include <hip/hip_runtime.h>
 #include <hip/hip_bf16.h>
+#include <math.h>
+
 #include "../config.hpp"
 
 // GPU kernels with bfloat16 weights support
@@ -104,5 +106,59 @@ __global__ void rmsnorm_kernel_bf16_out(__hip_bfloat16 *output,
         const float wi = __bfloat162float(weight[i]);
         const float yi = wi * (inv_rms * x[i]);
         o[i] = __float2bfloat16(yi);
+    }
+}
+
+
+__global__ void rmsnorm_kernel_bf16_io(__hip_bfloat16 *output,
+                                       const __hip_bfloat16 *input,
+                                       const __hip_bfloat16 *weight,
+                                       int batch_size, int size)
+{
+    const int batch_idx = blockIdx.x;
+    const int tid       = threadIdx.x;
+
+    if (batch_idx >= batch_size) return;
+
+    const __hip_bfloat16 *x_bf16 = input  + 1LL * batch_idx * size;
+    __hip_bfloat16       *o_bf16 = output + 1LL * batch_idx * size;
+
+    // Use double in shared memory to keep the reduction numerically stable.
+    __shared__ double shared_ss[THREADS_PER_BLOCK];
+
+    // 1) Sum of squares over the vector
+    double ss = 0.0;
+    for (int i = tid; i < size; i += blockDim.x) {
+        const float xi = __bfloat162float(x_bf16[i]);
+        ss += (double)xi * (double)xi;
+    }
+    shared_ss[tid] = ss;
+    __syncthreads();
+
+    // 2) Block reduction
+    for (int stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            shared_ss[tid] += shared_ss[tid + stride];
+        }
+        __syncthreads();
+    }
+
+    // 3) Compute inverse RMS (shared across the block)
+    if (tid == 0) {
+        double mean_sq = shared_ss[0] / (double)size;
+        const double eps = 1e-5;            // match original epsilon
+        const double inv_rms = 1.0 / sqrt(mean_sq + eps);
+        shared_ss[0] = inv_rms;
+    }
+    __syncthreads();
+
+    const float inv_rms_f = (float)shared_ss[0];
+
+    // 4) Normalize, scale by weight (both bf16 -> f32), then store as bf16
+    for (int i = tid; i < size; i += blockDim.x) {
+        const float xi = __bfloat162float(x_bf16[i]);
+        const float wi = __bfloat162float(weight[i]);
+        const float yi = wi * (inv_rms_f * xi);
+        o_bf16[i] = __float2bfloat16(yi);
     }
 }
