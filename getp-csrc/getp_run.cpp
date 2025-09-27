@@ -2263,8 +2263,8 @@ void moe_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size,
 
         // acc_owner currently holds this rank's partial (from its own W2 shard).
         // Pull the same owner slice from every peer and accumulate.
-        for (int r = 0; r < TP; ++r) {
-            if (r == rank_in_group) continue;
+        for (int i = 1; i < TP; ++i) {
+            int r = (rank_in_group + i) % TP; // peer rank
 
             const int peer_dev  = group_base + r;
             const float* peer_owner =
