@@ -398,6 +398,12 @@ void malloc_gpu_run_state(GPURunState *s, Config *p)
         const size_t TILE_ELEMS = RING_TILE_BYTES / sizeof(float);
         HIP_CHECK(hipMalloc((void **)&s->d_recv, TILE_ELEMS * sizeof(float)));
     }
+    // Always keep a per-rank recv tile large enough for one owner slice
+    {
+        const int H = p->hidden_dim;
+        const size_t owner_elems = (size_t)BATCH_SIZE * (size_t)H; // worst case per rank
+        HIP_CHECK(hipMalloc((void**)&s->d_recv, owner_elems * sizeof(float)));
+    }
 }
 
 void malloc_gpu_weights_20b(GPUTransformerWeights *w, Config *p)
@@ -2246,47 +2252,49 @@ void moe_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size,
     HIP_CHECK(hipStreamSynchronize(sMoe));
     tp_group_barrier(tp);
 
-    // 9) Token-wise all-reduce emulation across TP (unchanged)
+    // 9) Reduce-scatter over TP on OWNER rows only (no all-reduce over [Bgrp,H])
     {
-        // // TIMER_BLOCK("moe_allreduce_tokenwise");
-        const size_t span_elems = (size_t)Bgrp * (size_t)H;
-        const size_t bytes = span_elems * sizeof(float);
+        // We only need rows that this rank owns: [rank_in_group*bs_local ... +bs_local)
+        const size_t owner_elems = (size_t)bs_local * (size_t)H;
+        const size_t owner_bytes = owner_elems * sizeof(float);
 
-        float *gather_base = s->expert_output_gather_g;
+        // Accumulator lives in-place at our owner slice inside e_agg_g
+        float* acc_owner = s->e_agg_g + (size_t)rank_in_group * owner_elems;
 
-        HIP_CHECK(hipMemcpyAsync(
-            gather_base + (size_t)rank_in_group * span_elems,
-            s->e_agg_g, bytes,
-            hipMemcpyDeviceToDevice, sMoe));
+        // acc_owner currently holds this rank's partial (from its own W2 shard).
+        // Pull the same owner slice from every peer and accumulate.
+        for (int r = 0; r < TP; ++r) {
+            if (r == rank_in_group) continue;
 
-        for (int r = 0; r < TP; ++r)
-        {
-            const int peer_dev = group_base + r;
-            if (peer_dev == my_dev)
-                continue;
-            float *peer_src = gpu_transformers[peer_dev]->state.e_agg_g;
-            float *dst = gather_base + (size_t)r * span_elems;
+            const int peer_dev  = group_base + r;
+            const float* peer_owner =
+                gpu_transformers[peer_dev]->state.e_agg_g + (size_t)rank_in_group * owner_elems;
 
-            if (tp.p2p[rank_in_group][r])
-            {
-                HIP_CHECK(hipMemcpyPeerAsync(dst, my_dev, peer_src, peer_dev, bytes, sMoe));
+            if (tp.p2p[rank_in_group][r]) {
+                // P2P: copy peer owner slice into our small device recv buffer
+                HIP_CHECK(hipMemcpyPeerAsync(
+                    /*dst*/ s->d_recv,        /*dstDevice*/ my_dev,
+                    /*src*/ peer_owner,       /*srcDevice*/ peer_dev,
+                    /*count*/ owner_bytes, sMoe));
+            } else {
+                // Fallback via host bounce (pinned)
+                HIP_CHECK(hipMemcpyAsync(
+                    gpu_t->cpu_buffers.tp_host_stage, peer_owner,
+                    owner_bytes, hipMemcpyDeviceToHost, sMoe));
+                HIP_CHECK(hipMemcpyAsync(
+                    s->d_recv, gpu_t->cpu_buffers.tp_host_stage,
+                    owner_bytes, hipMemcpyHostToDevice, sMoe));
             }
-            else
-            {
-                HIP_CHECK(hipMemcpyAsync(cpu->tp_host_stage, peer_src, bytes, hipMemcpyDeviceToHost, sMoe));
-                HIP_CHECK(hipMemcpyAsync(dst, cpu->tp_host_stage, bytes, hipMemcpyHostToDevice, sMoe));
-            }
+
+            // Accumulate: acc_owner += d_recv
+            const int T = THREADS_PER_BLOCK;
+            const int GRD = (int)((owner_elems + T - 1) / T);
+            accumulate_kernel<<<GRD, T, 0, sMoe>>>(acc_owner, s->d_recv, /*alpha=*/1.0f,
+                                                /*rows=*/bs_local, /*cols=*/H);
+            HIP_CHECK(hipGetLastError());
         }
-        HIP_CHECK(hipStreamSynchronize(sMoe));
-        tp_group_barrier(tp);
 
-        const size_t total = span_elems;
-        const int BLK = 256, GRD = (int)((total + BLK - 1) / BLK);
-        sum_rank_axis_kernel<<<GRD, BLK, 0, sMoe>>>(
-            /*out=*/s->e_agg_g,
-            /*parts=*/gather_base,
-            /*TP=*/TP, /*T=*/Bgrp, /*H=*/H);
-        HIP_CHECK(hipGetLastError());
+        // No need to sync here; next consumer is on the same stream.
     }
 
     // 10) Scatter owner rows back and residual-add (unchanged)

@@ -120,7 +120,7 @@ squeue -h -o "%i %u %t %M %D %R" \
       CG|CD) STC="$BOLD$GREEN" ;;
       *)  STC="$BOLD$RESET" ;;
     esac
-    [[ "$user" == "getp02" ]] && ROW="$YELLOW" || ROW=""
+    [[ "$user" == "getp03" ]] && ROW="$YELLOW" || ROW=""
     print_cell "$ROW"        "$W_JOBID"    "$jobid"
     print_cell "$BOLD$ROW"   "$W_NAME"     "$fullname"
     print_cell "$ROW"        "$W_USER"     "$user"

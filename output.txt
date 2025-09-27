@@ -40,8 +40,8 @@ Weights copied. w_qkv and out are transposed in-place on GPU ([K,N] layout).
 Weights copied. w_qkv and out are transposed in-place on GPU ([K,N] layout).
 Weights copied. w_qkv and out are transposed in-place on GPU ([K,N] layout).
 
-warm up elapsed time(s): 77.659000
+warm up elapsed time(s): 66.033000
 
-elapsed time(s): 305.560000, achieved throughput TPS (tok/s): 36540.211415
+elapsed time(s): 298.545000, achieved throughput TPS (tok/s): 37398.807550
 
-finish elapsed time(s): 0.078000
+finish elapsed time(s): 0.084000
