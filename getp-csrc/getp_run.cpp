@@ -86,6 +86,7 @@ typedef struct
     // Basic activation buffers
     float *x;           // activation at current time stamp (batch_size, hidden_dim)
     float *t;           // residual branch buffer (batch_size, hidden_dim)
+    __hip_bfloat16 *t_bf16; // residual branch buffer in bf16 (batch_size, hidden_dim)
     float *tb;          // temp buffer (batch_size, head_dim * n_attn_heads)
     float *tb2;         // temp buffer (batch_size, hidden_dim)
     float *temp_buffer; // general purpose temp buffer (batch_size, hidden_dim)
@@ -285,6 +286,7 @@ void malloc_gpu_run_state(GPURunState *s, Config *p)
     // Base activations
     HIP_CHECK(hipMalloc((void **)&s->x, batch_hidden));
     HIP_CHECK(hipMalloc((void **)&s->t, batch_hidden));
+    HIP_CHECK(hipMalloc((void **)&s->t_bf16, batch_hidden / 2));
     HIP_CHECK(hipMalloc((void **)&s->tb, BATCH_SIZE * p->head_dim * p->n_attn_heads * sizeof(float)));
     HIP_CHECK(hipMalloc((void **)&s->tb2, batch_hidden));
     HIP_CHECK(hipMalloc((void **)&s->qkv, batch_qkv));
@@ -1801,6 +1803,7 @@ void attention_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size,
 
     float *x_mb = s->x + (size_t)row_offset * H;
     float *t_mb = s->t + (size_t)row_offset * H;
+    __hip_bfloat16 *t_mb_bf16 = s->t_bf16 + (size_t)row_offset * H;
     float *tb_mb = s->tb + (size_t)row_offset * (Hd * NA);
     float *qkv_mb = s->qkv + (size_t)row_offset * QKV;
     float *q_mb = s->q + (size_t)row_offset * (Hd * NA);
@@ -1815,7 +1818,7 @@ void attention_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size,
     {
         // // TIMER_BLOCK("rmsnorm_kernel_attention");
         dim3 grid(batch_size), block(THREADS_PER_BLOCK);
-        rmsnorm_kernel<<<grid, block, 0, sAttn>>>(t_mb, x_mb,
+        rmsnorm_kernel_bf16_out<<<grid, block, 0, sAttn>>>(t_mb_bf16, x_mb,
                                                   w->rms_attn_w + (size_t)layer_idx * H, batch_size, H);
         HIP_CHECK(hipGetLastError());
     }
@@ -1823,12 +1826,12 @@ void attention_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size,
     {
         // // TIMER_BLOCK("matmul_mc_attention");
         const int woff = layer_idx * H * QKV;
-        matmul32x32x8_vec128_singlebuf<
+        matmul32x32x8_vec128_singlebuf_Abf16<
             /*WM,WN,WK*/ 32, 32, 8,
             /*WAVES_M,N,K*/ 4, 16, 4,
             /*TW_M,TW_N*/ 1, 4,
             /*PAD_K*/ 4,
-            /*FUSED*/ false>(qkv_mb, t_mb, w->w_qkv + woff, batch_size, H, QKV, nullptr, sAttn);
+            /*FUSED*/ false>(qkv_mb, t_mb_bf16, w->w_qkv + woff, batch_size, H, QKV, nullptr, sAttn);
         HIP_CHECK(hipGetLastError());
     }
     // 3) bias
@@ -2762,17 +2765,17 @@ int *forward_batch_gpu(GPUTransformer *gpu_t, int *tokens, int batch_size)
     // final norm + head on default stream
     {
         dim3 grid(B), block(THREADS_PER_BLOCK);
-        rmsnorm_kernel<<<grid, block>>>(s->x, s->x, w->rms_out_w, B, H);
+        rmsnorm_kernel_bf16_out<<<grid, block>>>(s->t_bf16, s->x, w->rms_out_w, B, H);
         HIP_CHECK(hipGetLastError());
     }
     {
         // // TIMER_BLOCK("final_matmul");
-        matmul32x32x8_vec128_singlebuf<
+        matmul32x32x8_vec128_singlebuf_Abf16<
             32, 32, 8,
             4, 16, 4,
             1, 4,
             4,
-            false>(s->logits, s->x, w->out, B, H, p->vocab_size);
+            false>(s->logits, s->t_bf16, w->out, B, H, p->vocab_size);
         HIP_CHECK(hipGetLastError());
     }
     {
