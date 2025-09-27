@@ -1,5 +1,6 @@
 #include <hip/hip_runtime.h>
 #include <hip/hip_bf16.h>
+#include <stdint.h>
 #include "../config.hpp"
 #include "../memory/mxfp4.hpp"
 
@@ -812,6 +813,76 @@ __global__ void pack_rows_kernel_bf16(
         __syncthreads(); // optional; remove if not relying on per-row ordering
     }
 }
+
+
+
+
+__global__ void pack_rows_kernel_bf16_in(
+    const __hip_bfloat16 *__restrict__ x,      // [B, H] bf16
+    int H,
+    const int *__restrict__ expert_tokidx,     // [sum_tokens] row -> token
+    int sum_tokens,
+    __hip_bfloat16 *__restrict__ expert_in     // [sum_tokens, H] bf16
+)
+{
+    for (int row = blockIdx.x; row < sum_tokens; row += gridDim.x)
+    {
+        const int tkn = expert_tokidx[row];
+        const __hip_bfloat16 *__restrict__ src = x + (size_t)tkn * H;
+        __hip_bfloat16 *__restrict__ dst = expert_in + (size_t)row * H;
+
+        // Try 8B vector path (4×bf16 at a time), then 4B (2×bf16), else scalar.
+        const bool vec4_ok = (((uintptr_t)src & 0x7) == 0) && (((uintptr_t)dst & 0x7) == 0);
+        const bool vec2_ok = (!vec4_ok) && (((uintptr_t)src & 0x3) == 0) && (((uintptr_t)dst & 0x3) == 0);
+
+        if (vec4_ok)
+        {
+            const int H4 = H >> 2; // groups of 4 bf16 (8 bytes)
+            const uint2 *__restrict__ s8 = reinterpret_cast<const uint2 *>(src);
+            uint2 *__restrict__ d8 = reinterpret_cast<uint2 *>(dst);
+
+            for (int i4 = threadIdx.x; i4 < H4; i4 += blockDim.x)
+            {
+                d8[i4] = s8[i4];
+            }
+
+            // Tail elements if H % 4 != 0
+            if ((H & 3) && threadIdx.x == 0)
+            {
+                int i = H4 << 2;
+                for (; i < H; ++i) dst[i] = src[i];
+            }
+        }
+        else if (vec2_ok)
+        {
+            const int H2 = H >> 1; // groups of 2 bf16 (4 bytes)
+            const uint32_t *__restrict__ s4 = reinterpret_cast<const uint32_t *>(src);
+            uint32_t *__restrict__ d4 = reinterpret_cast<uint32_t *>(dst);
+
+            for (int i2 = threadIdx.x; i2 < H2; i2 += blockDim.x)
+            {
+                d4[i2] = s4[i2];
+            }
+
+            // Tail if H is odd
+            if ((H & 1) && threadIdx.x == 0)
+            {
+                dst[H - 1] = src[H - 1];
+            }
+        }
+        else
+        {
+            // Scalar path
+            for (int i = threadIdx.x; i < H; i += blockDim.x)
+            {
+                dst[i] = src[i];
+            }
+        }
+
+        __syncthreads(); // optional; safe to remove if not relying on per-row ordering
+    }
+}
+
 // ====== Kernel A: build per-expert compact index + global row -> token map ======
 __device__ __forceinline__ int lane_id_amd()
 {

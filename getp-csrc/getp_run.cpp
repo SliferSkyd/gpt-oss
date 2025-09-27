@@ -88,6 +88,7 @@ typedef struct
     float *t;           // residual branch buffer (batch_size, hidden_dim)
     __hip_bfloat16 *t_bf16; // residual branch buffer in bf16 (batch_size, hidden_dim)
     float *tb;          // temp buffer (batch_size, head_dim * n_attn_heads)
+    __hip_bfloat16 *tb_bf16; // temp buffer in bf16 (batch_size, head_dim * n_attn_heads)
     float *tb2;         // temp buffer (batch_size, hidden_dim)
     float *temp_buffer; // general purpose temp buffer (batch_size, hidden_dim)
 
@@ -288,6 +289,7 @@ void malloc_gpu_run_state(GPURunState *s, Config *p)
     HIP_CHECK(hipMalloc((void **)&s->t, batch_hidden));
     HIP_CHECK(hipMalloc((void **)&s->t_bf16, batch_hidden / 2));
     HIP_CHECK(hipMalloc((void **)&s->tb, BATCH_SIZE * p->head_dim * p->n_attn_heads * sizeof(float)));
+    HIP_CHECK(hipMalloc((void **)&s->tb_bf16, BATCH_SIZE * p->head_dim * p->n_attn_heads * sizeof(__hip_bfloat16)));
     HIP_CHECK(hipMalloc((void **)&s->tb2, batch_hidden));
     HIP_CHECK(hipMalloc((void **)&s->qkv, batch_qkv));
     HIP_CHECK(hipMalloc((void **)&s->q, BATCH_SIZE * p->n_attn_heads * p->head_dim * sizeof(float)));
@@ -1805,6 +1807,7 @@ void attention_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size,
     float *t_mb = s->t + (size_t)row_offset * H;
     __hip_bfloat16 *t_mb_bf16 = s->t_bf16 + (size_t)row_offset * H;
     float *tb_mb = s->tb + (size_t)row_offset * (Hd * NA);
+    __hip_bfloat16 *tb_mb_bf16 = s->tb_bf16 + (size_t)row_offset * (Hd * NA);
     float *qkv_mb = s->qkv + (size_t)row_offset * QKV;
     float *q_mb = s->q + (size_t)row_offset * (Hd * NA);
     float *k_mb = s->k + (size_t)row_offset * KV;
@@ -1904,9 +1907,9 @@ void attention_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size,
                 (int)shmem);
 
             hipLaunchKernelGGL(
-                flashdecoding_fused_fastmerge_nostage_1warp8q,
+                flashdecoding_fused_fastmerge_nostage_1warp8q_bf16out,
                 grid, block, shmem, sAttn,
-                /* output      */ tb_mb,
+                /* output      */ tb_mb_bf16,
                 /* q           */ q_mb,
                 /* key_cache   */ key_cache_mb,
                 /* value_cache */ value_cache_mb,
@@ -1933,12 +1936,12 @@ void attention_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size,
         const int woff = (size_t)layer_idx * Kproj * H;
         const int boff = (size_t)layer_idx * H;
 
-        matmul_vec128_singlebuf<
+        matmul_vec128_singlebuf_Abf16<
             16, 16, 16,
             4, 8, 4,
             1, 2,
             4,
-            /*FUSED*/ true>(x_mb, tb_mb, w->w_o + woff, /*M=*/batch_size, /*K=*/Hd * NA, /*N=*/H,
+            /*FUSED*/ true>(x_mb, tb_mb_bf16, w->w_o + woff, /*M=*/batch_size, /*K=*/Hd * NA, /*N=*/H,
                             /*bias=*/w->b_o + boff, /*stream=*/sAttn);
         HIP_CHECK(hipGetLastError());
     }
