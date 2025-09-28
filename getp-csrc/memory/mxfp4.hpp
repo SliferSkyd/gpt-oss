@@ -216,3 +216,58 @@ __global__ void quantize_pack_mxfp4_block32_kernel(
     }
 }
 
+
+
+// ====== MXFP4 -> BF16 (layer-wide) dequantization ======
+// One thread writes one u32 (2x bf16) pair; tail-safe for odd element counts.
+__global__ void dequant_mxfp4_pairs_to_bf16_kernel(
+    __hip_bfloat16 *__restrict__ dst_bf16,  // [E, N*K] row-major
+    const uint8_t *__restrict__ packed,     // [E, ceil(N*K/2)]
+    const float   *__restrict__ scales_f32, // [E, ceil(N*K/32)], already expanded scales
+    int E, int N, int K)
+{
+    const int e = blockIdx.y;
+    if (e >= E) return;
+
+    const size_t seg_elems = (size_t)N * (size_t)K;
+    const size_t seg_pairs = (seg_elems + 1) >> 1;   // ceil(elems/2)
+    const size_t seg_blocks = (seg_elems + 31) >> 5; // /32
+
+    const uint8_t *packed_e = packed     + (size_t)e * ((seg_elems + 1) >> 1);
+    const float   *scales_e = scales_f32 + (size_t)e * seg_blocks;
+
+    // We'll write via u32 for aligned pairs when possible
+    uint32_t *out_pairs = reinterpret_cast<uint32_t*>(dst_bf16 + (size_t)e * seg_elems);
+
+    const size_t tid = blockIdx.x * blockDim.x + threadIdx.x;
+    const size_t stride = (size_t)blockDim.x * gridDim.x;
+
+    for (size_t p = tid; p < seg_pairs; p += stride)
+    {
+        const size_t even_idx = p << 1; // element index (even)
+        const size_t blk = even_idx >> 5;
+        const float X = (blk < seg_blocks) ? scales_e[blk] : 0.0f;
+
+        // Byte holding two nibbles for elements even_idx and even_idx+1
+        const uint8_t byte = packed_e[even_idx >> 1];
+        const uint8_t nib0 =  byte       & 0xF;
+        const uint8_t nib1 = (byte >> 4) & 0xF;
+
+        const float mag0 = mxfp4_mag_from_code(nib0 & 7);
+        const float v0   = ((nib0 & 8) ? -mag0 : mag0) * X;
+
+        if (even_idx + 1 < seg_elems)
+        {
+            // both valid -> pack two bf16 into u32
+            const float mag1 = mxfp4_mag_from_code(nib1 & 7);
+            const float v1   = ((nib1 & 8) ? -mag1 : mag1) * X;
+            out_pairs[p] = pack2_bf16_bits_f32(v0, v1);
+        }
+        else
+        {
+            // last odd element -> store only the low half safely
+            __hip_bfloat16 *dst = dst_bf16 + (size_t)e * seg_elems + even_idx;
+            *dst = __float2bfloat16(v0);
+        }
+    }
+}
