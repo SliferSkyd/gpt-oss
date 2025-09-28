@@ -2244,24 +2244,34 @@ void moe_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size,
 
     // 9) Token-wise all-reduce across TP (bf16) using ring (in place on e_agg_g)
     {
-        // TIMER_BLOCK("moe_allreduce_tokenwise_ring");
-        const size_t elems = (size_t)Bgrp * (size_t)H;
-
-        __hip_bfloat16 *peer_bases[MAX_TP];
-        for (int r = 0; r < TP; ++r)
-        {
-            const int peer_dev = group_base + r;
-            peer_bases[r] = gpu_transformers[peer_dev]->state.e_agg_g; // base of SAME logical buffer
+        // We only need rows that this rank owns: [rank_in_group*bs_local ... +bs_local)
+        const size_t owner_elems = (size_t)bs_local * (size_t)H;
+        const size_t owner_bytes = owner_elems * sizeof(__hip_bfloat16);
+        // Accumulator lives in-place at our owner slice inside e_agg_g
+        __hip_bfloat16* acc_owner = s->e_agg_g + (size_t)rank_in_group * owner_elems;
+        // acc_owner currently holds this rank's partial (from its own W2 shard).
+        // Pull the same owner slice from every peer and accumulate.
+        for (int i = 1; i < TP; ++i) {
+            const int r = (rank_in_group + i) % TP;
+            const int peer_dev  = group_base + r;
+            const __hip_bfloat16* peer_owner =
+                gpu_transformers[peer_dev]->state.e_agg_g + (size_t)rank_in_group * owner_elems;
+            if (tp.p2p[rank_in_group][r]) {
+                // P2P: copy peer owner slice into our small device recv buffer
+                HIP_CHECK(hipMemcpyPeerAsync(
+                    /*dst*/ s->d_recv,        /*dstDevice*/ my_dev,
+                    /*src*/ peer_owner,       /*srcDevice*/ peer_dev,
+                    /*count*/ owner_bytes, sMoe));
+            } else {
+                assert(0);
+            }
+            // Accumulate: acc_owner += d_recv
+            const int T = THREADS_PER_BLOCK;
+            const int GRD = (int)((owner_elems + T - 1) / T);
+            vec_add_inplace_bf16<<<GRD, T, 0, sMoe>>>(acc_owner, s->d_recv, owner_elems);
+            HIP_CHECK(hipGetLastError());
         }
-
-        __hip_bfloat16 *recv_tile_bf16 = reinterpret_cast<__hip_bfloat16 *>(s->d_recv); // BF16 scratch
-
-        ring_allreduce_sum_bf16(
-            /*buf_local*/ s->e_agg_g,
-            /*peer_bases*/ peer_bases,
-            /*N_elems*/ elems,
-            /*d_recv*/ recv_tile_bf16,
-            tp, sMoe);
+        // No need to sync here; next consumer is on the same stream.
     }
 
     // 10) Scatter owner rows back and residual-add (unchanged)

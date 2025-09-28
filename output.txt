@@ -1,9 +1,9 @@
 vocab_size: 201088
 hidden_dim: 2880
-n_experts: 32
+n_experts: 128
 experts_per_token: 4
 intermediate_dim: 2880
-n_layers: 24
+n_layers: 36
 head_dim: 64
 n_attn_heads: 64
 n_kv_heads: 8
@@ -13,24 +13,24 @@ rope theta: 150000.000000
 rope_scaling_factor: 32.000000
 sliding window: 128
 swiglu_limit: 7.000000
-requests size = 2955673600 B
-Num requests: 11264
-KV cache (fp32) total capacity: layers_capacity=13824 positions/layer-stack
-KV cache size per batch: 19008 MB
-KV cache (fp32) total capacity: layers_capacity=13824 positions/layer-stack
-KV cache size per batch: 19008 MB
-KV cache (fp32) total capacity: layers_capacity=13824 positions/layer-stack
-KV cache size per batch: 19008 MB
-KV cache (fp32) total capacity: layers_capacity=13824 positions/layer-stack
-KV cache size per batch: 19008 MB
-KV cache (fp32) total capacity: layers_capacity=13824 positions/layer-stack
-KV cache size per batch: 19008 MB
-KV cache (fp32) total capacity: layers_capacity=13824 positions/layer-stack
-KV cache size per batch: 19008 MB
-KV cache (fp32) total capacity: layers_capacity=13824 positions/layer-stack
-KV cache size per batch: 19008 MB
-KV cache (fp32) total capacity: layers_capacity=13824 positions/layer-stack
-KV cache size per batch: 19008 MB
+requests size = 1343488000 B
+Num requests: 5120
+KV cache (fp32) total capacity: layers_capacity=20736 positions/layer-stack
+KV cache size per batch: 12960 MB
+KV cache (fp32) total capacity: layers_capacity=20736 positions/layer-stack
+KV cache size per batch: 12960 MB
+KV cache (fp32) total capacity: layers_capacity=20736 positions/layer-stack
+KV cache size per batch: 12960 MB
+KV cache (fp32) total capacity: layers_capacity=20736 positions/layer-stack
+KV cache size per batch: 12960 MB
+KV cache (fp32) total capacity: layers_capacity=20736 positions/layer-stack
+KV cache size per batch: 12960 MB
+KV cache (fp32) total capacity: layers_capacity=20736 positions/layer-stack
+KV cache size per batch: 12960 MB
+KV cache (fp32) total capacity: layers_capacity=20736 positions/layer-stack
+KV cache size per batch: 12960 MB
+KV cache (fp32) total capacity: layers_capacity=20736 positions/layer-stack
+KV cache size per batch: 12960 MB
 Weights copied. w_qkv and out are transposed in-place on GPU ([K,N] layout).
 Weights copied. w_qkv and out are transposed in-place on GPU ([K,N] layout).
 Weights copied. w_qkv and out are transposed in-place on GPU ([K,N] layout).
@@ -40,8 +40,8 @@ Weights copied. w_qkv and out are transposed in-place on GPU ([K,N] layout).
 Weights copied. w_qkv and out are transposed in-place on GPU ([K,N] layout).
 Weights copied. w_qkv and out are transposed in-place on GPU ([K,N] layout).
 
-warm up elapsed time(s): 77.659000
+warm up elapsed time(s): 261.731000
 
-elapsed time(s): 305.560000, achieved throughput TPS (tok/s): 36540.211415
+elapsed time(s): 367.583000, achieved throughput TPS (tok/s): 13746.851731
 
-finish elapsed time(s): 0.078000
+finish elapsed time(s): 0.150000
