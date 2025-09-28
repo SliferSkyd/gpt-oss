@@ -7,6 +7,7 @@
 #include <sstream>
 #include <vector>
 #include <mutex>
+#include <cstdarg>
 // HIP error checking macro
 #define HIP_CHECK(call)                                                                                 \
     do                                                                                                  \
@@ -18,6 +19,18 @@
             exit(EXIT_FAILURE);                                                                         \
         }                                                                                               \
     } while (0)
+
+void debug_print(const char* format, ...) {
+    HIP_CHECK(hipDeviceSynchronize());
+    static std::mutex print_mutex;
+    std::lock_guard<std::mutex> lock(print_mutex);
+    
+    va_list args;
+    va_start(args, format);
+    vprintf(format, args);
+    va_end(args);
+    fflush(stdout);
+}
 
 // Float to bfloat16 conversion functions using library function
 void convert_float_array_to_bfloat16(const float *src, __hip_bfloat16 *dst, size_t count)

@@ -188,7 +188,7 @@ int main(int argc, char** argv)
   HIP_CHECK(hipGetLastError());
 
   // Optimized (currently identical)
-  mlp1_optimized<16,16,16, 4,4,4, 1,1, 8>(
+  mlp1_optimized<16,16,16, 4,4,4, 1,2, 8>(
       d_C_opt, d_A, d_W1,
       d_offsets, d_counts,
       d_t2e, d_t2l,
@@ -238,7 +238,7 @@ int main(int argc, char** argv)
     HIP_CHECK(hipEventRecord(ev_start, stream));
     for (int i = 0; i < itN; ++i) {
       if (optimized) {
-        mlp1_optimized<16,16,16, 4,4,4, 1,1, 8>(
+        mlp1_optimized<16,16,16, 4,4,4, 1,2, 8>(
             dC, d_A, d_W1, d_offsets, d_counts, d_t2e, d_t2l, E, H, o_len, cur_tiles, stream);
       } else {
         mlp1<16,16,16, 4,4,2, 1,1, 8>(

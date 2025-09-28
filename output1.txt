@@ -1,0 +1,26 @@
+vocab_size: 201088
+hidden_dim: 2880
+n_experts: 128
+experts_per_token: 4
+intermediate_dim: 2880
+n_layers: 36
+head_dim: 64
+n_attn_heads: 64
+n_kv_heads: 8
+max_seq_len: 2048
+init context len: 4096
+rope theta: 150000.000000
+rope_scaling_factor: 32.000000
+sliding window: 128
+swiglu_limit: 7.000000
+requests size = 185335808 B
+Num requests: 7168
+KV cache (fp32) total capacity: layers_capacity=20736 positions/layer-stack
+KV cache size per batch: 18144 MB
+KV cache (fp32) total capacity: layers_capacity=20736 positions/layer-stack
+KV cache size per batch: 18144 MB
+KV cache (fp32) total capacity: layers_capacity=20736 positions/layer-stack
+KV cache size per batch: 18144 MB
+KV cache (fp32) total capacity: layers_capacity=20736 positions/layer-stack
+KV cache size per batch: 18144 MB
+120B MoE weights copied (Expert-Parallel, local E slice, MXFP4).
