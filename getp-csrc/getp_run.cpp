@@ -149,6 +149,9 @@ typedef struct
     int *local_ids;   // [BATCH_SIZE * K]
     int *n_local;     // [BATCH_SIZE]
     __hip_bfloat16 *d_recv;
+
+    __hip_bfloat16 *w1_bf16_layer;   // [E, o_len, H]  (staged BF16 for *current* layer MLP1 shard)
+    __hip_bfloat16 *w2_bf16_layer;   // [E, H, i_len]  (staged BF16 for *current* layer MLP2 shard)
 } GPURunState;
 
 // CPU buffers for warmup and host-side operations
@@ -346,6 +349,9 @@ void malloc_gpu_run_state(GPURunState *s, Config *p)
     HIP_CHECK(hipMalloc((void **)&s->d_tile2expert_g, s->cap_tiles * sizeof(int)));
     HIP_CHECK(hipMalloc((void **)&s->d_tile2local_g, s->cap_tiles * sizeof(int)));
 
+    HIP_CHECK(hipMalloc((void **)&s->w1_bf16_layer, (size_t)E * o_len_max * H * sizeof(__hip_bfloat16)));
+    HIP_CHECK(hipMalloc((void **)&s->w2_bf16_layer, (size_t)E * H * Dloc_max * sizeof(__hip_bfloat16)));
+
     // Initialize to zero
     HIP_CHECK(hipMemset(s->x, 0, batch_hidden));
     HIP_CHECK(hipMemset(s->t, 0, batch_hidden));
@@ -364,6 +370,8 @@ void malloc_gpu_run_state(GPURunState *s, Config *p)
     HIP_CHECK(hipMemset(s->seq_lengths, 0, BATCH_SIZE * sizeof(int)));
     HIP_CHECK(hipMemset(s->slot_active, 0, BATCH_SIZE * sizeof(bool)));
     HIP_CHECK(hipMemset(s->request_mapping, -1, BATCH_SIZE * sizeof(int)));
+
+    
 
     if (!IS_20B_MODEL)
     {
@@ -936,6 +944,88 @@ static void streaming_quantize_copy_mxfp4_cpu_to_gpu(
     HIP_CHECK(hipStreamDestroy(copy_stream));
     HIP_CHECK(hipStreamDestroy(compute_stream));
 }
+
+
+static inline int tp_rank_and_size(int *rank_out)
+{
+    int my_dev = 0;
+    HIP_CHECK(hipGetDevice(&my_dev));
+    TPGroup &tp = tp_groups[my_dev];
+    if (rank_out) *rank_out = my_dev - ((my_dev / tp.tp_size) * tp.tp_size);
+    return tp.tp_size;
+}
+
+// Launch dequant for a given layer into the staging buffers in run-state.
+// Uses the local shard sizes computed from TP rank/size.
+static inline void dequantize_mlp_layer_to_bf16(GPUTransformer *gpu_t, int layer_idx, hipStream_t sW)
+{
+    Config *p = &gpu_t->config;
+    GPUTransformerWeights *w = &gpu_t->weights;
+    GPURunState *st = &gpu_t->state;
+
+    int rank_in_group = 0;
+    const int TPx = tp_rank_and_size(&rank_in_group);
+
+    const int H = p->hidden_dim;
+    const int D = p->intermediate_dim;
+    const int E = p->n_experts;
+
+    const int twoD = 2 * D;
+    const int o_base = twoD / TPx, o_rem = twoD % TPx;
+    const int o_len = o_base + (rank_in_group < o_rem ? 1 : 0);
+
+    const int i_base = D / TPx, i_rem = D % TPx;
+    const int i_len  = i_base + (rank_in_group < i_rem ? 1 : 0);
+
+    // ----- MLP1 (O=2D local shard, I=H) -----
+    {
+        const size_t seg_elems_loc        = (size_t)o_len * (size_t)H;
+        const size_t seg_packed_bytes_loc = (seg_elems_loc + 1) / 2;
+        const size_t seg_blocks_loc       = (seg_elems_loc + 31) / 32;
+
+        const size_t layer_pack_off = (size_t)layer_idx * (size_t)E * seg_packed_bytes_loc;
+        const size_t layer_sc_off   = (size_t)layer_idx * (size_t)E * seg_blocks_loc;
+
+        const uint8_t *W1_packed = w->w_mlp1_mxfp4 + layer_pack_off;
+        const float   *S1_f32    = w->w_mlp1_scales_f32 + layer_sc_off;
+
+        const int threads = 256;
+        const int pairs = (int)((seg_elems_loc + 1) >> 1);
+        const int blocks = (pairs + threads - 1) / threads;
+
+        dim3 grid(max(1, blocks), E);
+        dim3 block(threads);
+
+        dequant_mxfp4_pairs_to_bf16_kernel<<<grid, block, 0, sW>>>(
+            st->w1_bf16_layer, W1_packed, S1_f32, E, /*N=*/o_len, /*K=*/H);
+        HIP_CHECK(hipGetLastError());
+    }
+
+    // ----- MLP2 (O=H, I=D local shard) -----
+    {
+        const size_t seg_elems_loc        = (size_t)H * (size_t)i_len;
+        const size_t seg_packed_bytes_loc = (seg_elems_loc + 1) / 2;
+        const size_t seg_blocks_loc       = (seg_elems_loc + 31) / 32;
+
+        const size_t layer_pack_off = (size_t)layer_idx * (size_t)E * seg_packed_bytes_loc;
+        const size_t layer_sc_off   = (size_t)layer_idx * (size_t)E * seg_blocks_loc;
+
+        const uint8_t *W2_packed = w->w_mlp2_mxfp4 + layer_pack_off;
+        const float   *S2_f32    = w->w_mlp2_scales_f32 + layer_sc_off;
+
+        const int threads = 256;
+        const int pairs = (int)((seg_elems_loc + 1) >> 1);
+        const int blocks = (pairs + threads - 1) / threads;
+
+        dim3 grid(max(1, blocks), E);
+        dim3 block(threads);
+
+        dequant_mxfp4_pairs_to_bf16_kernel<<<grid, block, 0, sW>>>(
+            st->w2_bf16_layer, W2_packed, S2_f32, E, /*N=*/H, /*K=*/i_len);
+        HIP_CHECK(hipGetLastError());
+    }
+}
+
 
 static inline long long tick_msec()
 {
@@ -1579,6 +1669,8 @@ void build_gpu_transformer(GPUTransformer *gpu_t, Transformer *cpu_t)
         malloc_cpu_buffers(&gpu_t->cpu_buffers, &gpu_t->config);
 
         copy_weights_to_gpu_120b(cpu_t, &gpu_t->weights);
+            dequantize_mlp_layer_to_bf16(gpu_t, /*layer_idx=*/0, /*stream=*/0);
+
     }
 }
 
@@ -2464,45 +2556,22 @@ void moe_gpu_120b(GPUTransformer *gpu_t, int layer_idx, int batch_size,
     }
 
     // 5) MLP1 (column-parallel O=2D), MXFP4 packed weights; A is bf16, C is bf16
-    int o_len = 0;
-    {
-        TIMER_BLOCK("MLP1_mxfp4_bf16");
-        const int twoD = 2 * D;
-        const int base = twoD / TPx, rem = twoD % TPx;
-        o_len = base + (rank_in_group < rem ? 1 : 0);
+   int o_len = 0;  // declared before the MLP1 block
 
-        const size_t seg1_elems_loc        = (size_t)o_len * (size_t)H;
-        const size_t seg1_packed_bytes_loc = (seg1_elems_loc + 1) / 2;
-        const size_t seg1_blocks_loc       = (seg1_elems_loc + 31) / 32;
+{
+    TIMER_BLOCK("MLP1_bf16_stagedW");
+    const int twoD = 2 * D;
+    const int base = twoD / TPx, rem = twoD % TPx;
+    o_len = base + (rank_in_group < rem ? 1 : 0);   // <-- remove 'const int'
+    const __hip_bfloat16 *W1 = s->w1_bf16_layer;
+    mlp1_optimized_outbf16<16,16,16, 4,8,4, 1,2, 4>(
+        s->mlp1_out_g, s->expert_input_buffer_bf16_g, W1,
+        s->d_expert_offsets, s->d_expert_counts,
+        s->d_tile2expert_g, s->d_tile2local_g,
+        /*E=*/E, /*K=*/H, /*N=*/o_len, /*cur_tiles=*/cur_tiles, sMoe);
+    HIP_CHECK(hipGetLastError());
+}
 
-        const size_t layer_pack_off = (size_t)layer_idx * (size_t)E * seg1_packed_bytes_loc;
-        const size_t layer_sc_off   = (size_t)layer_idx * (size_t)E * seg1_blocks_loc;
-
-        const uint8_t *W1_packed_layer = w->w_mlp1_mxfp4 + layer_pack_off;
-        const float   *S1_layer        = w->w_mlp1_scales_f32 + layer_sc_off;
-
-        dim3 grid((o_len + BLOCK_N_MLP - 1) / BLOCK_N_MLP, cur_tiles);
-        dim3 block(LANE_PER_WAVE, (WAVES_M_MLP / 1) * (WAVES_N_MLP / 2));
-
-        const int ldA = BLOCK_K_MLP + PAD_K_MLP;
-        const int ldB = BLOCK_K_MLP + PAD_K_MLP;
-        const size_t shmem = sizeof(uint16_t) *
-            (size_t)(BLOCK_M_MLP * ldA + ldB * BLOCK_N_MLP);
-
-        assert_smem_or_die(shmem, "grouped_mlp1_mxfp4_kernel_unified_A_bf16_out_bf16(TP)");
-        hipLaunchKernelGGL(
-            (grouped_mlp1_mxfp4_kernel_unified_A_bf16_out_bf16<
-                16,16,16, WAVES_M_MLP, WAVES_N_MLP, WAVES_K_MLP, 1, 2, PAD_K_MLP>),
-            grid, block, shmem, sMoe,
-            /*C*/ s->mlp1_out_g,
-            /*A*/ s->expert_input_buffer_bf16_g,
-            /*W*/ W1_packed_layer,
-            /*S*/ S1_layer,
-            /*routing*/ s->d_expert_offsets, s->d_expert_counts,
-            /*tiles*/   s->d_tile2expert_g,  s->d_tile2local_g,
-            /*E,K,N*/ E, /*K=*/H, /*N=*/o_len);
-        HIP_CHECK(hipGetLastError());
-    }
 
     // 6) SwiGLU + bias -> gate_up_bf16_g with Dloc = o_len/2
     const int Dloc = o_len / 2;
@@ -2525,55 +2594,29 @@ void moe_gpu_120b(GPUTransformer *gpu_t, int layer_idx, int batch_size,
 
     // 7) MLP2 (row-parallel on input D), MXFP4 (+bias), A is bf16, C is bf16
     {
-        TIMER_BLOCK("MLP2_mxfp4_bf16");
-        int i_len, i_start;
-        {
-            const int base = D / TPx, rem = D % TPx;
-            i_len   = base + (rank_in_group < rem ? 1 : 0);
-            i_start = rank_in_group * base + (rank_in_group < rem ? rank_in_group : rem);
-            (void)i_start;
-        }
-        if (i_len != Dloc) {
-            fprintf(stderr, "MLP2 shard mismatch: i_len=%d vs Dloc=%d\n", i_len, Dloc);
-            abort();
-        }
-
-        const size_t seg2_elems_loc        = (size_t)H * (size_t)i_len;
-        const size_t seg2_packed_bytes_loc = (seg2_elems_loc + 1) / 2;
-        const size_t seg2_blocks_loc       = (seg2_elems_loc + 31) / 32;
-
-        const size_t layer_pack_off = (size_t)layer_idx * (size_t)E * seg2_packed_bytes_loc;
-        const size_t layer_sc_off   = (size_t)layer_idx * (size_t)E * seg2_blocks_loc;
-
-        const uint8_t *__restrict__ W2_packed_layer = w->w_mlp2_mxfp4 + layer_pack_off;
-        const float   *__restrict__ S2_layer        = w->w_mlp2_scales_f32 + layer_sc_off;
-        const __hip_bfloat16 *__restrict__ b2s      =
-            w->b_mlp2 + (size_t)layer_idx * (size_t)E * (size_t)H;
-
-        dim3 grid((H + BLOCK_N_MLP - 1) / BLOCK_N_MLP, cur_tiles);
-        dim3 block(LANE_PER_WAVE, (WAVES_M_MLP / 1) * (WAVES_N_MLP / 2));
-
-        const int ldA = BLOCK_K_MLP + PAD_K_MLP;
-        const int ldB = BLOCK_K_MLP + PAD_K_MLP;
-        const size_t shmem = sizeof(uint16_t) *
-            (size_t)(BLOCK_M_MLP * ldA + ldB * BLOCK_N_MLP);
-
-        assert_smem_or_die(shmem, "grouped_mlp2_mxfp4_bias_kernel_unified_A_bf16(TP)");
-        hipLaunchKernelGGL(
-            (grouped_mlp2_mxfp4_bias_kernel_unified_A_bf16_out_bf16<
-                16,16,16, WAVES_M_MLP, WAVES_N_MLP, WAVES_K_MLP, 1, 2, PAD_K_MLP>),
-            grid, block, shmem, sMoe,
-            /*C*/ s->expert_output_partial_g,
-            /*A*/ s->gate_up_bf16_g,
-            /*W*/ W2_packed_layer,
-            /*S*/ S2_layer,
-            /*b*/ b2s,
-            /*routing*/ s->d_expert_offsets, s->d_expert_counts,
-            /*tiles*/   s->d_tile2expert_g,  s->d_tile2local_g,
-            /*E,K,N*/ E, /*K=*/i_len, /*N=*/H);
-        HIP_CHECK(hipGetLastError());
+    TIMER_BLOCK("MLP2_bf16_stagedW");
+    int i_len, i_start;
+    {
+        const int base = D / TPx, rem = D % TPx;
+        i_len   = base + (rank_in_group < rem ? 1 : 0);
+        i_start = rank_in_group * base + (rank_in_group < rem ? rank_in_group : rem);
+        (void)i_start;
     }
+    if (i_len != Dloc) { fprintf(stderr, "MLP2 shard mismatch: i_len=%d vs Dloc=%d\n", i_len, Dloc); abort(); }
 
+    const __hip_bfloat16 *W2 = s->w2_bf16_layer;                         // [E, H, i_len]
+    const __hip_bfloat16 *b2s = w->b_mlp2 + (size_t)layer_idx * (size_t)E * H;
+
+    mlp2_optimized_outbf16<16,16,16, 4,4,4, 1,2, 4>(
+        s->expert_output_partial_g,
+        /*A=*/s->gate_up_bf16_g,
+        /*W2=*/W2,
+        /*b2=*/b2s,
+        s->d_expert_offsets, s->d_expert_counts,
+        s->d_tile2expert_g, s->d_tile2local_g,
+        /*E=*/E, /*K=*/i_len, /*N=*/H, /*cur_tiles=*/cur_tiles, sMoe);
+    HIP_CHECK(hipGetLastError());
+}
     // 8) Reduce over experts -> token-wise union e_agg_g[Bgrp,H]
     {
         TIMER_BLOCK("reduce_tokenwise_expert_outputs");
@@ -2971,45 +3014,53 @@ int *forward_batch_gpu(GPUTransformer *gpu_t, int *tokens, int batch_size)
     GPURunState *s = &gpu_t->state;
     GPUTransformerWeights *w = &gpu_t->weights;
     CPUBuffers *cpu_buf = &gpu_t->cpu_buffers;
+
     const int H = p->hidden_dim;
     const int B = batch_size;
-    if (B <= 0)
-        return cpu_buf->current_tokens;
+    if (B <= 0) return cpu_buf->current_tokens;
 
-    // streams
-    hipStream_t attn_stream = nullptr, moe_stream = nullptr;
+    // --- Streams ---
+    hipStream_t attn_stream = nullptr, moe_stream = nullptr, w_stream = nullptr;
     HIP_CHECK(hipStreamCreateWithFlags(&attn_stream, hipStreamNonBlocking));
-    HIP_CHECK(hipStreamCreateWithFlags(&moe_stream, hipStreamNonBlocking));
+    HIP_CHECK(hipStreamCreateWithFlags(&moe_stream,  hipStreamNonBlocking));
+#if !IS_20B_MODEL
+    HIP_CHECK(hipStreamCreateWithFlags(&w_stream,     hipStreamNonBlocking));
+#endif
 
-    // microbatching — keep your MB exactly (no TP-capping inside attention)
+    // --- Microbatching ---
     const int MB = (BATCH_SIZE <= B) ? BATCH_SIZE : B;
     const int NUM_MB = (B + MB - 1) / MB;
+    const int L = p->n_layers;
 
-    // per-microbatch events
-    auto make_evt = []()
-    {
+    auto make_evt = []() {
         hipEvent_t e = nullptr;
         HIP_CHECK(hipEventCreateWithFlags(&e, hipEventDisableTiming));
         return e;
     };
+
+    // Per-microbatch events
     std::vector<hipEvent_t> evt_attn_done(NUM_MB);
     std::vector<hipEvent_t> evt_moe_done_prev(NUM_MB), evt_moe_done_cur(NUM_MB);
-    for (int i = 0; i < NUM_MB; ++i)
-    {
-        evt_attn_done[i] = make_evt();
+    for (int i = 0; i < NUM_MB; ++i) {
+        evt_attn_done[i]     = make_evt();
         evt_moe_done_prev[i] = make_evt();
-        evt_moe_done_cur[i] = make_evt();
+        evt_moe_done_cur[i]  = make_evt();
     }
 
-    // H2D tokens + positions
+#if !IS_20B_MODEL
+    // Per-layer weights-ready events (only needed for MXFP4 path)
+    std::vector<hipEvent_t> evt_w_ready(L);
+    for (int l = 0; l < L; ++l) evt_w_ready[l] = make_evt();
+#endif
+
+    // --- H2D tokens + positions ---
     h2d_copy(s->current_tokens, tokens, (size_t)B * sizeof(int), attn_stream);
     h2d_copy(s->positions, cpu_buf->positions, (size_t)B * sizeof(int), attn_stream);
 
-    // embeddings on attn_stream
+    // --- Embeddings on attn_stream ---
     {
         const int elems = B * H;
-        if (elems > 0)
-        {
+        if (elems > 0) {
             dim3 grid((elems + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK);
             copy_embeddings_kernel_bf16<<<grid, THREADS_PER_BLOCK, 0, attn_stream>>>(
                 s->x, w->token_embedding_table, s->current_tokens, B, H);
@@ -3017,42 +3068,54 @@ int *forward_batch_gpu(GPUTransformer *gpu_t, int *tokens, int batch_size)
         }
     }
 
-    // pipelined schedule across layers and microbatches
-    for (int l = 0; l < p->n_layers; ++l)
+#if !IS_20B_MODEL
+    // --- Warm-up dequant for layer 0 (MXFP4 -> staged BF16) ---
+    if (L > 0) {
+        HIP_CHECK(hipEventRecord(evt_w_ready[0], 0));
+    }
+#endif
+
+    // --- Pipeline across layers & microbatches ---
+    for (int l = 0; l < L; ++l)
     {
+#if !IS_20B_MODEL
+        // Wait until this layer's weights are staged (MXFP4 path only)
+        HIP_CHECK(hipStreamWaitEvent(moe_stream, evt_w_ready[l], 0));
+#endif
         int mb_idx = 0;
         for (int row = 0; row < B; row += MB, ++mb_idx)
         {
             const int bs = std::min(MB, B - row);
-            const int i = mb_idx;
+            const int i  = mb_idx;
 
-            // cross-layer dep: Attention(l,i) waits MoE(l-1,i)
-            if (l > 0)
-                HIP_CHECK(hipStreamWaitEvent(attn_stream, evt_moe_done_prev[i], 0));
+            // Attention(l,i) waits on MoE(l-1,i)
+            if (l > 0) HIP_CHECK(hipStreamWaitEvent(attn_stream, evt_moe_done_prev[i], 0));
 
-            // Attn(l,i)
+            // Attention(l,i)
             attention_gpu(gpu_t, l, bs, /*row_offset=*/row, attn_stream);
             HIP_CHECK(hipEventRecord(evt_attn_done[i], attn_stream));
 
-            // MoE(l,i-1) on the separate stream
+            // MoE(l,i-1) overlapped on moe_stream
             if (i > 0)
             {
                 const int prev_row = row - MB;
-                const int prev_bs = std::min(MB, B - prev_row);
+                const int prev_bs  = std::min(MB, B - prev_row);
                 HIP_CHECK(hipStreamWaitEvent(moe_stream, evt_attn_done[i - 1], 0));
+
                 if (IS_20B_MODEL)
                     moe_gpu(gpu_t, l, prev_bs, /*row_offset=*/prev_row, moe_stream);
                 else
                     moe_gpu_120b(gpu_t, l, prev_bs, /*row_offset=*/prev_row, moe_stream);
+
                 HIP_CHECK(hipEventRecord(evt_moe_done_cur[i - 1], moe_stream));
             }
         }
 
-        // drain last microbatch for this layer
+        // Drain last microbatch for this layer
         {
-            const int i_last = NUM_MB - 1;
+            const int i_last  = NUM_MB - 1;
             const int row_last = i_last * MB;
-            const int bs_last = std::min(MB, B - row_last);
+            const int bs_last  = std::min(MB, B - row_last);
             if (bs_last > 0)
             {
                 HIP_CHECK(hipStreamWaitEvent(moe_stream, evt_attn_done[i_last], 0));
@@ -3060,24 +3123,35 @@ int *forward_batch_gpu(GPUTransformer *gpu_t, int *tokens, int batch_size)
                     moe_gpu(gpu_t, l, bs_last, /*row_offset=*/row_last, moe_stream);
                 else
                     moe_gpu_120b(gpu_t, l, bs_last, /*row_offset=*/row_last, moe_stream);
-
                 HIP_CHECK(hipEventRecord(evt_moe_done_cur[i_last], moe_stream));
             }
+
+#if !IS_20B_MODEL
+            // Kick dequant for next layer on weight stream after layer l compute is done
+            if ((l + 1) < L) {
+                HIP_CHECK(hipStreamWaitEvent(w_stream, evt_moe_done_cur[i_last], 0));
+                dequantize_mlp_layer_to_bf16(gpu_t, /*layer_idx=*/l + 1, /*stream=*/w_stream);
+                HIP_CHECK(hipEventRecord(evt_w_ready[l + 1], w_stream));
+            }
+#endif
         }
-        // make next layer depend on current layer's MoE-done (per microbatch)
+
+        // Next layer depends on current layer's MoE-done (per microbatch)
         std::swap(evt_moe_done_prev, evt_moe_done_cur);
-        for (int i = 0; i < NUM_MB; ++i)
-        {
+        for (int i = 0; i < NUM_MB; ++i) {
             HIP_CHECK(hipEventDestroy(evt_moe_done_cur[i]));
             evt_moe_done_cur[i] = make_evt();
         }
     }
 
-    // sync compute streams before head
+    // --- Sync compute streams before head ---
     HIP_CHECK(hipStreamSynchronize(attn_stream));
     HIP_CHECK(hipStreamSynchronize(moe_stream));
+#if !IS_20B_MODEL
+    HIP_CHECK(hipStreamSynchronize(w_stream));
+#endif
 
-    // final norm + head on default stream
+    // --- Final norm + head ---
     {
         dim3 grid(B), block(THREADS_PER_BLOCK);
         rmsnorm_kernel_bf16_io<<<grid, block>>>(s->x, s->x, w->rms_out_w, B, H);
@@ -3099,18 +3173,23 @@ int *forward_batch_gpu(GPUTransformer *gpu_t, int *tokens, int batch_size)
         HIP_CHECK(hipGetLastError());
     }
 
-    // D2H tokens
+    // --- D2H tokens ---
     d2h_copy(cpu_buf->current_tokens, s->current_tokens, (size_t)B * sizeof(int), 0);
 
-    // cleanup
-    for (int i = 0; i < NUM_MB; ++i)
-    {
+    // --- Cleanup ---
+    for (int i = 0; i < NUM_MB; ++i) {
         HIP_CHECK(hipEventDestroy(evt_attn_done[i]));
         HIP_CHECK(hipEventDestroy(evt_moe_done_prev[i]));
         HIP_CHECK(hipEventDestroy(evt_moe_done_cur[i]));
     }
+#if !IS_20B_MODEL
+    for (int l = 0; l < L; ++l) HIP_CHECK(hipEventDestroy(evt_w_ready[l]));
+#endif
     HIP_CHECK(hipStreamDestroy(attn_stream));
     HIP_CHECK(hipStreamDestroy(moe_stream));
+#if !IS_20B_MODEL
+    HIP_CHECK(hipStreamDestroy(w_stream));
+#endif
 
     return cpu_buf->current_tokens;
 }
