@@ -2239,25 +2239,25 @@ __device__ inline void copy_B_tile_vec_MXFP4_hybrid(
     }
 }
 
-// ========== NEW: unified MXFP4 kernel that LOADS A IN BF16 ==========
+
+/* =========================================================================
+   MLP1: unified MXFP4 (A in bf16) -> OUT in __hip_bfloat16
+   ========================================================================= */
 template <
-    // MFMA micro-tile
     int WM, int WN, int WK,
-    // Block waves (logical)
     int WAVES_M, int WAVES_N, int WAVES_K,
-    // Tiles per wave (multi-tile per wave)
     int TW_M, int TW_N,
-    // Padding along K in LDS
     int PAD_K_MC>
-__global__ __launch_bounds__(64 * ((WAVES_M / TW_M) * (WAVES_N / TW_N)), 2) void grouped_mlp1_mxfp4_kernel_unified_A_bf16(
-    float *__restrict__ C,                        // [sum_tokens, N]
-    const __hip_bfloat16 *__restrict__ A_bf16,    // [sum_tokens, K]  <<< bf16 inputs
-    const uint8_t *__restrict__ W_packed_layer,   // [E, ceil(N*K/2)]
-    const float *__restrict__ S_scales_f32_layer, // [E, ceil(N*K/32)]
-    const int *__restrict__ expert_offsets,       // [E]
-    const int *__restrict__ expert_counts,        // [E]
-    const int *__restrict__ tile2expert,          // [num_mtiles]
-    const int *__restrict__ tile2local,           // [num_mtiles]
+__global__ __launch_bounds__(64 * ((WAVES_M / TW_M) * (WAVES_N / TW_N)), 2)
+void grouped_mlp1_mxfp4_kernel_unified_A_bf16_out_bf16(
+    __hip_bfloat16 *__restrict__ C,              // [sum_tokens, N]  <<< bf16 output
+    const __hip_bfloat16 *__restrict__ A_bf16,   // [sum_tokens, K]
+    const uint8_t *__restrict__ W_packed_layer,  // [E, ceil(N*K/2)]
+    const float   *__restrict__ S_scales_f32_layer, // [E, ceil(N*K/32)]
+    const int *__restrict__ expert_offsets,      // [E]
+    const int *__restrict__ expert_counts,       // [E]
+    const int *__restrict__ tile2expert,         // [num_mtiles]
+    const int *__restrict__ tile2local,          // [num_mtiles]
     int E, int K, int N)
 {
     static_assert(WM == 16 && WN == 16 && WK == 16, "MFMA 16x16x16");
@@ -2270,19 +2270,16 @@ __global__ __launch_bounds__(64 * ((WAVES_M / TW_M) * (WAVES_N / TW_N)), 2) void
     static_assert((BLOCK_K % 2) == 0, "BLOCK_K even");
     static_assert((PAD_K_MC % 2) == 0, "PAD_K_MC even");
 
-    // which expert / M tile
     const int mtile_id = blockIdx.y;
-    const int e = tile2expert[mtile_id];
-    const int tile_m = tile2local[mtile_id];
-    const int m_start = expert_offsets[e] + tile_m * BLOCK_M;
-    const int m_left = expert_counts[e] - tile_m * BLOCK_M;
-    if (m_left <= 0)
-        return;
+    const int e        = tile2expert[mtile_id];
+    const int tile_m   = tile2local[mtile_id];
+    const int m_start  = expert_offsets[e] + tile_m * BLOCK_M;
+    const int m_left   = expert_counts[e] - tile_m * BLOCK_M;
+    if (m_left <= 0) return;
 
     const int n0 = blockIdx.x * BLOCK_N;
     const int m0 = m_start;
 
-    // unified indexing
     const int lane = threadIdx.x; // 0..63
     const int wave = threadIdx.y; // 0..WAVES_M_E*WAVES_N_E-1
     const int wave_m_eff = wave / WAVES_N_E;
@@ -2294,7 +2291,6 @@ __global__ __launch_bounds__(64 * ((WAVES_M / TW_M) * (WAVES_N / TW_N)), 2) void
     const int aBase0 = tile_m0 * WM;
     const int bBase0 = tile_n0 * WN;
 
-    // single-buffer LDS
     extern __shared__ uint8_t smemRaw[];
     constexpr int ldA = BLOCK_K + PAD_K_MC;
     constexpr int ldB = BLOCK_K + PAD_K_MC;
@@ -2305,7 +2301,6 @@ __global__ __launch_bounds__(64 * ((WAVES_M / TW_M) * (WAVES_N / TW_N)), 2) void
     uint32_t *sA_u32 = reinterpret_cast<uint32_t *>(sA_u16);
     uint32_t *sB_u32 = reinterpret_cast<uint32_t *>(sB_u16);
 
-    // accumulators
     f32x4 acc[TW_M][TW_N];
 #pragma unroll
     for (int tm = 0; tm < TW_M; ++tm)
@@ -2314,21 +2309,19 @@ __global__ __launch_bounds__(64 * ((WAVES_M / TW_M) * (WAVES_N / TW_N)), 2) void
             acc[tm][tn] = {0.f, 0.f, 0.f, 0.f};
 
     const int threadsPerBlock = blockDim.x * blockDim.y;
-    const int linearT = wave * blockDim.x + lane;
+    const int linearT         = wave * blockDim.x + lane;
 
-    // per-expert segment bases
-    const size_t seg_elems = (size_t)N * (size_t)K;
-    const size_t seg_bytes = (seg_elems + 1) / 2;
+    const size_t seg_elems  = (size_t)N * (size_t)K;
+    const size_t seg_bytes  = (seg_elems + 1) / 2;
     const size_t seg_blocks = (seg_elems + 31) / 32;
-    const uint8_t *__restrict__ W_e_packed = W_packed_layer + (size_t)e * seg_bytes;
-    const float *__restrict__ S_f32_e = S_scales_f32_layer + (size_t)e * seg_blocks;
+    const uint8_t *__restrict__ W_e_packed = W_packed_layer    + (size_t)e * seg_bytes;
+    const float   *__restrict__ S_f32_e    = S_scales_f32_layer + (size_t)e * seg_blocks;
 
     const int M_bound = m_start + m_left;
 
-    // K loop
     for (int k0 = 0; k0 < K; k0 += BLOCK_K)
     {
-        // A: bf16 -> LDS bf16 (128b vectorized)
+        // A: bf16 -> LDS (vectorized)
         copy_A_tile_vec128_bf16<BLOCK_M, BLOCK_K, ldA>(
             sA_u32, A_bf16, m0, M_bound, K, k0, linearT, threadsPerBlock);
 
@@ -2343,15 +2336,13 @@ __global__ __launch_bounds__(64 * ((WAVES_M / TW_M) * (WAVES_N / TW_N)), 2) void
         {
             bf16x4 avec[TW_M];
 #pragma unroll
-            for (int tm = 0; tm < TW_M; ++tm)
-            {
+            for (int tm = 0; tm < TW_M; ++tm) {
                 const int aRowBase = aBase0 + tm * WM;
                 avec[tm] = make_a_vec_k(sA_u16, ldA, aRowBase, kk, lane);
             }
             bf16x4 bvec[TW_N];
 #pragma unroll
-            for (int tn = 0; tn < TW_N; ++tn)
-            {
+            for (int tn = 0; tn < TW_N; ++tn) {
                 const int bColBase = bBase0 + tn * WN;
                 bvec[tn] = make_b_vec_k(sB_u16, ldB, bColBase, kk, lane);
             }
@@ -2365,34 +2356,32 @@ __global__ __launch_bounds__(64 * ((WAVES_M / TW_M) * (WAVES_N / TW_N)), 2) void
         __syncthreads();
     }
 
-    // stores (identical to your previous path)
+    // bf16 stores
     const bool interior =
         ((m0 + BLOCK_M) <= (m_start + m_left)) &&
         ((n0 + BLOCK_N) <= N);
 #pragma unroll
-    for (int tm = 0; tm < TW_M; ++tm)
-    {
+    for (int tm = 0; tm < TW_M; ++tm) {
 #pragma unroll
-        for (int tn = 0; tn < TW_N; ++tn)
-        {
+        for (int tn = 0; tn < TW_N; ++tn) {
             const int wmt = tile_m0 + tm;
             const int wnt = tile_n0 + tn;
             if (interior)
-                store_c_tile<WM, WN, true>(acc[tm][tn], C, m_start + m_left, N, m0, n0, wmt, wnt, lane);
+                store_c_tile_bf16<WM, WN, true>(acc[tm][tn], C, m_start + m_left, N, m0, n0, wmt, wnt, lane);
             else
-                store_c_tile<WM, WN, false>(acc[tm][tn], C, m_start + m_left, N, m0, n0, wmt, wnt, lane);
+                store_c_tile_bf16<WM, WN, false>(acc[tm][tn], C, m_start + m_left, N, m0, n0, wmt, wnt, lane);
         }
     }
 }
 
-// ========== NEW: launcher for the bf16-A unified kernel ==========
+/* ===== launcher for bf16 OUT (MLP1) ===== */
 template <
     int WM = 16, int WN = 16, int WK = 16,
     int WAVES_M = 1, int WAVES_N = 8, int WAVES_K = 2,
     int TW_M = 1, int TW_N = 2,
     int PAD_K_MC = 16>
-inline void mlp1_mxfp4_optimized_unified_A_bf16(
-    float *C, const __hip_bfloat16 *A_bf16,
+inline void mlp1_mxfp4_optimized_unified_A_bf16_out(
+    __hip_bfloat16 *C_bf16, const __hip_bfloat16 *A_bf16,
     const uint8_t *W1_packed, const float *S1_scales_f32,
     const int *expert_offsets, const int *expert_counts,
     const int *tile2expert, const int *tile2local,
@@ -2402,9 +2391,8 @@ inline void mlp1_mxfp4_optimized_unified_A_bf16(
     constexpr int BLOCK_N = WN * WAVES_N;
     constexpr int BLOCK_K = WK * WAVES_K;
 
-    // grid over N and the logical M tiles
     dim3 grid((N + BLOCK_N - 1) / BLOCK_N, cur_tiles);
-    dim3 block(64, (WAVES_M / TW_M) * (WAVES_N / TW_N)); // effective waves
+    dim3 block(64, (WAVES_M / TW_M) * (WAVES_N / TW_N));
 
     constexpr int ldA = BLOCK_K + PAD_K_MC;
     constexpr int ldB = BLOCK_K + PAD_K_MC;
@@ -2412,38 +2400,45 @@ inline void mlp1_mxfp4_optimized_unified_A_bf16(
         sizeof(uint16_t) * (size_t)(BLOCK_M * ldA + ldB * BLOCK_N);
 
 #ifdef assert_smem_or_die
-    assert_smem_or_die(shmem_bytes, "grouped_mlp1_mxfp4_kernel_unified_A_bf16");
+    assert_smem_or_die(shmem_bytes, "grouped_mlp1_mxfp4_kernel_unified_A_bf16_out_bf16");
 #endif
 
     hipLaunchKernelGGL(
-        (grouped_mlp1_mxfp4_kernel_unified_A_bf16<
+        (grouped_mlp1_mxfp4_kernel_unified_A_bf16_out_bf16<
             WM, WN, WK,
             WAVES_M, WAVES_N, WAVES_K,
             TW_M, TW_N,
             PAD_K_MC>),
         grid, block, shmem_bytes, s,
-        C, A_bf16, W1_packed, S1_scales_f32,
-        expert_offsets, expert_counts,
-        tile2expert, tile2local,
-        E, K, N);
+        /*C*/ C_bf16,
+        /*A*/ A_bf16,
+        /*W*/ W1_packed,
+        /*S*/ S1_scales_f32,
+        /*routing*/ expert_offsets, expert_counts,
+        /*tiles*/   tile2expert, tile2local,
+        /*E,K,N*/ E, K, N);
     HIP_CHECK(hipGetLastError());
 }
 
+/* =========================================================================
+   MLP2 + bias: unified MXFP4 (A in bf16) -> OUT in __hip_bfloat16
+   ========================================================================= */
 template <
     int WM, int WN, int WK,
     int WAVES_M, int WAVES_N, int WAVES_K,
     int TW_M, int TW_N,
     int PAD_K_MC>
-__global__ __launch_bounds__(64 * ((WAVES_M / TW_M) * (WAVES_N / TW_N)), 2) void grouped_mlp2_mxfp4_bias_kernel_unified_A_bf16(
-    float *__restrict__ C,                        // [sum_tokens, N]
-    const __hip_bfloat16 *__restrict__ A_bf16,    // [sum_tokens, K]  <<< bf16 inputs
-    const uint8_t *__restrict__ W_packed_layer,   // [E, ceil(N*K/2)]
-    const float *__restrict__ S_scales_f32_layer, // [E, ceil(N*K/32)]
-    const __hip_bfloat16 *__restrict__ b2,        // [E, N] bf16
-    const int *__restrict__ expert_offsets,       // [E]
-    const int *__restrict__ expert_counts,        // [E]
-    const int *__restrict__ tile2expert,          // [num_mtiles]
-    const int *__restrict__ tile2local,           // [num_mtiles]
+__global__ __launch_bounds__(64 * ((WAVES_M / TW_M) * (WAVES_N / TW_N)), 2)
+void grouped_mlp2_mxfp4_bias_kernel_unified_A_bf16_out_bf16(
+    __hip_bfloat16 *__restrict__ C,              // [sum_tokens, N] <<< bf16 output
+    const __hip_bfloat16 *__restrict__ A_bf16,   // [sum_tokens, K]
+    const uint8_t *__restrict__ W_packed_layer,  // [E, ceil(N*K/2)]
+    const float   *__restrict__ S_scales_f32_layer,// [E, ceil(N*K/32)]
+    const __hip_bfloat16 *__restrict__ b2,       // [E, N] bf16 bias
+    const int *__restrict__ expert_offsets,      // [E]
+    const int *__restrict__ expert_counts,       // [E]
+    const int *__restrict__ tile2expert,         // [num_mtiles]
+    const int *__restrict__ tile2local,          // [num_mtiles]
     int E, int K, int N)
 {
     static_assert(WM == 16 && WN == 16 && WK == 16, "MFMA 16x16x16");
@@ -2457,12 +2452,11 @@ __global__ __launch_bounds__(64 * ((WAVES_M / TW_M) * (WAVES_N / TW_N)), 2) void
     static_assert((PAD_K_MC % 2) == 0, "PAD_K_MC even");
 
     const int mtile_id = blockIdx.y;
-    const int e = tile2expert[mtile_id];
-    const int tile_m = tile2local[mtile_id];
-    const int m_start = expert_offsets[e] + tile_m * BLOCK_M;
-    const int m_left = expert_counts[e] - tile_m * BLOCK_M;
-    if (m_left <= 0)
-        return;
+    const int e        = tile2expert[mtile_id];
+    const int tile_m   = tile2local[mtile_id];
+    const int m_start  = expert_offsets[e] + tile_m * BLOCK_M;
+    const int m_left   = expert_counts[e] - tile_m * BLOCK_M;
+    if (m_left <= 0) return;
 
     const int n0 = blockIdx.x * BLOCK_N;
     const int m0 = m_start;
@@ -2496,22 +2490,22 @@ __global__ __launch_bounds__(64 * ((WAVES_M / TW_M) * (WAVES_N / TW_N)), 2) void
             acc[tm][tn] = {0.f, 0.f, 0.f, 0.f};
 
     const int threadsPerBlock = blockDim.x * blockDim.y;
-    const int linearT = wave * blockDim.x + lane;
+    const int linearT         = wave * blockDim.x + lane;
 
-    const size_t seg_elems = (size_t)N * (size_t)K;
-    const size_t seg_bytes = (seg_elems + 1) / 2;
+    const size_t seg_elems  = (size_t)N * (size_t)K;
+    const size_t seg_bytes  = (seg_elems + 1) / 2;
     const size_t seg_blocks = (seg_elems + 31) / 32;
-    const uint8_t *__restrict__ W_e_packed = W_packed_layer + (size_t)e * seg_bytes;
-    const float *__restrict__ S_f32_e = S_scales_f32_layer + (size_t)e * seg_blocks;
+    const uint8_t *__restrict__ W_e_packed = W_packed_layer    + (size_t)e * seg_bytes;
+    const float   *__restrict__ S_f32_e    = S_scales_f32_layer + (size_t)e * seg_blocks;
     const __hip_bfloat16 *__restrict__ b_e = b2 + (size_t)e * (size_t)N;
 
     const int M_bound = m_start + m_left;
 
     for (int k0 = 0; k0 < K; k0 += BLOCK_K)
     {
-        // A: bf16 -> LDS bf16 (128b vectorized)
+        // A: bf16 -> LDS (vectorized)
         copy_A_tile_vec128_bf16<BLOCK_M, BLOCK_K, ldA>(
-            sA_u32, A_bf16, m_start, M_bound, K, k0, linearT, threadsPerBlock);
+            sA_u32, A_bf16, m0, M_bound, K, k0, linearT, threadsPerBlock);
 
         // B: MXFP4 -> bf16
         copy_B_tile_vec_MXFP4_hybrid<BLOCK_N, BLOCK_K, ldB>(
@@ -2524,15 +2518,13 @@ __global__ __launch_bounds__(64 * ((WAVES_M / TW_M) * (WAVES_N / TW_N)), 2) void
         {
             bf16x4 avec[TW_M];
 #pragma unroll
-            for (int tm = 0; tm < TW_M; ++tm)
-            {
+            for (int tm = 0; tm < TW_M; ++tm) {
                 const int aRowBase = aBase0 + tm * WM;
                 avec[tm] = make_a_vec_k(sA_u16, ldA, aRowBase, kk, lane);
             }
             bf16x4 bvec[TW_N];
 #pragma unroll
-            for (int tn = 0; tn < TW_N; ++tn)
-            {
+            for (int tn = 0; tn < TW_N; ++tn) {
                 const int bColBase = bBase0 + tn * WN;
                 bvec[tn] = make_b_vec_k(sB_u16, ldB, bColBase, kk, lane);
             }
@@ -2546,7 +2538,7 @@ __global__ __launch_bounds__(64 * ((WAVES_M / TW_M) * (WAVES_N / TW_N)), 2) void
         __syncthreads();
     }
 
-    // Stores with bias (same as your fp32-A version)
+    // Stores with bias -> bf16
 #pragma unroll
     for (int tm = 0; tm < TW_M; ++tm)
     {
@@ -2555,26 +2547,28 @@ __global__ __launch_bounds__(64 * ((WAVES_M / TW_M) * (WAVES_N / TW_N)), 2) void
         for (int tn = 0; tn < TW_N; ++tn)
         {
             const int col = n0 + (bBase0 + tn * WN) + lane_row(lane);
-            const float bias = (col < N) ? __bfloat162float(b_e[col]) : 0.0f;
+            const float bias_f = (col < N) ? __bfloat162float(b_e[col]) : 0.0f;
 #pragma unroll
             for (int i = 0; i < 4; ++i)
             {
                 const int row = rowBase + i;
-                if (row < M_bound && col < N)
-                    C[(size_t)row * N + col] = acc[tm][tn][i] + bias;
+                if (row < M_bound && col < N) {
+                    const float out_f = acc[tm][tn][i] + bias_f;
+                    C[(size_t)row * N + col] = __float2bfloat16(out_f);
+                }
             }
         }
     }
 }
 
-// ========== NEW: launcher for the bf16-A unified MLP2 ==========
+/* ===== launcher for bf16 OUT (MLP2 + bias) ===== */
 template <
     int WM = 16, int WN = 16, int WK = 16,
     int WAVES_M = 1, int WAVES_N = 8, int WAVES_K = 2,
     int TW_M = 1, int TW_N = 2,
     int PAD_K_MC = 16>
-inline void mlp2_mxfp4_bias_optimized_unified_A_bf16(
-    float *C, const __hip_bfloat16 *A_bf16, // <<< bf16 A
+inline void mlp2_mxfp4_bias_optimized_unified_A_bf16_out(
+    __hip_bfloat16 *C_bf16, const __hip_bfloat16 *A_bf16,
     const uint8_t *W_packed, const float *S_scales_f32,
     const __hip_bfloat16 *bias_bf16,
     const int *expert_offsets, const int *expert_counts,
@@ -2594,26 +2588,28 @@ inline void mlp2_mxfp4_bias_optimized_unified_A_bf16(
         sizeof(uint16_t) * (size_t)(BLOCK_M * ldA + ldB * BLOCK_N);
 
 #ifdef assert_smem_or_die
-    assert_smem_or_die(shmem_bytes, "grouped_mlp2_mxfp4_bias_kernel_unified_A_bf16");
+    assert_smem_or_die(shmem_bytes, "grouped_mlp2_mxfp4_bias_kernel_unified_A_bf16_out_bf16");
 #endif
 
     hipLaunchKernelGGL(
-        (grouped_mlp2_mxfp4_bias_kernel_unified_A_bf16<
+        (grouped_mlp2_mxfp4_bias_kernel_unified_A_bf16_out_bf16<
             WM, WN, WK,
             WAVES_M, WAVES_N, WAVES_K,
             TW_M, TW_N,
             PAD_K_MC>),
         grid, block, shmem_bytes, s,
-        /*C*/ C,
+        /*C*/ C_bf16,
         /*A*/ A_bf16,
         /*W*/ W_packed,
         /*S*/ S_scales_f32,
         /*b*/ bias_bf16,
         /*routing*/ expert_offsets, expert_counts,
-        /*tiles*/ tile2expert, tile2local,
+        /*tiles*/   tile2expert, tile2local,
         /*E,K,N*/ E, K, N);
     HIP_CHECK(hipGetLastError());
 }
+
+
 
 // ===================================
 // mlp1: bf16 output kernel + launcher
