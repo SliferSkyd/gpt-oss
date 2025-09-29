@@ -1,5 +1,7 @@
 // bench_gemm.cpp
-// Benchmark and autotune the mfma_bf16_kernel_vec128_singlebuf matmul kernel.
+// Baseline vs optimized (small-M) mfma_bf16 matmul benchmark.
+// - Baseline: matmul_vec128_singlebuf with config 16 16 16  4 8 4  1 2 4
+// - Optimized: new small-M kernel+launcher (matmul_smallM_opt) for M in {1,2,3,4}, N=1440, K=2880
 
 #include <hip/hip_runtime.h>
 #include <hip/hip_bf16.h>
@@ -20,10 +22,13 @@
 #include "../utils.hpp"
 #include "../kernels/matmul.hpp"
 
+// -------------------------------------------------------------------------------------
+// CLI and stats
+// -------------------------------------------------------------------------------------
 struct CliOptions {
-    int M = 1024;
+    int M = 3712;         // keep same defaults as the previous version
     int K = 2880;
-    int N = 4096;
+    int N = 1440;
     int warmup = 5;
     int iters = 50;
     unsigned seed = 123u;
@@ -37,15 +42,6 @@ struct TimingStats {
     double stddev_ms = 0.0;
     double min_ms = 0.0;
     double max_ms = 0.0;
-};
-
-struct KernelStats {
-    std::string name;
-    TimingStats timing;
-    double gflops = 0.0;
-    double speedup = 1.0;
-    double max_abs = 0.0;
-    double max_rel = 0.0;
 };
 
 static inline float frand(std::mt19937 &rng) {
@@ -110,23 +106,26 @@ static void compute_errors(const float *ref, const float *test, size_t elems,
     }
 }
 
-template <int WM, int WN, int WK,
-          int WAVES_M, int WAVES_N, int WAVES_K,
-          int TW_M, int TW_N, int PAD_K_MC>
-static TimingStats run_matmul_kernel(float *dC,
-                                     const float *dA,
-                                     const __hip_bfloat16 *dW,
-                                     int M, int K, int N,
-                                     hipStream_t stream,
-                                     hipEvent_t ev_start,
-                                     hipEvent_t ev_stop,
-                                     int warmup,
-                                     int iters) {
+// -------------------------------------------------------------------------------------
+// Baseline runner: matmul_vec128_singlebuf<16,16,16, 4,8,4, 1,2,4, false>
+// -------------------------------------------------------------------------------------
+static TimingStats run_baseline(float *dC,
+                                const float *dA,
+                                const __hip_bfloat16 *dW,
+                                int M, int K, int N,
+                                hipStream_t stream,
+                                hipEvent_t ev_start,
+                                hipEvent_t ev_stop,
+                                int warmup,
+                                int iters) {
     const auto launch = [&]() {
-        matmul_vec128_singlebuf<WM, WN, WK,
-                                WAVES_M, WAVES_N, WAVES_K,
-                                TW_M, TW_N, PAD_K_MC, false>(
-            dC, dA, dW, M, K, N, nullptr, stream);
+        matmul_vec128_singlebuf<
+            16, 16, 16,   // WM, WN, WK
+            4,  8,  4,    // WAVES_M, WAVES_N, WAVES_K
+            1,  2,        // TW_M, TW_N
+            4,            // PAD_K_MC
+            false         // FUSED
+        >(dC, dA, dW, M, K, N, /*bias=*/nullptr, stream);
     };
 
     for (int i = 0; i < warmup; ++i) launch();
@@ -134,7 +133,6 @@ static TimingStats run_matmul_kernel(float *dC,
 
     std::vector<float> samples;
     samples.reserve(iters);
-
     for (int i = 0; i < iters; ++i) {
         HIP_CHECK(hipEventRecord(ev_start, stream));
         launch();
@@ -147,50 +145,51 @@ static TimingStats run_matmul_kernel(float *dC,
 
     HIP_CHECK(hipStreamSynchronize(stream));
     HIP_CHECK(hipGetLastError());
-
     return summarize_samples(samples);
 }
 
-template <int WM, int WN, int WK,
-          int WAVES_M, int WAVES_N, int WAVES_K,
-          int TW_M, int TW_N, int PAD_K_MC>
-static KernelStats benchmark_variant(const std::string &name,
-                                     float *dC,
-                                     const float *dA,
-                                     const __hip_bfloat16 *dW,
-                                     int M, int K, int N,
-                                     hipStream_t stream,
-                                     hipEvent_t ev_start,
-                                     hipEvent_t ev_stop,
-                                     int warmup,
-                                     int iters,
-                                     size_t bytes_c,
-                                     double flop_count,
-                                     double baseline_avg_ms,
-                                     bool compare_outputs,
-                                     std::vector<float> *h_tmp,
-                                     const std::vector<float> *h_ref) {
-    HIP_CHECK(hipMemset(dC, 0, bytes_c));
-    const TimingStats timing = run_matmul_kernel<WM, WN, WK,
-                                                 WAVES_M, WAVES_N, WAVES_K,
-                                                 TW_M, TW_N, PAD_K_MC>(
-        dC, dA, dW, M, K, N, stream, ev_start, ev_stop, warmup, iters);
+// -------------------------------------------------------------------------------------
+// Optimized (new) kernel launcher path for small M
+// Assumes a new function exists in matmul.hpp:
+//     void matmul_smallM_opt(float* C, const float* A, const __hip_bfloat16* Wbf16,
+//                            int M, int K, int N, hipStream_t stream);
+// -------------------------------------------------------------------------------------
+static TimingStats run_smallM_optimized(float *dC,
+                                        const float *dA,
+                                        const __hip_bfloat16 *dW,
+                                        int M, int K, int N,
+                                        hipStream_t stream,
+                                        hipEvent_t ev_start,
+                                        hipEvent_t ev_stop,
+                                        int warmup,
+                                        int iters) {
+    const auto launch = [&]() {
+        matmul_smallM_opt(dC, dA, dW, M, K, N, stream);
+    };
 
-    KernelStats stats;
-    stats.name = name;
-    stats.timing = timing;
-    stats.gflops = (flop_count * 1e-6) / timing.avg_ms;
-    stats.speedup = baseline_avg_ms > 0.0 ? baseline_avg_ms / timing.avg_ms : 1.0;
+    for (int i = 0; i < warmup; ++i) launch();
+    HIP_CHECK(hipStreamSynchronize(stream));
 
-    if (compare_outputs && h_tmp && h_ref) {
-        HIP_CHECK(hipMemcpy(h_tmp->data(), dC, bytes_c, hipMemcpyDeviceToHost));
-        compute_errors(h_ref->data(), h_tmp->data(), bytes_c / sizeof(float),
-                       stats.max_abs, stats.max_rel);
+    std::vector<float> samples;
+    samples.reserve(iters);
+    for (int i = 0; i < iters; ++i) {
+        HIP_CHECK(hipEventRecord(ev_start, stream));
+        launch();
+        HIP_CHECK(hipEventRecord(ev_stop, stream));
+        HIP_CHECK(hipEventSynchronize(ev_stop));
+        float ms = 0.0f;
+        HIP_CHECK(hipEventElapsedTime(&ms, ev_start, ev_stop));
+        samples.push_back(ms);
     }
 
-    return stats;
+    HIP_CHECK(hipStreamSynchronize(stream));
+    HIP_CHECK(hipGetLastError());
+    return summarize_samples(samples);
 }
 
+// -------------------------------------------------------------------------------------
+// CPU reference (optional, used by validation)
+// -------------------------------------------------------------------------------------
 static void host_reference(const std::vector<float> &hA,
                            const std::vector<float> &hW,
                            std::vector<float> &hC,
@@ -252,16 +251,13 @@ static void run_validation(const CliOptions &opts) {
     HIP_CHECK(hipEventCreate(&ev_stop));
 
     HIP_CHECK(hipMemset(dC, 0, bytes_C));
-    const TimingStats timing = run_matmul_kernel<16, 16, 16,
-                                                1, 8, 2,
-                                                1, 2, 16>(
-        dC, dA, dW, M, K, N, stream, ev_start, ev_stop,
-        opts.warmup, opts.iters);
+    const TimingStats timing = run_baseline(dC, dA, dW, M, K, N,
+                                            stream, ev_start, ev_stop,
+                                            opts.warmup, opts.iters);
 
     HIP_CHECK(hipMemcpy(hC_gpu.data(), dC, bytes_C, hipMemcpyDeviceToHost));
 
-    double max_abs = 0.0;
-    double max_rel = 0.0;
+    double max_abs = 0.0, max_rel = 0.0;
     compute_errors(hC_cpu.data(), hC_gpu.data(), elems_C, max_abs, max_rel);
 
     printf("Validation shape M=%d K=%d N=%d\n", M, K, N);
@@ -278,6 +274,10 @@ static void run_validation(const CliOptions &opts) {
     HIP_CHECK(hipFree(dC));
 }
 
+// -------------------------------------------------------------------------------------
+// Run a single benchmark: Baseline (always). If shape is small-M (M<=4, N=1440, K=2880),
+// also time the optimized kernel and compare outputs (baseline vs optimized).
+// -------------------------------------------------------------------------------------
 static void run_single_benchmark(const CliOptions &opts) {
     const int M = opts.M;
     const int K = opts.K;
@@ -305,25 +305,24 @@ static void run_single_benchmark(const CliOptions &opts) {
     for (size_t i = 0; i < elems_W; ++i) {
         const float v = frand(rng);
         hW_float[i] = v;
-        hW_bf16[i] = f2bf16(v);
+        hW_bf16[i]  = f2bf16(v);
     }
 
-    std::vector<float> hC_ref;
-    std::vector<float> hC_tmp;
+    std::vector<float> hC_base, hC_opt;
     if (opts.compare_outputs) {
-        hC_ref.resize(elems_C);
-        hC_tmp.resize(elems_C);
+        hC_base.resize(elems_C);
+        hC_opt.resize(elems_C);
     }
 
     float *dA = nullptr;
     __hip_bfloat16 *dW = nullptr;
     float *dC_base = nullptr;
-    float *dC_opt = nullptr;
+    float *dC_opt  = nullptr;
 
     HIP_CHECK(hipMalloc(&dA, bytes_A));
     HIP_CHECK(hipMalloc(&dW, bytes_W));
     HIP_CHECK(hipMalloc(&dC_base, bytes_C));
-    HIP_CHECK(hipMalloc(&dC_opt, bytes_C));
+    HIP_CHECK(hipMalloc(&dC_opt,  bytes_C));
 
     HIP_CHECK(hipMemcpy(dA, hA.data(), bytes_A, hipMemcpyHostToDevice));
     HIP_CHECK(hipMemcpy(dW, hW_bf16.data(), bytes_W, hipMemcpyHostToDevice));
@@ -336,78 +335,52 @@ static void run_single_benchmark(const CliOptions &opts) {
 
     const double flop_count = 2.0 * static_cast<double>(M) * N * K;
 
-    // Baseline (default instantiation)
+    // ---- Baseline ----
     HIP_CHECK(hipMemset(dC_base, 0, bytes_C));
-    const TimingStats baseline_timing = run_matmul_kernel<16, 16, 16,
-                                                         4, 4, 4,
-                                                         1, 2, 4>(
-        dC_base, dA, dW, M, K, N, stream, ev_start, ev_stop,
-        opts.warmup, opts.iters);
-
-    const double baseline_gflops = (flop_count * 1e-6) / baseline_timing.avg_ms;
+    const TimingStats base_timing = run_baseline(dC_base, dA, dW, M, K, N,
+                                                 stream, ev_start, ev_stop,
+                                                 opts.warmup, opts.iters);
+    const double base_gflops = (flop_count * 1e-6) / base_timing.avg_ms;
     if (opts.compare_outputs) {
-        HIP_CHECK(hipMemcpy(hC_ref.data(), dC_base, bytes_C, hipMemcpyDeviceToHost));
+        HIP_CHECK(hipMemcpy(hC_base.data(), dC_base, bytes_C, hipMemcpyDeviceToHost));
     }
 
-    printf("\nBaseline (matmul_vec128_singlebuf defaults):\n");
+    printf("\nBaseline (vec128 singlebuf @ waves=4x8x4, tw=1x2, pad=4):\n");
     printf("  avg %.3f ms  min %.3f  max %.3f  stddev %.4f  |  %.2f GFLOP/s\n",
-           baseline_timing.avg_ms,
-           baseline_timing.min_ms,
-           baseline_timing.max_ms,
-           baseline_timing.stddev_ms,
-           baseline_gflops);
+           base_timing.avg_ms,
+           base_timing.min_ms,
+           base_timing.max_ms,
+           base_timing.stddev_ms,
+           base_gflops);
 
-    std::vector<KernelStats> variants;
-    variants.reserve(8);
+    // ---- Optimized (only when small-M shape matches the intended target) ----
+    const bool smallM_shape = (M >= 1 && M <= 128 && N == 1440 && K == 2880);
+    if (smallM_shape) {
+        HIP_CHECK(hipMemset(dC_opt, 0, bytes_C));
+        const TimingStats opt_timing = run_smallM_optimized(dC_opt, dA, dW, M, K, N,
+                                                            stream, ev_start, ev_stop,
+                                                            opts.warmup, opts.iters);
+        const double opt_gflops = (flop_count * 1e-6) / opt_timing.avg_ms;
 
-#define RUN_VARIANT(LABEL, WM, WN, WK, WMV, WNV, WKV, TWM, TWN, PAD) \
-    variants.push_back(benchmark_variant<WM, WN, WK, WMV, WNV, WKV, TWM, TWN, PAD>( \
-        LABEL, dC_opt, dA, dW, M, K, N, \
-        stream, ev_start, ev_stop, \
-        opts.warmup, opts.iters, \
-        bytes_C, flop_count, baseline_timing.avg_ms, \
-        opts.compare_outputs, opts.compare_outputs ? &hC_tmp : nullptr, \
-        opts.compare_outputs ? &hC_ref : nullptr))
+        printf("\nOptimized small-M kernel:\n");
+        printf("  avg %.3f ms  min %.3f  max %.3f  stddev %.4f  |  %.2f GFLOP/s\n",
+               opt_timing.avg_ms,
+               opt_timing.min_ms,
+               opt_timing.max_ms,
+               opt_timing.stddev_ms,
+               opt_gflops);
 
-    RUN_VARIANT("waves=1x8x2 tw=1x1 pad=16", 16, 16, 16, 1, 8, 2, 1, 1, 16);
-    RUN_VARIANT("waves=1x8x2 tw=1x2 pad=8", 16, 16, 16, 1, 8, 2, 1, 2, 8);
-    RUN_VARIANT("waves=2x4x2 tw=1x2 pad=16", 16, 16, 16, 2, 4, 2, 1, 2, 16);
-    RUN_VARIANT("waves=2x8x2 tw=1x2 pad=16", 16, 16, 16, 2, 8, 2, 1, 2, 16);
-    RUN_VARIANT("waves=1x4x4 tw=1x2 pad=16", 16, 16, 16, 1, 4, 4, 1, 2, 16);
-    RUN_VARIANT("waves=1x8x4 tw=1x2 pad=16", 16, 16, 16, 1, 8, 4, 1, 2, 16);
-    RUN_VARIANT("waves=4x8x4 tw=1x2 pad=4", 16, 16, 16, 4, 8, 4, 1, 2, 4);
+        printf("\nSpeedup vs baseline: %.3fx\n", base_timing.avg_ms / opt_timing.avg_ms);
 
-
-#undef RUN_VARIANT
-
-    if (!variants.empty()) {
-        std::sort(variants.begin(), variants.end(),
-                  [](const KernelStats &a, const KernelStats &b) {
-                      return a.timing.avg_ms < b.timing.avg_ms;
-                  });
-
-        printf("\n--- Autotune Variants (baseline speed = 1.00x) ---\n");
-        for (const auto &res : variants) {
-            printf("%-32s  avg %.3f ms  |  %.2f GFLOP/s  |  speedup %.3fx",
-                   res.name.c_str(),
-                   res.timing.avg_ms,
-                   res.gflops,
-                   res.speedup);
-            if (opts.compare_outputs) {
-                const bool ok = (res.max_abs < 1e-4) && (res.max_rel < 1e-4);
-                printf("  |  max_abs=%.3g  max_rel=%.3g  %s",
-                       res.max_abs,
-                       res.max_rel,
-                       ok ? "OK" : "WARN");
-            }
-            printf("\n");
+        if (opts.compare_outputs) {
+            HIP_CHECK(hipMemcpy(hC_opt.data(), dC_opt, bytes_C, hipMemcpyDeviceToHost));
+            double max_abs = 0.0, max_rel = 0.0;
+            compute_errors(hC_base.data(), hC_opt.data(), elems_C, max_abs, max_rel);
+            printf("Output diff (baseline vs optimized): max_abs=%.3g  max_rel=%.3g  %s\n",
+                   max_abs, max_rel, (max_abs < 1e-4 && max_rel < 1e-4) ? "OK" : "WARN");
         }
-
-        const auto &best = variants.front();
-        printf("\nBest config: %s (avg %.3f ms, speedup %.3fx)\n",
-               best.name.c_str(),
-               best.timing.avg_ms,
-               best.speedup);
+    } else {
+        printf("\nOptimized small-M kernel not run (shape not targeted: requires M in {1..4}, N=1440, K=2880).\n");
     }
 
     HIP_CHECK(hipEventDestroy(ev_start));
@@ -419,6 +392,9 @@ static void run_single_benchmark(const CliOptions &opts) {
     HIP_CHECK(hipFree(dC_opt));
 }
 
+// -------------------------------------------------------------------------------------
+// Real-case scenario (kept, but uses baseline only; small-M optimized path is not relevant)
+// -------------------------------------------------------------------------------------
 struct RealCase {
     const char *label;
     int repeats;
@@ -445,7 +421,6 @@ static void run_real_scenario(const CliOptions &opts) {
         local.M = rc.M;
         local.K = rc.K;
         local.N = rc.N;
-        local.compare_outputs = false; // avoid massive host transfers
 
         const size_t elems_A = static_cast<size_t>(local.M) * local.K;
         const size_t elems_W = static_cast<size_t>(local.N) * local.K;
@@ -477,12 +452,9 @@ static void run_real_scenario(const CliOptions &opts) {
         HIP_CHECK(hipEventCreate(&ev_stop));
 
         HIP_CHECK(hipMemset(dC, 0, bytes_C));
-        const TimingStats timing = run_matmul_kernel<16, 16, 16,
-                                                    1, 8, 2,
-                                                    1, 2, 16>(
-            dC, dA, dW, local.M, local.K, local.N,
-            stream, ev_start, ev_stop,
-            local.warmup, local.iters);
+        const TimingStats timing = run_baseline(dC, dA, dW, local.M, local.K, local.N,
+                                                stream, ev_start, ev_stop,
+                                                local.warmup, local.iters);
 
         const double avg_ms = timing.avg_ms;
         const double std_ms = timing.stddev_ms;
@@ -511,17 +483,20 @@ static void run_real_scenario(const CliOptions &opts) {
     printf("Total execution time: %.3f ms\n", total_ms);
 }
 
+// -------------------------------------------------------------------------------------
+// CLI parsing / main
+// -------------------------------------------------------------------------------------
 static void print_usage(const char *prog) {
     printf("Usage: %s [options]\n", prog);
-    printf("  --M <int>           Rows of A/C (default 1024)\n");
+    printf("  --M <int>           Rows of A/C (default 3712)\n");
     printf("  --K <int>           Common dimension (default 2880)\n");
-    printf("  --N <int>           Columns of C (default 4096)\n");
+    printf("  --N <int>           Columns of C (default 1440)\n");
     printf("  --warmup <int>      Warmup iterations (default 5)\n");
     printf("  --iters <int>       Timed iterations (default 50)\n");
     printf("  --seed <int>        RNG seed (default 123)\n");
-    printf("  --validate          Run small-shape CPU validation\n");
-    printf("  --real-case         Run predefined real workload mix\n");
-    printf("  --no-compare        Skip baseline vs variant comparisons\n");
+    printf("  --validate          Run small-shape CPU validation (baseline)\n");
+    printf("  --real-case         Run predefined real workload mix (baseline only)\n");
+    printf("  --no-compare        Skip baseline vs optimized comparison\n");
     printf("  --help              Show this message\n");
 }
 
