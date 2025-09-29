@@ -1,5 +1,5 @@
 // bench_moe.cpp
-// Benchmark the legacy fp32 MLP1 path vs the bf16 unified grouped kernel
+// Benchmark the (baseline) bf16 mlp1_optimized vs other bf16 unified grouped kernel variants
 // Uses the MoE microkernel path from moe.hpp
 
 #include <hip/hip_runtime.h>
@@ -16,7 +16,7 @@
 // Make sure your include path finds the header you pasted above.
 #include "../utils.hpp"
 #include "../kernels/matmul.hpp"
-#include "../kernels/moe.hpp"  // provides mlp1<...> and BLOCK_M_MLP, etc.
+#include "../kernels/moe.hpp"  // provides mlp1_optimized<...> and BLOCK_M_MLP, etc.
 
 #ifndef HIP_CHECK
 #define HIP_CHECK(cmd) do { \
@@ -29,9 +29,32 @@
 #endif
 
 // ----- Config from the prompt -----
+// struct SimConfig {
+//   int num_hidden_layers = 24;
+//   int num_experts       = 32;   // E
+//   int experts_per_token = 4;    // K_topk (routing)
+//   int vocab_size        = 201088;
+//   int hidden_size       = 2880; // H
+//   int intermediate_size = 2880; // D
+//   float swiglu_limit    = 7.0f;
+//   int head_dim          = 64;
+//   int num_attention_heads = 64;
+//   int num_key_value_heads = 8;
+//   int sliding_window      = 128;
+//   int initial_context_length = 4096;
+//   int rope_theta = 150000;
+//   float rope_scaling_factor = 32.0f;
+//   int rope_ntk_alpha = 1;
+//   int rope_ntk_beta  = 32;
+//   // Benchmark harness knobs:
+//   int BATCH_SIZE = 1024;
+//   int _MAX_SEQ_LEN = 1024;
+//   int TP = 2;
+// };
+
 struct SimConfig {
-  int num_hidden_layers = 24;
-  int num_experts       = 32;   // E
+  int num_hidden_layers = 36;
+  int num_experts       = 128;   // E
   int experts_per_token = 4;    // K_topk (routing)
   int vocab_size        = 201088;
   int hidden_size       = 2880; // H
@@ -49,9 +72,8 @@ struct SimConfig {
   // Benchmark harness knobs:
   int BATCH_SIZE = 1024;
   int _MAX_SEQ_LEN = 1024;
-  int TP = 2;
+  int TP = 4;
 };
-
 
 // Random helpers
 static inline float frand(std::mt19937 &rng) {
@@ -87,7 +109,7 @@ struct TuneResult {
 
 static float time_baseline_kernel(
     float *dC,
-    const float *dA,
+    const __hip_bfloat16 *dA,
     const __hip_bfloat16 *dW1,
     const int *d_offsets,
     const int *d_counts,
@@ -100,7 +122,7 @@ static float time_baseline_kernel(
     int warmup, int iters)
 {
   for (int i = 0; i < warmup; ++i) {
-    mlp1<16,16,16, 2,4,2, 1,1, 8>(
+    mlp1_optimized<16,16,16, 4,8,4, 1,2, 4>(
         dC, dA, dW1, d_offsets, d_counts, d_t2e, d_t2l,
         E, K, N, cur_tiles, stream);
   }
@@ -108,7 +130,7 @@ static float time_baseline_kernel(
 
   HIP_CHECK(hipEventRecord(ev_start, stream));
   for (int i = 0; i < iters; ++i) {
-    mlp1<16,16,16, 4,4,2, 1,1, 8>(
+    mlp1_optimized<16,16,16, 4,8,4, 1,2, 4>(
         dC, dA, dW1, d_offsets, d_counts, d_t2e, d_t2l,
         E, K, N, cur_tiles, stream);
   }
@@ -348,9 +370,9 @@ int main(int argc, char** argv)
   HIP_CHECK(hipMemset(d_C_ref, 0, out_bytes));
   HIP_CHECK(hipMemset(d_C_opt, 0, out_bytes));
 
-  // Baseline
-  mlp1<16,16,16, 4,4,2, 1,1, 8>(
-      d_C_ref, d_A_fp32, d_W1,
+  // Baseline: mlp1_optimized<16,16,16, 4,8,4, 1,2, 4> with bf16 activations/weights
+  mlp1_optimized<16,16,16, 4,8,4, 1,2, 4>(
+      d_C_ref, d_A_bf16, d_W1,
       d_offsets, d_counts,
       d_t2e, d_t2l,
       /*E=*/E, /*K=H*/H, /*N=o_len*/o_len, /*cur_tiles=*/cur_tiles, stream);
@@ -366,7 +388,7 @@ int main(int argc, char** argv)
   HIP_CHECK(hipEventCreate(&ev_stop));
 
   const float t_base_ms = time_baseline_kernel(
-      d_C_ref, d_A_fp32, d_W1,
+      d_C_ref, d_A_bf16, d_W1,
       d_offsets, d_counts, d_t2e, d_t2l,
       E, H, o_len, cur_tiles,
       stream, ev_start, ev_stop,
@@ -451,7 +473,7 @@ int main(int argc, char** argv)
 // RUN_VARIANT("waves=4x8x4 tw=2x4 pad=8", 16,16,16, 4,8,4, 2,4, 4);
 // // RUN_VARIANT("waves=4x8x4 tw=4x1 pad=8", 16,16,16, 4,8,4, 4,1, 8);
 // RUN_VARIANT("waves=4x8x4 tw=4x2 pad=8", 16,16,16, 4,8,4, 4,2, 4);
-// RUN_VARIANT("waves=4x8x4 tw=4x4 pad=8", 16,16,16, 4,8,4, 4,4, 4);
+// RUN_VARIANT("waves=4x8x4 tw=4x4 pad=8", 16,16,16,  4,8,4, 4,4, 4);
 
 
 // RUN_VARIANT("waves=4x8x4 tw=1x2 pad=8", 16,16,16, 8,16,4, 2,4, 4);
@@ -468,11 +490,15 @@ int main(int argc, char** argv)
   RUN_VARIANT("waves=4x4x4 tw=1x2 pad=4", 16,16,16, 4,4,4, 1,2, 6);
   RUN_VARIANT("waves=4x4x4 tw=1x2 pad=4", 16,16,16, 4,4,4, 1,2, 4);
   RUN_VARIANT("waves=4x4x4 tw=1x2 pad=4", 16,16,16, 4,4,4, 1,2, 8);
-  RUN_VARIANT("waves=4x8x4 tw=1x2 pad=4", 16,16,16, 4,8,4, 1,2, 4);
-  RUN_VARIANT("waves=4x8x4 tw=1x2 pad=4", 16,16,16, 4,8,4, 1,2, 6);
-  RUN_VARIANT("waves=4x8x4 tw=1x2 pad=4", 16,16,16, 4,8,4, 1,2, 4);
-  RUN_VARIANT("waves=4x8x4 tw=1x2 pad=4", 16,16,16, 4,8,4, 1,2, 8);
+  RUN_VARIANT("waves=4x8x4 tw=1x2 pad=4", 16,16,16, 4,8,4,  1,2, 4);
+  RUN_VARIANT("waves=4x8x4 tw=1x2 pad=4", 16,16,16, 4,8,4,  1,2, 6);
+  RUN_VARIANT("waves=4x8x4 tw=1x2 pad=4", 16,16,16, 4,8,4,  1,2, 4);
+  RUN_VARIANT("waves=4x8x4 tw=1x2 pad=4", 16,16,16, 4,8,4,  1,2, 8);
 
+  RUN_VARIANT("waves=4x8x4 tw=1x2 pad=4", 16,16,16, 4,16,4,  1,4, 4);
+  RUN_VARIANT("waves=4x8x4 tw=1x2 pad=4", 16,16,16, 4,16,4,  1,4, 6);
+  RUN_VARIANT("waves=4x8x4 tw=1x2 pad=4", 16,16,16, 4,16,4,  1,4, 4);
+  RUN_VARIANT("waves=4x8x4 tw=1x2 pad=4", 16,16,16, 4,16,4,  1,4, 8);
 
 
 
@@ -496,16 +522,16 @@ int main(int argc, char** argv)
 // RUN_VARIANT("waves=8x4x4 tw=2x4 pad=8", 16,16,16, 8,4,4, 2,4, 8);
 // RUN_VARIANT("waves=8x4x4 tw=4x1 pad=8", 16,16,16, 8,4,4, 4,1, 8);
 // RUN_VARIANT("waves=8x4x4 tw=4x2 pad=8", 16,16,16, 8,4,4, 4,2, 8);
-// RUN_VARIANT("waves=8x4x4 tw=4x4 pad=8", 16,16,16, 8,4,4, 4,4, 8);
+// RUN_VARIANT("waves=8x4x4 tw=4x4 pad=8", 16,16,16, 8,4,4,  4,4, 8);
 // RUN_VARIANT("waves=8x8x4 tw=1x1 pad=8", 16,16,16, 8,8,4, 1,1, 8);
 // RUN_VARIANT("waves=8x8x4 tw=1x2 pad=8", 16,16,16, 8,8,4, 1,2, 8);
 // RUN_VARIANT("waves=8x8x4 tw=1x4 pad=8", 16,16,16, 8,8,4, 1,4, 8);
 // RUN_VARIANT("waves=8x8x4 tw=2x1 pad=8", 16,16,16, 8,8,4, 2,1, 8);
 // RUN_VARIANT("waves=8x8x4 tw=2x2 pad=8", 16,16,16, 8,8,4, 2,2, 8);
-// RUN_VARIANT("waves=8x8x4 tw=2x4 pad=8", 16,16,16, 8,8,4, 2,4, 8);
-// RUN_VARIANT("waves=8x8x4 tw=4x1 pad=8", 16,16,16, 8,8,4, 4,1, 8);
-// RUN_VARIANT("waves=8x8x4 tw=4x2 pad=8", 16,16,16, 8,8,4, 4,2, 8);
-// RUN_VARIANT("waves=8x8x4 tw=4x4 pad=8", 16,16,16, 8,8,4, 4,4, 8);
+// RUN_VARIANT("waves=8x8x4 tw=2x4 pad=8", 16,16,16, 8,8,4, 2,4,  8);
+// RUN_VARIANT("waves=8x8x4 tw=4x1 pad=8", 16,16,16, 8,8,4, 4,1,  8);
+// RUN_VARIANT("waves=8x8x4 tw=4x2 pad=8", 16,16,16, 8,8,4, 4,2,  8);
+// RUN_VARIANT("waves=8x8x4 tw=4x4 pad=8", 16,16,16, 8,8,4, 4,4,  8);
 
 // // --- p4 = 16 ---
 // RUN_VARIANT("waves=16x2x4 tw=1x1 pad=8", 16,16,16, 16,2,4, 1,1, 8);
@@ -517,21 +543,21 @@ int main(int argc, char** argv)
 // RUN_VARIANT("waves=16x4x4 tw=1x1 pad=8", 16,16,16, 16,4,4, 1,1, 8);
 // RUN_VARIANT("waves=16x4x4 tw=1x2 pad=8", 16,16,16, 16,4,4, 1,2, 8);
 // RUN_VARIANT("waves=16x4x4 tw=1x4 pad=8", 16,16,16, 16,4,4, 1,4, 8);
-// RUN_VARIANT("waves=16x4x4 tw=2x1 pad=8", 16,16,16, 16,4,4, 2,1, 8);
-// RUN_VARIANT("waves=16x4x4 tw=2x2 pad=8", 16,16,16, 16,4,4, 2,2, 8);
-// RUN_VARIANT("waves=16x4x4 tw=2x4 pad=8", 16,16,16, 16,4,4, 2,4, 8);
-// RUN_VARIANT("waves=16x4x4 tw=4x1 pad=8", 16,16,16, 16,4,4, 4,1, 8);
-// RUN_VARIANT("waves=16x4x4 tw=4x2 pad=8", 16,16,16, 16,4,4, 4,2, 8);
-// RUN_VARIANT("waves=16x4x4 tw=4x4 pad=8", 16,16,16, 16,4,4, 4,4, 8);
-// RUN_VARIANT("waves=16x8x4 tw=1x1 pad=8", 16,16,16, 16,8,4, 1,1, 8);
-// RUN_VARIANT("waves=16x8x4 tw=1x2 pad=8", 16,16,16, 16,8,4, 1,2, 8);
-// RUN_VARIANT("waves=16x8x4 tw=1x4 pad=8", 16,16,16, 16,8,4, 1,4, 8);
-// RUN_VARIANT("waves=16x8x4 tw=2x1 pad=8", 16,16,16, 16,8,4, 2,1, 8);
-// RUN_VARIANT("waves=16x8x4 tw=2x2 pad=8", 16,16,16, 16,8,4, 2,2, 8);
-// RUN_VARIANT("waves=16x8x4 tw=2x4 pad=8", 16,16,16, 16,8,4, 2,4, 8);
-// RUN_VARIANT("waves=16x8x4 tw=4x1 pad=8", 16,16,16, 16,8,4, 4,1, 8);
-// RUN_VARIANT("waves=16x8x4 tw=4x2 pad=8", 16,16,16, 16,8,4, 4,2, 8);
-// RUN_VARIANT("waves=16x8x4 tw=4x4 pad=8", 16,16,16, 16,8,4, 4,4, 8);
+// RUN_VARIANT("waves=16x4x4 tw=2x1 pad=8", 16,16,16, 16,4,4,  2,1, 8);
+// RUN_VARIANT("waves=16x4x4 tw=2x2 pad=8", 16,16,16, 16,4,4,  2,2, 8);
+// RUN_VARIANT("waves=16x4x4 tw=2x4 pad=8", 16,16,16, 16,4,4,  2,4, 8);
+// RUN_VARIANT("waves=16x4x4 tw=4x1 pad=8", 16,16,16, 16,4,4,  4,1, 8);
+// RUN_VARIANT("waves=16x4x4 tw=4x2 pad=8", 16,16,16, 16,4,4,  4,2, 8);
+// RUN_VARIANT("waves=16x4x4 tw=4x4 pad=8", 16,16,16, 16,4,4,  4,4, 8);
+// RUN_VARIANT("waves=16x8x4 tw=1x1 pad=8", 16,16,16, 16,8,4,  1,1, 8);
+// RUN_VARIANT("waves=16x8x4 tw=1x2 pad=8", 16,16,16, 16,8,4,  1,2, 8);
+// RUN_VARIANT("waves=16x8x4 tw=1x4 pad=8", 16,16,16, 16,8,4,  1,4, 8);
+// RUN_VARIANT("waves=16x8x4 tw=2x1 pad=8", 16,16,16, 16,8,4,  2,1, 8);
+// RUN_VARIANT("waves=16x8x4 tw=2x2 pad=8", 16,16,16, 16,8,4,  2,2, 8);
+// RUN_VARIANT("waves=16x8x4 tw=2x4 pad=8", 16,16,16, 16,8,4,  2,4, 8);
+// RUN_VARIANT("waves=16x8x4 tw=4x1 pad=8", 16,16,16, 16,8,4,  4,1, 8);
+// RUN_VARIANT("waves=16x8x4 tw=4x2 pad=8", 16,16,16, 16,8,4,  4,2, 8);
+// RUN_VARIANT("waves=16x8x4 tw=4x4 pad=8", 16,16,16, 16,8,4,  4,4, 8);
 // RUN_VARIANT("waves=16x16x4 tw=1x1 pad=8", 16,16,16, 16,16,4, 1,1, 8);
 // RUN_VARIANT("waves=16x16x4 tw=1x2 pad=8", 16,16,16, 16,16,4, 1,2, 8);
 // RUN_VARIANT("waves=16x16x4 tw=1x4 pad=8", 16,16,16, 16,16,4, 1,4, 8);
@@ -540,7 +566,7 @@ int main(int argc, char** argv)
 // RUN_VARIANT("waves=16x16x4 tw=2x4 pad=8", 16,16,16, 16,16,4, 2,4, 8);
 // RUN_VARIANT("waves=16x16x4 tw=4x1 pad=8", 16,16,16, 16,16,4, 4,1, 8);
 // RUN_VARIANT("waves=16x16x4 tw=4x2 pad=8", 16,16,16, 16,16,4, 4,2, 8);
-// RUN_VARIANT("waves=16x16x4 tw=4x4 pad=8", 16,16,16, 16,16,4, 4,4, 8);
+// RUN_VARIANT("waves=16x16x4 tw=4x4 pad=8", 16,16,16, 16,16,4, 4,4,  8);
 
 // // ===== Group 2: Varying p6 and p9 for select cases - 48 variants =====
 // // --- Case: waves~4x4, tw~2x2 ---
@@ -558,7 +584,7 @@ int main(int argc, char** argv)
 // RUN_VARIANT("waves=4x4x16 tw=2x2 pad=28", 16,16,16, 4,4,16, 2,2, 28);
 // // --- Case: waves~16x4, tw~4x2 ---
 // RUN_VARIANT("waves=16x4x2 tw=4x2 pad=0", 16,16,16, 16,4,2, 4,2, 0);
-// RUN_VARIANT("waves=16x4x2 tw=4x2 pad=4", 16,16,16, 16,4,2, 4,2, 4);
+// RUN_VARIANT("waves=16x4x2 tw=4x2 pad=4", 16,16,16, 16,4,2,  4,2, 4);
 // RUN_VARIANT("waves=16x4x2 tw=4x2 pad=16", 16,16,16, 16,4,2, 4,2, 16);
 // RUN_VARIANT("waves=16x4x2 tw=4x2 pad=28", 16,16,16, 16,4,2, 4,2, 28);
 // RUN_VARIANT("waves=16x4x8 tw=4x2 pad=0", 16,16,16, 16,4,8, 4,2, 0);
@@ -577,11 +603,11 @@ int main(int argc, char** argv)
 // RUN_VARIANT("waves=8x8x8 tw=1x1 pad=0", 16,16,16, 8,8,8, 1,1, 0);
 // RUN_VARIANT("waves=8x8x8 tw=1x1 pad=4", 16,16,16, 8,8,8, 1,1, 4);
 // RUN_VARIANT("waves=8x8x8 tw=1x1 pad=16", 16,16,16, 8,8,8, 1,1, 16);
-// RUN_VARIANT("waves=8x8x8 tw=1x1 pad=28", 16,16,16, 8,8,8, 1,1, 28);
+// RUN_VARIANT("waves=8x8x8 tw=1x1 pad=28", 16,16,16, 8,8,8,  1,1, 28);
 // RUN_VARIANT("waves=8x8x16 tw=1x1 pad=0", 16,16,16, 8,8,16, 1,1, 0);
 // RUN_VARIANT("waves=8x8x16 tw=1x1 pad=4", 16,16,16, 8,8,16, 1,1, 4);
 // RUN_VARIANT("waves=8x8x16 tw=1x1 pad=16", 16,16,16, 8,8,16, 1,1, 16);
-// RUN_VARIANT("waves=8x8x16 tw=1x1 pad=28", 16,16,16, 8,8,16, 1,1, 28);
+// RUN_VARIANT("waves=8x8x16 tw=1x1 pad=28", 16,16,16, 8,8,16,  1,1, 28);
 // // --- Case: waves~2x16, tw~1x4 ---
 // RUN_VARIANT("waves=2x16x2 tw=1x4 pad=0", 16,16,16, 2,16,2, 1,4, 0);
 // RUN_VARIANT("waves=2x16x2 tw=1x4 pad=4", 16,16,16, 2,16,2, 1,4, 4);
@@ -589,7 +615,7 @@ int main(int argc, char** argv)
 // RUN_VARIANT("waves=2x16x2 tw=1x4 pad=28", 16,16,16, 2,16,2, 1,4, 28);
 // RUN_VARIANT("waves=2x16x8 tw=1x4 pad=0", 16,16,16, 2,16,8, 1,4, 0);
 // RUN_VARIANT("waves=2x16x8 tw=1x4 pad=4", 16,16,16, 2,16,8, 1,4, 4);
-// RUN_VARIANT("waves=2x16x8 tw=1x4 pad=16", 16,16,16, 2,16,8, 1,4, 16);
+// RUN_VARIANT("waves=2x16x8 tw=1x4 pad=16", 16,16,16,  2,16,8, 1,4, 16);
 // RUN_VARIANT("waves=2x16x8 tw=1x4 pad=28", 16,16,16, 2,16,8, 1,4, 28);
 // RUN_VARIANT("waves=2x16x16 tw=1x4 pad=0", 16,16,16, 2,16,16, 1,4, 0);
 // RUN_VARIANT("waves=2x16x16 tw=1x4 pad=4", 16,16,16, 2,16,16, 1,4, 4);
@@ -603,7 +629,7 @@ int main(int argc, char** argv)
 // RUN_VARIANT("waves=16x16x4 tw=4x4 pad=20", 16,16,16, 16,16,4, 4,4, 20);
 // RUN_VARIANT("waves=16x16x4 tw=4x4 pad=30", 16,16,16, 16,16,4, 4,4, 30);
 // RUN_VARIANT("waves=16x16x16 tw=4x4 pad=0", 16,16,16, 16,16,16, 4,4, 0);
-// RUN_VARIANT("waves=16x16x16 tw=4x4 pad=10", 16,16,16, 16,16,16, 4,4, 10);
+// RUN_VARIANT("waves=16x16x16 tw=4x4 pad=10", 16,16,16, 16,16,16,  4,4, 10);
 // RUN_VARIANT("waves=16x16x16 tw=4x4 pad=20", 16,16,16, 16,16,16, 4,4, 20);
 // RUN_VARIANT("waves=16x16x16 tw=4x4 pad=30", 16,16,16, 16,16,16, 4,4, 30);
 
@@ -611,7 +637,7 @@ int main(int argc, char** argv)
 // RUN_VARIANT("waves=2x2x2 tw=1x1 pad=0", 16,16,16, 2,2,2, 1,1, 0);
 // RUN_VARIANT("waves=2x2x2 tw=1x1 pad=2", 16,16,16, 2,2,2, 1,1, 2);
 // RUN_VARIANT("waves=2x2x2 tw=1x1 pad=4", 16,16,16, 2,2,2, 1,1, 4);
-// RUN_VARIANT("waves=2x2x2 tw=1x1 pad=6", 16,16,16, 2,2,2, 1,1, 6);
+// RUN_VARIANT("waves=2x2x2 tw=1x1 pad=6", 16,16,16, 2,2,2,  1,1, 6);
 // RUN_VARIANT("waves=2x2x4 tw=1x1 pad=0", 16,16,16, 2,2,4, 1,1, 0);
 // RUN_VARIANT("waves=2x2x4 tw=1x1 pad=2", 16,16,16, 2,2,4, 1,1, 2);
 // RUN_VARIANT("waves=2x2x4 tw=1x1 pad=4", 16,16,16, 2,2,4, 1,1, 4);
@@ -635,7 +661,8 @@ int main(int argc, char** argv)
   }
 
   printf("\n--- Results ---\n");
-  printf("Baseline (mlp1 fp32):    %.3f ms  |  %.2f GFLOP/s\n", t_base_ms, base_gflops);
+  printf("Baseline (mlp1_optimized bf16; 16x16x16, waves=4x8x4, tw=1x2, pad=4):    %.3f ms  |  %.2f GFLOP/s\n",
+         t_base_ms, base_gflops);
 
   if (!tune_results.empty()) {
     printf("\n--- Unified Kernel Autotune ---\n");
