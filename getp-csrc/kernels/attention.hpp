@@ -73,6 +73,7 @@ __device__ inline float blockReduceSum(float v, float *shared_mem) {
 
 #include <hip/hip_runtime.h>
 #include <hip/hip_bfloat16.h>
+#include <hip/hip_fp16.h>
 #include <float.h>
 #include <stdint.h>
 
@@ -530,7 +531,7 @@ void fused_attention_kernel_optimized(
 // === KV cache quantization kernel (write int8 with per-row scales) ===
 __global__ void quantize_kv_cache_kernel(
     int8_t *key_cache, int8_t *value_cache,
-    float *key_scales, float *value_scales,
+    __half *key_scales, __half *value_scales,
     const __hip_bfloat16 *k, const __hip_bfloat16 *v,
     const int *seq_lengths, int batch_size,
     int layer_idx, int seq_len,
@@ -592,8 +593,8 @@ __global__ void quantize_kv_cache_kernel(
 
     if (threadIdx.x == 0)
     {
-        key_scales[scale_offset] = scale_k;
-        value_scales[scale_offset] = scale_v;
+        key_scales[scale_offset] = __float2half(scale_k);
+        value_scales[scale_offset] = __float2half(scale_v);
     }
     __syncthreads();
 
@@ -615,4 +616,3 @@ __global__ void quantize_kv_cache_kernel(
         value_cache[cache_offset + dim] = static_cast<int8_t>(qv);
     }
 }
-

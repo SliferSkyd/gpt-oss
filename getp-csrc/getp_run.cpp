@@ -6,6 +6,7 @@
 #include <cstdio>
 #include <hip/hip_runtime.h>
 #include <hip/hip_bf16.h>
+#include <hip/hip_fp16.h>
 #include <iostream>
 #include <fstream>
 #include <vector>
@@ -101,8 +102,8 @@ typedef struct
     // KV cache
     int8_t *key_cache;           // (batch_size, n_layers, seq_len, kv_dim) stored as int8
     int8_t *value_cache;         // (batch_size, n_layers, seq_len, kv_dim) stored as int8
-    float *key_cache_scales;     // (batch_size, n_layers, seq_len)
-    float *value_cache_scales;   // (batch_size, n_layers, seq_len)
+    __half *key_cache_scales;    // (batch_size, n_layers, seq_len)
+    __half *value_cache_scales;  // (batch_size, n_layers, seq_len)
 
     __hip_bfloat16 *w1_bf16_layer;   // [E, o_len, H]  (staged BF16 for *current* layer MLP1 shard)
     __hip_bfloat16 *w2_bf16_layer;   // [E, H, i_len]  (staged BF16 for *current* layer MLP2 shard)
@@ -292,7 +293,7 @@ void malloc_gpu_run_state(GPURunState *s, Config *p)
 
     const size_t kv_cache_rows = (size_t)BATCH_SIZE * layers_capacity;
     const size_t kv_cache_bytes = kv_cache_rows * (size_t)kv_dim * sizeof(int8_t);
-    const size_t kv_scale_bytes = kv_cache_rows * sizeof(float);
+    const size_t kv_scale_bytes = kv_cache_rows * sizeof(__half);
 
     printf("KV cache (int8) total capacity: layers_capacity=%zu positions/layer-stack\n",
            layers_capacity);
@@ -1931,8 +1932,8 @@ void attention_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size,
 
     int8_t *key_cache_mb = s->key_cache + (size_t)row_offset * kv_slice;
     int8_t *value_cache_mb = s->value_cache + (size_t)row_offset * kv_slice;
-    float *key_scale_mb = s->key_cache_scales + (size_t)row_offset * scale_slice;
-    float *value_scale_mb = s->value_cache_scales + (size_t)row_offset * scale_slice;
+    __half *key_scale_mb = s->key_cache_scales + (size_t)row_offset * scale_slice;
+    __half *value_scale_mb = s->value_cache_scales + (size_t)row_offset * scale_slice;
     const size_t layer_scale_offset = layer_pos_offset;
 
     // 1) RMSNorm
@@ -3291,8 +3292,8 @@ static inline void clear_kv_cache_for_slot(GPURunState *s, const Config *p, int 
 
         HIP_CHECK(hipMemset(k_ptr, 0, bytes_this_layer));
         HIP_CHECK(hipMemset(v_ptr, 0, bytes_this_layer));
-        HIP_CHECK(hipMemset(ks_ptr, 0, capL * sizeof(float)));
-        HIP_CHECK(hipMemset(vs_ptr, 0, capL * sizeof(float)));
+        HIP_CHECK(hipMemset(ks_ptr, 0, capL * sizeof(__half)));
+        HIP_CHECK(hipMemset(vs_ptr, 0, capL * sizeof(__half)));
 
         layer_pos_offset += capL;
     }

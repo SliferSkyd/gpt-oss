@@ -1,5 +1,6 @@
 #include <hip/hip_runtime.h>
 #include <hip/hip_bfloat16.h>
+#include <hip/hip_fp16.h>
 #include <float.h>
 #include <stdint.h>
 
@@ -1107,8 +1108,8 @@ __global__ __launch_bounds__(256, 4) void flashdecoding_fused_fastmerge_nostage_
     __hip_bfloat16 *__restrict__ output, const __hip_bfloat16 *__restrict__ q,
     const int8_t *__restrict__ key_cache,
     const int8_t *__restrict__ value_cache,
-    const float *__restrict__ key_scales,
-    const float *__restrict__ value_scales,
+    const __half *__restrict__ key_scales,
+    const __half *__restrict__ value_scales,
     const __hip_bfloat16 *__restrict__ sinks, const __hip_bfloat16 * /*mask*/,
     const int *__restrict__ seq_lengths,
     int B, int H, int KVH, int D, int /*seq_len*/,
@@ -1145,9 +1146,9 @@ __global__ __launch_bounds__(256, 4) void flashdecoding_fused_fastmerge_nostage_
       key_cache + (size_t)b * batch_kv_stride + layer_kv_offset + (size_t)kv_h * D;
   const int8_t *__restrict__ V0 =
       value_cache + (size_t)b * batch_kv_stride + layer_kv_offset + (size_t)kv_h * D;
-  const float *__restrict__ KS =
+  const __half *__restrict__ KS =
       key_scales + (size_t)b * batch_scale_stride + layer_scale_offset;
-  const float *__restrict__ VS =
+  const __half *__restrict__ VS =
       value_scales + (size_t)b * batch_scale_stride + layer_scale_offset;
 
   // Pre-scale q by 1/sqrt(D) once (each subgroup lane holds 8 scalars)
@@ -1180,8 +1181,8 @@ __global__ __launch_bounds__(256, 4) void flashdecoding_fused_fastmerge_nostage_
   {
     const int t_abs = t_start + tloc;
     const int tw = do_sw ? (t_abs % SW_WINDOW) : t_abs;
-    const float scale_k = KS[tw];
-    const float scale_v = VS[tw];
+    const float scale_k = __half2float(KS[tw]);
+    const float scale_v = __half2float(VS[tw]);
 
     // dot across 64 dims split over 8 lanes; memory access is coalesced across lanes
     float part = 0.f;
