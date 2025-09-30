@@ -527,27 +527,92 @@ void fused_attention_kernel_optimized(
 
 
 
-// === KV cache update kernel (write __hip_bfloat16) ===
-__global__ void update_kv_cache_kernel(__hip_bfloat16 *key_cache, __hip_bfloat16 *value_cache,
-                                       const __hip_bfloat16 *k, const __hip_bfloat16 *v,
-                                       const int *seq_lengths, int batch_size,
-                                       int n_layers, int layer_idx, int seq_len,
-                                       int kv_dim, size_t batch_kv_stride, size_t layer_kv_offset)
+// === KV cache quantization kernel (write int8 with per-row scales) ===
+__global__ void quantize_kv_cache_kernel(
+    int8_t *key_cache, int8_t *value_cache,
+    float *key_scales, float *value_scales,
+    const __hip_bfloat16 *k, const __hip_bfloat16 *v,
+    const int *seq_lengths, int batch_size,
+    int layer_idx, int seq_len,
+    int kv_dim,
+    size_t batch_kv_stride, size_t layer_kv_offset,
+    size_t batch_scale_stride, size_t layer_scale_offset)
 {
-    size_t batch_idx = blockIdx.x;
-    size_t dim_idx   = 1LL * blockIdx.y * blockDim.y + threadIdx.y;
-
-    if (batch_idx >= (size_t)batch_size || dim_idx >= (size_t)kv_dim)
+    const size_t batch_idx = blockIdx.x;
+    if (batch_idx >= (size_t)batch_size)
         return;
 
-    int pos = seq_lengths[batch_idx];
+    const int pos = seq_lengths[batch_idx];
     if (pos >= seq_len)
         return; // Safety check
 
-    const size_t base = (size_t)batch_idx * batch_kv_stride + layer_kv_offset;
+    const size_t base_elem = (size_t)batch_idx * batch_kv_stride + layer_kv_offset;
+    const size_t base_scale = (size_t)batch_idx * batch_scale_stride + layer_scale_offset;
     const int row = ((layer_idx & 1) ? pos : (pos % SW_WINDOW));
-    const size_t cache_idx = base + (size_t)row * (size_t)kv_dim + (size_t)dim_idx;
+    const size_t cache_offset = base_elem + (size_t)row * (size_t)kv_dim;
+    const size_t scale_offset = base_scale + (size_t)row;
 
-    key_cache[cache_idx]   = k[1LL*batch_idx * kv_dim + dim_idx];
-    value_cache[cache_idx] = v[1LL*batch_idx * kv_dim + dim_idx];
+    float local_max_k = 0.f;
+    float local_max_v = 0.f;
+
+    for (int dim = threadIdx.x; dim < kv_dim; dim += blockDim.x)
+    {
+        const size_t idx = (size_t)batch_idx * (size_t)kv_dim + (size_t)dim;
+        const float k_val = fabsf(__bfloat162float(k[idx]));
+        const float v_val = fabsf(__bfloat162float(v[idx]));
+        local_max_k = fmaxf(local_max_k, k_val);
+        local_max_v = fmaxf(local_max_v, v_val);
+    }
+
+    __shared__ float shared_max_k[THREADS_PER_BLOCK];
+    __shared__ float shared_max_v[THREADS_PER_BLOCK];
+
+    shared_max_k[threadIdx.x] = local_max_k;
+    shared_max_v[threadIdx.x] = local_max_v;
+    __syncthreads();
+
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1)
+    {
+        if (threadIdx.x < stride)
+        {
+            shared_max_k[threadIdx.x] = fmaxf(shared_max_k[threadIdx.x], shared_max_k[threadIdx.x + stride]);
+            shared_max_v[threadIdx.x] = fmaxf(shared_max_v[threadIdx.x], shared_max_v[threadIdx.x + stride]);
+        }
+        __syncthreads();
+    }
+
+    const float max_k = shared_max_k[0];
+    const float max_v = shared_max_v[0];
+    const float safe_k = fmaxf(max_k, 1e-6f);
+    const float safe_v = fmaxf(max_v, 1e-6f);
+    const float inv_scale_k = 127.f / safe_k;
+    const float inv_scale_v = 127.f / safe_v;
+    const float scale_k = safe_k / 127.f;
+    const float scale_v = safe_v / 127.f;
+
+    if (threadIdx.x == 0)
+    {
+        key_scales[scale_offset] = scale_k;
+        value_scales[scale_offset] = scale_v;
+    }
+    __syncthreads();
+
+    for (int dim = threadIdx.x; dim < kv_dim; dim += blockDim.x)
+    {
+        const size_t idx = (size_t)batch_idx * (size_t)kv_dim + (size_t)dim;
+        const float k_val = __bfloat162float(k[idx]) * inv_scale_k;
+        const float v_val = __bfloat162float(v[idx]) * inv_scale_v;
+
+        int qk = __float2int_rn(k_val);
+        int qv = __float2int_rn(v_val);
+
+        if (qk > 127) qk = 127;
+        if (qk < -127) qk = -127;
+        if (qv > 127) qv = 127;
+        if (qv < -127) qv = -127;
+
+        key_cache[cache_offset + dim] = static_cast<int8_t>(qk);
+        value_cache[cache_offset + dim] = static_cast<int8_t>(qv);
+    }
 }
+

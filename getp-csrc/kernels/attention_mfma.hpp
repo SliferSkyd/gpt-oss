@@ -1105,13 +1105,17 @@ __global__ __launch_bounds__(256, 4) void flashdecoding_fused_fastmerge_nostage_
 // ---------------------------------
 __global__ __launch_bounds__(256, 4) void flashdecoding_fused_fastmerge_nostage_1warp8q_bf16q_bf16out(
     __hip_bfloat16 *__restrict__ output, const __hip_bfloat16 *__restrict__ q,
-    const __hip_bfloat16 *__restrict__ key_cache,
-    const __hip_bfloat16 *__restrict__ value_cache,
+    const int8_t *__restrict__ key_cache,
+    const int8_t *__restrict__ value_cache,
+    const float *__restrict__ key_scales,
+    const float *__restrict__ value_scales,
     const __hip_bfloat16 *__restrict__ sinks, const __hip_bfloat16 * /*mask*/,
     const int *__restrict__ seq_lengths,
     int B, int H, int KVH, int D, int /*seq_len*/,
     int L, int layer_idx, bool use_sw,
-    size_t batch_kv_stride, size_t layer_kv_offset, int /*tile_t_unused*/)
+    size_t batch_kv_stride, size_t layer_kv_offset,
+    size_t batch_scale_stride, size_t layer_scale_offset,
+    int /*tile_t_unused*/)
 {
   const int kv_h = blockIdx.x, b = blockIdx.y;
   if (b >= B || kv_h >= KVH || D != 64)
@@ -1137,10 +1141,14 @@ __global__ __launch_bounds__(256, 4) void flashdecoding_fused_fastmerge_nostage_
   const int n_steps = pos - t_start + 1;
 
   const int kv_dim = D * KVH;
-  const __hip_bfloat16 *__restrict__ K0 =
+  const int8_t *__restrict__ K0 =
       key_cache + (size_t)b * batch_kv_stride + layer_kv_offset + (size_t)kv_h * D;
-  const __hip_bfloat16 *__restrict__ V0 =
+  const int8_t *__restrict__ V0 =
       value_cache + (size_t)b * batch_kv_stride + layer_kv_offset + (size_t)kv_h * D;
+  const float *__restrict__ KS =
+      key_scales + (size_t)b * batch_scale_stride + layer_scale_offset;
+  const float *__restrict__ VS =
+      value_scales + (size_t)b * batch_scale_stride + layer_scale_offset;
 
   // Pre-scale q by 1/sqrt(D) once (each subgroup lane holds 8 scalars)
   float qseg[8];
@@ -1172,13 +1180,16 @@ __global__ __launch_bounds__(256, 4) void flashdecoding_fused_fastmerge_nostage_
   {
     const int t_abs = t_start + tloc;
     const int tw = do_sw ? (t_abs % SW_WINDOW) : t_abs;
+    const float scale_k = KS[tw];
+    const float scale_v = VS[tw];
 
     // dot across 64 dims split over 8 lanes; memory access is coalesced across lanes
     float part = 0.f;
 #pragma unroll
     for (int s = 0; s < 8; ++s)
     {
-      float k = __bfloat162float(K0[(size_t)tw * kv_dim + (li + 8 * s)]);
+      const int8_t k_q = K0[(size_t)tw * kv_dim + (li + 8 * s)];
+      const float k = static_cast<float>(k_q) * scale_k;
       part = fmaf(qseg[s], k, part);
     }
 
@@ -1208,7 +1219,8 @@ __global__ __launch_bounds__(256, 4) void flashdecoding_fused_fastmerge_nostage_
 #pragma unroll
     for (int s = 0; s < 8; ++s)
     {
-      float v = __bfloat162float(V0[(size_t)tw * kv_dim + (li + 8 * s)]);
+      const int8_t v_q = V0[(size_t)tw * kv_dim + (li + 8 * s)];
+      const float v = static_cast<float>(v_q) * scale_v;
       out8[s] = fmaf(w, v, out8[s] * alpha);
     }
   }

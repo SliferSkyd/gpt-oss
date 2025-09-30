@@ -31,6 +31,7 @@
 #include <numeric>
 #include <queue>
 #include <vector>
+#include <cstdint>
 #include "nccl.hpp" // <— NCCL/RCCL-free TP collectives/helpers
 #include "tp_ring.hpp"
 
@@ -98,8 +99,10 @@ typedef struct
     __hip_bfloat16 *mask; // attention mask (seq_len, seq_len)
 
     // KV cache
-    __hip_bfloat16 *key_cache;   // (batch_size, n_layers, seq_len, kv_dim)
-    __hip_bfloat16 *value_cache; // (batch_size, n_layers, seq_len, kv_dim)
+    int8_t *key_cache;           // (batch_size, n_layers, seq_len, kv_dim) stored as int8
+    int8_t *value_cache;         // (batch_size, n_layers, seq_len, kv_dim) stored as int8
+    float *key_cache_scales;     // (batch_size, n_layers, seq_len)
+    float *value_cache_scales;   // (batch_size, n_layers, seq_len)
 
     __hip_bfloat16 *w1_bf16_layer;   // [E, o_len, H]  (staged BF16 for *current* layer MLP1 shard)
     __hip_bfloat16 *w2_bf16_layer;   // [E, H, i_len]  (staged BF16 for *current* layer MLP2 shard)
@@ -287,11 +290,14 @@ void malloc_gpu_run_state(GPURunState *s, Config *p)
     const size_t layers_capacity =
         (size_t)n_even * (size_t)even_cap + (size_t)n_odd * (size_t)MAX_SEQ_LEN;
 
-    size_t kv_cache_size = (size_t)BATCH_SIZE * layers_capacity * (size_t)kv_dim * sizeof(__hip_bfloat16);
+    const size_t kv_cache_rows = (size_t)BATCH_SIZE * layers_capacity;
+    const size_t kv_cache_bytes = kv_cache_rows * (size_t)kv_dim * sizeof(int8_t);
+    const size_t kv_scale_bytes = kv_cache_rows * sizeof(float);
 
-    printf("KV cache (fp32) total capacity: layers_capacity=%zu positions/layer-stack\n",
+    printf("KV cache (int8) total capacity: layers_capacity=%zu positions/layer-stack\n",
            layers_capacity);
-    printf("KV cache size per batch: %zu MB\n", kv_cache_size / (1024 * 1024));
+    printf("KV cache int8 data: %zu MB, scales: %zu MB\n",
+           kv_cache_bytes / (1024 * 1024), kv_scale_bytes / (1024 * 1024));
 
     // Base activations
     HIP_CHECK(hipMalloc((void **)&s->x, batch_hidden));
@@ -310,8 +316,10 @@ void malloc_gpu_run_state(GPURunState *s, Config *p)
     int total_mtiles = BATCH_SIZE * K;
 
     // KV cache
-    HIP_CHECK(hipMalloc((void **)&s->key_cache, kv_cache_size));
-    HIP_CHECK(hipMalloc((void **)&s->value_cache, kv_cache_size));
+    HIP_CHECK(hipMalloc((void **)&s->key_cache, kv_cache_bytes));
+    HIP_CHECK(hipMalloc((void **)&s->value_cache, kv_cache_bytes));
+    HIP_CHECK(hipMalloc((void **)&s->key_cache_scales, kv_scale_bytes));
+    HIP_CHECK(hipMalloc((void **)&s->value_cache_scales, kv_scale_bytes));
 
     HIP_CHECK(hipMalloc((void **)&s->att, BATCH_SIZE * p->n_attn_heads * MAX_SEQ_LEN * sizeof(__hip_bfloat16)));
     HIP_CHECK(hipMalloc((void **)&s->logits, BATCH_SIZE * p->vocab_size * sizeof(__hip_bfloat16)));
@@ -369,12 +377,15 @@ void malloc_gpu_run_state(GPURunState *s, Config *p)
     HIP_CHECK(hipMemset(s->q, 0, BATCH_SIZE * p->n_attn_heads * p->head_dim * sizeof(__hip_bfloat16)));
     HIP_CHECK(hipMemset(s->k, 0, BATCH_SIZE * kv_dim * sizeof(__hip_bfloat16)));
     HIP_CHECK(hipMemset(s->v, 0, BATCH_SIZE * kv_dim * sizeof(__hip_bfloat16)));
-    HIP_CHECK(hipMemset(s->key_cache, 0, kv_cache_size));
-    HIP_CHECK(hipMemset(s->value_cache, 0, kv_cache_size));
+    HIP_CHECK(hipMemset(s->key_cache, 0, kv_cache_bytes));
+    HIP_CHECK(hipMemset(s->value_cache, 0, kv_cache_bytes));
+    HIP_CHECK(hipMemset(s->key_cache_scales, 0, kv_scale_bytes));
+    HIP_CHECK(hipMemset(s->value_cache_scales, 0, kv_scale_bytes));
     HIP_CHECK(hipMemset(s->att, 0, BATCH_SIZE * p->n_attn_heads * MAX_SEQ_LEN * sizeof(__hip_bfloat16)));
     HIP_CHECK(hipMemset(s->logits, 0, (size_t)BATCH_SIZE * p->vocab_size * sizeof(__hip_bfloat16)));
 
-    // after you compute o_len_max and Dloc_max:
+if(!IS_20B_MODEL)
+    {    // after you compute o_len_max and Dloc_max:
     const size_t w1_stage_bytes = (size_t)E * o_len_max * H * sizeof(__hip_bfloat16);
     const size_t w2_stage_bytes = (size_t)E * H * Dloc_max * sizeof(__hip_bfloat16);
 
@@ -388,7 +399,7 @@ void malloc_gpu_run_state(GPURunState *s, Config *p)
     s->w2_bf16_layer = s->w2_bf16_stage[0];
     HIP_CHECK(hipStreamCreateWithFlags(&s->wts_stream, hipStreamNonBlocking));
 
-
+}
     // Continuous batching fields
     HIP_CHECK(hipMemset(s->seq_lengths, 0, BATCH_SIZE * sizeof(int)));
     HIP_CHECK(hipMemset(s->slot_active, 0, BATCH_SIZE * sizeof(bool)));
@@ -1722,7 +1733,7 @@ void warm_up(Transformer *transformer, Tokenizer *tokenizer)
     if (IS_20B_MODEL)
         BATCH_SIZE = 1536, TENSOR_PARALLEL_SIZE = 2;
     else
-        BATCH_SIZE = 920, TENSOR_PARALLEL_SIZE = 4;
+        BATCH_SIZE = 928, TENSOR_PARALLEL_SIZE = 4;
 
     HIP_CHECK(hipGetDeviceCount(&num_gpus));
     if (num_gpus > MAX_GPUS)
@@ -1740,7 +1751,7 @@ void warm_up(Transformer *transformer, Tokenizer *tokenizer)
         GPUTransformer *gpu_transformer = gpu_transformers[dev];
         gpu_transformer->config = transformer->config;
         build_gpu_transformer(gpu_transformer, transformer);
-        prefetch_moe_layer_into_slot(gpu_transformer, /*layer_idx=*/0, /*slot=*/0);
+        if(!IS_20B_MODEL) prefetch_moe_layer_into_slot(gpu_transformer, /*layer_idx=*/0, /*slot=*/0);
 
         float ntk_beta = 32.0f;
         float ntk_alpha = 1.0f;
@@ -1821,6 +1832,8 @@ void free_gpu_run_state(GPURunState *s)
     df(s->mask);
     df(s->key_cache);
     df(s->value_cache);
+    df(s->key_cache_scales);
+    df(s->value_cache_scales);
     df(s->cos_vals);
     df(s->sin_vals);
 
@@ -1897,6 +1910,7 @@ void attention_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size,
         layers_capacity += (size_t)(evenL ? even_cap : MAX_SEQ_LEN);
     }
     const size_t kv_slice = layers_capacity * (size_t)KV;
+    const size_t scale_slice = layers_capacity;
 
     size_t layer_pos_offset = 0;
     for (int L = 0; L < layer_idx; ++L)
@@ -1915,8 +1929,11 @@ void attention_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size,
     __hip_bfloat16 *v_mb = s->v + (size_t)row_offset * KV;
     int *pos_mb = s->positions + row_offset;
 
-    __hip_bfloat16 *key_cache_mb = s->key_cache + (size_t)row_offset * kv_slice;
-    __hip_bfloat16 *value_cache_mb = s->value_cache + (size_t)row_offset * kv_slice;
+    int8_t *key_cache_mb = s->key_cache + (size_t)row_offset * kv_slice;
+    int8_t *value_cache_mb = s->value_cache + (size_t)row_offset * kv_slice;
+    float *key_scale_mb = s->key_cache_scales + (size_t)row_offset * scale_slice;
+    float *value_scale_mb = s->value_cache_scales + (size_t)row_offset * scale_slice;
+    const size_t layer_scale_offset = layer_pos_offset;
 
     // 1) RMSNorm
     {
@@ -1961,14 +1978,19 @@ void attention_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size,
     }
     // 5) KV cache update
     {
-        // TIMER_BLOCK("update_kv_cache_kernel");
-        dim3 grid(batch_size, (KV + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK);
-        dim3 block(1, THREADS_PER_BLOCK);
-        update_kv_cache_kernel<<<grid, block, 0, sAttn>>>(
-            key_cache_mb, value_cache_mb, k_mb, v_mb, pos_mb,
-            batch_size, p->n_layers, layer_idx, MAX_SEQ_LEN, KV,
+        // TIMER_BLOCK("quantize_kv_cache_kernel");
+        dim3 grid(batch_size);
+        dim3 block(THREADS_PER_BLOCK);
+        quantize_kv_cache_kernel<<<grid, block, 0, sAttn>>>(
+            key_cache_mb, value_cache_mb,
+            key_scale_mb, value_scale_mb,
+            k_mb, v_mb, pos_mb,
+            batch_size, layer_idx, MAX_SEQ_LEN, KV,
             /* batch_kv_stride = */ layers_capacity * (size_t)KV,
-            /* layer_kv_offset = */ layer_elem_offset);
+            /* layer_kv_offset = */ layer_elem_offset,
+            /* batch_scale_stride = */ scale_slice,
+            /* layer_scale_offset = */ layer_scale_offset);
+        HIP_CHECK(hipGetLastError());
     }
     // 6) fused attention
     // --- optimized launch (tile_t = 48, same policy as launch_optimized) ---
@@ -2003,7 +2025,7 @@ void attention_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size,
 
             // Request dynamic LDS (ignore return; optional on some stacks)
             (void)hipFuncSetAttribute(
-                (const void *)flashdecoding_fused_fastmerge_nostage_1warp8q,
+                (const void *)flashdecoding_fused_fastmerge_nostage_1warp8q_bf16q_bf16out,
                 hipFuncAttributeMaxDynamicSharedMemorySize,
                 (int)shmem);
 
@@ -2014,6 +2036,8 @@ void attention_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size,
                 /* q           */ q_mb,
                 /* key_cache   */ key_cache_mb,
                 /* value_cache */ value_cache_mb,
+                /* key_scales  */ key_scale_mb,
+                /* value_scales*/ value_scale_mb,
                 /* sinks       */ w->attn_sinks + (size_t)layer_idx * NA,
                 /* mask        */ s->mask,
                 /* seq_lengths */ pos_mb,
@@ -2023,6 +2047,8 @@ void attention_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size,
                 /* use_sw      */ p->sliding_window > 0,
                 /* strides     */ /* batch_kv_stride = */ layers_capacity * (size_t)KV,
                 /* offsets     */ /* layer_kv_offset  = */ layer_elem_offset,
+                /* scale strides*/ /* batch_scale_stride = */ scale_slice,
+                /* scale offsets*/ /* layer_scale_offset = */ layer_scale_offset,
                 /* tile_t_unused */ 0);
 
             HIP_CHECK(hipGetLastError());
@@ -3232,12 +3258,11 @@ int *forward_batch_gpu(GPUTransformer *gpu_t, int *tokens, int batch_size)
 // Replace previous clear_kv_cache_for_slot kernel with host memset version
 static inline void clear_kv_cache_for_slot(GPURunState *s, const Config *p, int slot)
 {
-    return;
     if (slot < 0 || slot >= BATCH_SIZE)
         return;
 
     const int kv_dim = p->head_dim * p->n_kv_heads;
-    const size_t elem_bytes = sizeof(float);
+    const size_t elem_bytes = sizeof(int8_t);
 
     const int even_cap = (p->sliding_window > 0 ? SW_WINDOW : MAX_SEQ_LEN);
 
@@ -3247,7 +3272,8 @@ static inline void clear_kv_cache_for_slot(GPURunState *s, const Config *p, int 
         const bool evenL = ((L & 1) == 0);
         layers_capacity += (size_t)(evenL ? even_cap : MAX_SEQ_LEN);
     }
-    const size_t slot_base_elems = (size_t)slot * layers_capacity * (size_t)kv_dim;
+    const size_t slot_base_rows = (size_t)slot * layers_capacity;
+    const size_t slot_base_elems = slot_base_rows * (size_t)kv_dim;
 
     size_t layer_pos_offset = 0;
     for (int L = 0; L < p->n_layers; ++L)
@@ -3258,11 +3284,15 @@ static inline void clear_kv_cache_for_slot(GPURunState *s, const Config *p, int 
         const size_t layer_base_elems = slot_base_elems + layer_pos_offset * (size_t)kv_dim;
         const size_t bytes_this_layer = capL * (size_t)kv_dim * elem_bytes;
 
-        void *k_ptr = (void *)((char *)s->key_cache + layer_base_elems * elem_bytes);
-        void *v_ptr = (void *)((char *)s->value_cache + layer_base_elems * elem_bytes);
+        void *k_ptr = (void *)(s->key_cache + layer_base_elems);
+        void *v_ptr = (void *)(s->value_cache + layer_base_elems);
+        void *ks_ptr = (void *)(s->key_cache_scales + slot_base_rows + layer_pos_offset);
+        void *vs_ptr = (void *)(s->value_cache_scales + slot_base_rows + layer_pos_offset);
 
         HIP_CHECK(hipMemset(k_ptr, 0, bytes_this_layer));
         HIP_CHECK(hipMemset(v_ptr, 0, bytes_this_layer));
+        HIP_CHECK(hipMemset(ks_ptr, 0, capL * sizeof(float)));
+        HIP_CHECK(hipMemset(vs_ptr, 0, capL * sizeof(float)));
 
         layer_pos_offset += capL;
     }
