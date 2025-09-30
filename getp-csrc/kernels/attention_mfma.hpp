@@ -11,6 +11,10 @@
 #define SOFTMAX_EPS 1e-6f
 #endif
 
+#ifndef KV_BF16_KEEP_TOKENS
+#define KV_BF16_KEEP_TOKENS 4
+#endif
+
 // 64 + padding to break LDS bank conflicts
 constexpr int PADDED_HEAD_DIM = 72;
 
@@ -1110,6 +1114,9 @@ __global__ __launch_bounds__(256, 4) void flashdecoding_fused_fastmerge_nostage_
     const int8_t *__restrict__ value_cache,
     const __half *__restrict__ key_scales,
     const __half *__restrict__ value_scales,
+    const __hip_bfloat16 *__restrict__ key_cache_recent_bf16,
+    const __hip_bfloat16 *__restrict__ value_cache_recent_bf16,
+    const int *__restrict__ kv_cache_recent_pos,
     const __hip_bfloat16 *__restrict__ sinks, const __hip_bfloat16 * /*mask*/,
     const int *__restrict__ seq_lengths,
     int B, int H, int KVH, int D, int /*seq_len*/,
@@ -1150,6 +1157,16 @@ __global__ __launch_bounds__(256, 4) void flashdecoding_fused_fastmerge_nostage_
       key_scales + (size_t)b * batch_scale_stride + layer_scale_offset;
   const __half *__restrict__ VS =
       value_scales + (size_t)b * batch_scale_stride + layer_scale_offset;
+#if KV_BF16_KEEP_TOKENS > 0
+  const bool recent_available = key_cache_recent_bf16 && value_cache_recent_bf16 && kv_cache_recent_pos;
+  const size_t recent_slots = KV_BF16_KEEP_TOKENS;
+  const size_t recent_pos_base = ((size_t)b * (size_t)L + (size_t)layer_idx) * recent_slots;
+  const size_t recent_elem_base = recent_pos_base * (size_t)kv_dim;
+#else
+  (void)key_cache_recent_bf16;
+  (void)value_cache_recent_bf16;
+  (void)kv_cache_recent_pos;
+#endif
 
   // Pre-scale q by 1/sqrt(D) once (each subgroup lane holds 8 scalars)
   float qseg[8];
@@ -1183,15 +1200,42 @@ __global__ __launch_bounds__(256, 4) void flashdecoding_fused_fastmerge_nostage_
     const int tw = do_sw ? (t_abs % SW_WINDOW) : t_abs;
     const float scale_k = __half2float(KS[tw]);
     const float scale_v = __half2float(VS[tw]);
+#if KV_BF16_KEEP_TOKENS > 0
+    bool use_recent = false;
+    const __hip_bfloat16 *K_recent_head = nullptr;
+    const __hip_bfloat16 *V_recent_head = nullptr;
+    if (recent_available)
+    {
+      const size_t slot = (size_t)(t_abs % KV_BF16_KEEP_TOKENS);
+      const size_t pos_idx = recent_pos_base + slot;
+      if (kv_cache_recent_pos[pos_idx] == t_abs)
+      {
+        const size_t elem_offset = recent_elem_base + slot * (size_t)kv_dim + (size_t)kv_h * D;
+        K_recent_head = key_cache_recent_bf16 + elem_offset;
+        V_recent_head = value_cache_recent_bf16 + elem_offset;
+        use_recent = true;
+      }
+    }
+#endif
 
     // dot across 64 dims split over 8 lanes; memory access is coalesced across lanes
     float part = 0.f;
 #pragma unroll
     for (int s = 0; s < 8; ++s)
     {
-      const int8_t k_q = K0[(size_t)tw * kv_dim + (li + 8 * s)];
-      const float k = static_cast<float>(k_q) * scale_k;
-      part = fmaf(qseg[s], k, part);
+#if KV_BF16_KEEP_TOKENS > 0
+      if (use_recent)
+      {
+        const float k = __bfloat162float(K_recent_head[li + 8 * s]);
+        part = fmaf(qseg[s], k, part);
+      }
+      else
+#endif
+      {
+        const int8_t k_q = K0[(size_t)tw * kv_dim + (li + 8 * s)];
+        const float k = static_cast<float>(k_q) * scale_k;
+        part = fmaf(qseg[s], k, part);
+      }
     }
 
     // subgroup-8 reduction to sum partials from the 8 lanes of this head
@@ -1220,9 +1264,19 @@ __global__ __launch_bounds__(256, 4) void flashdecoding_fused_fastmerge_nostage_
 #pragma unroll
     for (int s = 0; s < 8; ++s)
     {
-      const int8_t v_q = V0[(size_t)tw * kv_dim + (li + 8 * s)];
-      const float v = static_cast<float>(v_q) * scale_v;
-      out8[s] = fmaf(w, v, out8[s] * alpha);
+#if KV_BF16_KEEP_TOKENS > 0
+      if (use_recent)
+      {
+        const float v = __bfloat162float(V_recent_head[li + 8 * s]);
+        out8[s] = fmaf(w, v, out8[s] * alpha);
+      }
+      else
+#endif
+      {
+        const int8_t v_q = V0[(size_t)tw * kv_dim + (li + 8 * s)];
+        const float v = static_cast<float>(v_q) * scale_v;
+        out8[s] = fmaf(w, v, out8[s] * alpha);
+      }
     }
   }
 

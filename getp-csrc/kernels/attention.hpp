@@ -1,5 +1,6 @@
 #include <hip/hip_runtime.h>
 #include <hip/hip_bf16.h>
+#include <hip/hip_fp16.h>
 #include <cmath>
 #include <cfloat>
 
@@ -20,6 +21,10 @@
 
 #ifndef SOFTMAX_EPS
 #define SOFTMAX_EPS 1e-9f
+#endif
+
+#ifndef KV_BF16_KEEP_TOKENS
+#define KV_BF16_KEEP_TOKENS 8
 #endif
 
 // ===== warp/block reductions (HIP-safe) =====
@@ -532,9 +537,12 @@ void fused_attention_kernel_optimized(
 __global__ void quantize_kv_cache_kernel(
     int8_t *key_cache, int8_t *value_cache,
     __half *key_scales, __half *value_scales,
+    __hip_bfloat16 *key_cache_recent_bf16,
+    __hip_bfloat16 *value_cache_recent_bf16,
+    int *recent_positions,
     const __hip_bfloat16 *k, const __hip_bfloat16 *v,
     const int *seq_lengths, int batch_size,
-    int layer_idx, int seq_len,
+    int n_layers, int layer_idx, int seq_len,
     int kv_dim,
     size_t batch_kv_stride, size_t layer_kv_offset,
     size_t batch_scale_stride, size_t layer_scale_offset)
@@ -615,4 +623,33 @@ __global__ void quantize_kv_cache_kernel(
         key_cache[cache_offset + dim] = static_cast<int8_t>(qk);
         value_cache[cache_offset + dim] = static_cast<int8_t>(qv);
     }
+
+#if KV_BF16_KEEP_TOKENS > 0
+    if (key_cache_recent_bf16 && value_cache_recent_bf16 && recent_positions && KV_BF16_KEEP_TOKENS > 0)
+    {
+        const size_t slots = (size_t)KV_BF16_KEEP_TOKENS;
+        const size_t token_slot = (size_t)(pos % KV_BF16_KEEP_TOKENS);
+        const size_t recent_pos_base = ((size_t)batch_idx * (size_t)n_layers + (size_t)layer_idx) * slots;
+        const size_t recent_elem_base = recent_pos_base * (size_t)kv_dim;
+
+        if (threadIdx.x == 0)
+        {
+            recent_positions[recent_pos_base + token_slot] = pos;
+        }
+        __syncthreads();
+
+        for (int dim = threadIdx.x; dim < kv_dim; dim += blockDim.x)
+        {
+            const size_t src_idx = (size_t)batch_idx * (size_t)kv_dim + (size_t)dim;
+            const size_t dst = recent_elem_base + token_slot * (size_t)kv_dim + (size_t)dim;
+            key_cache_recent_bf16[dst] = k[src_idx];
+            value_cache_recent_bf16[dst] = v[src_idx];
+        }
+    }
+#else
+    (void)key_cache_recent_bf16;
+    (void)value_cache_recent_bf16;
+    (void)recent_positions;
+    (void)n_layers;
+#endif
 }

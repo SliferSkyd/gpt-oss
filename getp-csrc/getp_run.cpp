@@ -104,6 +104,9 @@ typedef struct
     int8_t *value_cache;         // (batch_size, n_layers, seq_len, kv_dim) stored as int8
     __half *key_cache_scales;    // (batch_size, n_layers, seq_len)
     __half *value_cache_scales;  // (batch_size, n_layers, seq_len)
+    __hip_bfloat16 *key_cache_recent_bf16;   // (batch_size, n_layers, KV_BF16_KEEP_TOKENS, kv_dim)
+    __hip_bfloat16 *value_cache_recent_bf16; // (batch_size, n_layers, KV_BF16_KEEP_TOKENS, kv_dim)
+    int *kv_cache_recent_pos;               // (batch_size, n_layers, KV_BF16_KEEP_TOKENS)
 
     __hip_bfloat16 *w1_bf16_layer;   // [E, o_len, H]  (staged BF16 for *current* layer MLP1 shard)
     __hip_bfloat16 *w2_bf16_layer;   // [E, H, i_len]  (staged BF16 for *current* layer MLP2 shard)
@@ -322,6 +325,19 @@ void malloc_gpu_run_state(GPURunState *s, Config *p)
     HIP_CHECK(hipMalloc((void **)&s->key_cache_scales, kv_scale_bytes));
     HIP_CHECK(hipMalloc((void **)&s->value_cache_scales, kv_scale_bytes));
 
+#if KV_BF16_KEEP_TOKENS > 0
+    const size_t bf16_recent_tokens = KV_BF16_KEEP_TOKENS;
+    const size_t recent_cache_bytes = (size_t)BATCH_SIZE * (size_t)p->n_layers * bf16_recent_tokens * (size_t)kv_dim * sizeof(__hip_bfloat16);
+    const size_t recent_pos_bytes = (size_t)BATCH_SIZE * (size_t)p->n_layers * bf16_recent_tokens * sizeof(int);
+    HIP_CHECK(hipMalloc((void **)&s->key_cache_recent_bf16, recent_cache_bytes));
+    HIP_CHECK(hipMalloc((void **)&s->value_cache_recent_bf16, recent_cache_bytes));
+    HIP_CHECK(hipMalloc((void **)&s->kv_cache_recent_pos, recent_pos_bytes));
+#else
+    s->key_cache_recent_bf16 = nullptr;
+    s->value_cache_recent_bf16 = nullptr;
+    s->kv_cache_recent_pos = nullptr;
+#endif
+
     HIP_CHECK(hipMalloc((void **)&s->att, BATCH_SIZE * p->n_attn_heads * MAX_SEQ_LEN * sizeof(__hip_bfloat16)));
     HIP_CHECK(hipMalloc((void **)&s->logits, BATCH_SIZE * p->vocab_size * sizeof(__hip_bfloat16)));
 
@@ -382,6 +398,11 @@ void malloc_gpu_run_state(GPURunState *s, Config *p)
     HIP_CHECK(hipMemset(s->value_cache, 0, kv_cache_bytes));
     HIP_CHECK(hipMemset(s->key_cache_scales, 0, kv_scale_bytes));
     HIP_CHECK(hipMemset(s->value_cache_scales, 0, kv_scale_bytes));
+#if KV_BF16_KEEP_TOKENS > 0
+    HIP_CHECK(hipMemset(s->key_cache_recent_bf16, 0, (size_t)BATCH_SIZE * (size_t)p->n_layers * KV_BF16_KEEP_TOKENS * (size_t)kv_dim * sizeof(__hip_bfloat16)));
+    HIP_CHECK(hipMemset(s->value_cache_recent_bf16, 0, (size_t)BATCH_SIZE * (size_t)p->n_layers * KV_BF16_KEEP_TOKENS * (size_t)kv_dim * sizeof(__hip_bfloat16)));
+    HIP_CHECK(hipMemset(s->kv_cache_recent_pos, 0xFF, (size_t)BATCH_SIZE * (size_t)p->n_layers * KV_BF16_KEEP_TOKENS * sizeof(int)));
+#endif
     HIP_CHECK(hipMemset(s->att, 0, BATCH_SIZE * p->n_attn_heads * MAX_SEQ_LEN * sizeof(__hip_bfloat16)));
     HIP_CHECK(hipMemset(s->logits, 0, (size_t)BATCH_SIZE * p->vocab_size * sizeof(__hip_bfloat16)));
 
@@ -1732,9 +1753,9 @@ void warm_up(Transformer *transformer, Tokenizer *tokenizer)
         IS_20B_MODEL = 0;
 
     if (IS_20B_MODEL)
-        BATCH_SIZE = 1536, TENSOR_PARALLEL_SIZE = 2;
+        BATCH_SIZE = 2880, TENSOR_PARALLEL_SIZE = 2;
     else
-        BATCH_SIZE = 928, TENSOR_PARALLEL_SIZE = 4;
+        BATCH_SIZE = 1408, TENSOR_PARALLEL_SIZE = 4;
 
     HIP_CHECK(hipGetDeviceCount(&num_gpus));
     if (num_gpus > MAX_GPUS)
@@ -1835,6 +1856,11 @@ void free_gpu_run_state(GPURunState *s)
     df(s->value_cache);
     df(s->key_cache_scales);
     df(s->value_cache_scales);
+#if KV_BF16_KEEP_TOKENS > 0
+    df(s->key_cache_recent_bf16);
+    df(s->value_cache_recent_bf16);
+    df(s->kv_cache_recent_pos);
+#endif
     df(s->cos_vals);
     df(s->sin_vals);
 
@@ -1912,6 +1938,10 @@ void attention_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size,
     }
     const size_t kv_slice = layers_capacity * (size_t)KV;
     const size_t scale_slice = layers_capacity;
+#if KV_BF16_KEEP_TOKENS > 0
+    const size_t recent_elem_slice = (size_t)p->n_layers * (size_t)KV_BF16_KEEP_TOKENS * (size_t)KV;
+    const size_t recent_pos_slice = (size_t)p->n_layers * (size_t)KV_BF16_KEEP_TOKENS;
+#endif
 
     size_t layer_pos_offset = 0;
     for (int L = 0; L < layer_idx; ++L)
@@ -1935,6 +1965,15 @@ void attention_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size,
     __half *key_scale_mb = s->key_cache_scales + (size_t)row_offset * scale_slice;
     __half *value_scale_mb = s->value_cache_scales + (size_t)row_offset * scale_slice;
     const size_t layer_scale_offset = layer_pos_offset;
+#if KV_BF16_KEEP_TOKENS > 0
+    __hip_bfloat16 *key_recent_bf16_mb = s->key_cache_recent_bf16 ? s->key_cache_recent_bf16 + (size_t)row_offset * recent_elem_slice : nullptr;
+    __hip_bfloat16 *value_recent_bf16_mb = s->value_cache_recent_bf16 ? s->value_cache_recent_bf16 + (size_t)row_offset * recent_elem_slice : nullptr;
+    int *recent_pos_mb = s->kv_cache_recent_pos ? s->kv_cache_recent_pos + (size_t)row_offset * recent_pos_slice : nullptr;
+#else
+    __hip_bfloat16 *key_recent_bf16_mb = nullptr;
+    __hip_bfloat16 *value_recent_bf16_mb = nullptr;
+    int *recent_pos_mb = nullptr;
+#endif
 
     // 1) RMSNorm
     {
@@ -1985,8 +2024,10 @@ void attention_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size,
         quantize_kv_cache_kernel<<<grid, block, 0, sAttn>>>(
             key_cache_mb, value_cache_mb,
             key_scale_mb, value_scale_mb,
+            key_recent_bf16_mb, value_recent_bf16_mb,
+            recent_pos_mb,
             k_mb, v_mb, pos_mb,
-            batch_size, layer_idx, MAX_SEQ_LEN, KV,
+            batch_size, p->n_layers, layer_idx, MAX_SEQ_LEN, KV,
             /* batch_kv_stride = */ layers_capacity * (size_t)KV,
             /* layer_kv_offset = */ layer_elem_offset,
             /* batch_scale_stride = */ scale_slice,
@@ -2039,6 +2080,9 @@ void attention_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size,
                 /* value_cache */ value_cache_mb,
                 /* key_scales  */ key_scale_mb,
                 /* value_scales*/ value_scale_mb,
+                /* recent_kv_bf16 */ key_recent_bf16_mb,
+                /* recent_v_bf16 */ value_recent_bf16_mb,
+                /* recent_pos  */ recent_pos_mb,
                 /* sinks       */ w->attn_sinks + (size_t)layer_idx * NA,
                 /* mask        */ s->mask,
                 /* seq_lengths */ pos_mb,
@@ -3294,6 +3338,18 @@ static inline void clear_kv_cache_for_slot(GPURunState *s, const Config *p, int 
         HIP_CHECK(hipMemset(v_ptr, 0, bytes_this_layer));
         HIP_CHECK(hipMemset(ks_ptr, 0, capL * sizeof(__half)));
         HIP_CHECK(hipMemset(vs_ptr, 0, capL * sizeof(__half)));
+
+#if KV_BF16_KEEP_TOKENS > 0
+        const size_t recent_slot_base = ((size_t)slot * (size_t)p->n_layers + (size_t)L) * (size_t)KV_BF16_KEEP_TOKENS;
+        const size_t recent_elem_base = recent_slot_base * (size_t)kv_dim;
+        void *k_recent_ptr = (void *)(s->key_cache_recent_bf16 + recent_elem_base);
+        void *v_recent_ptr = (void *)(s->value_cache_recent_bf16 + recent_elem_base);
+        void *pos_recent_ptr = (void *)(s->kv_cache_recent_pos + recent_slot_base);
+
+        HIP_CHECK(hipMemset(k_recent_ptr, 0, (size_t)KV_BF16_KEEP_TOKENS * (size_t)kv_dim * sizeof(__hip_bfloat16)));
+        HIP_CHECK(hipMemset(v_recent_ptr, 0, (size_t)KV_BF16_KEEP_TOKENS * (size_t)kv_dim * sizeof(__hip_bfloat16)));
+        HIP_CHECK(hipMemset(pos_recent_ptr, 0xFF, (size_t)KV_BF16_KEEP_TOKENS * sizeof(int)));
+#endif
 
         layer_pos_offset += capL;
     }
