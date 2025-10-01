@@ -1755,7 +1755,7 @@ void warm_up(Transformer *transformer, Tokenizer *tokenizer)
     if (IS_20B_MODEL)
         BATCH_SIZE = 2880, TENSOR_PARALLEL_SIZE = 2;
     else
-        BATCH_SIZE = 1408, TENSOR_PARALLEL_SIZE = 4;
+        BATCH_SIZE = 1536, TENSOR_PARALLEL_SIZE = 4;
 
     HIP_CHECK(hipGetDeviceCount(&num_gpus));
     if (num_gpus > MAX_GPUS)
@@ -2864,30 +2864,37 @@ void moe_gpu_120b(GPUTransformer *gpu_t, int layer_idx, int batch_size,
     {
         // We only need rows that this rank owns: [rank_in_group*bs_local ... +bs_local)
         const size_t owner_elems = (size_t)bs_local * (size_t)H;
-        const size_t owner_bytes = owner_elems * sizeof(__hip_bfloat16);
         // Accumulator lives in-place at our owner slice inside e_agg_g
         __hip_bfloat16* acc_owner = s->e_agg_g + (size_t)rank_in_group * owner_elems;
         // acc_owner currently holds this rank's partial (from its own W2 shard).
         // Pull the same owner slice from every peer and accumulate.
+        const size_t TILE_ELEMS = std::max<size_t>(1, RING_TILE_BYTES / sizeof(__hip_bfloat16));
+        const int T = THREADS_PER_BLOCK;
         for (int i = 1; i < TPx; ++i) {
             const int r = (rank_in_group + i) % TPx;
             const int peer_dev  = group_base + r;
             const __hip_bfloat16* peer_owner =
                 gpu_transformers[peer_dev]->state.e_agg_g + (size_t)rank_in_group * owner_elems;
-            if (tp.p2p[rank_in_group][r]) {
-                // P2P: copy peer owner slice into our small device recv buffer
-                HIP_CHECK(hipMemcpyPeerAsync(
-                    /*dst*/ s->d_recv,        /*dstDevice*/ my_dev,
-                    /*src*/ peer_owner,       /*srcDevice*/ peer_dev,
-                    /*count*/ owner_bytes, sMoe));
-            } else {
+            if (!tp.p2p[rank_in_group][r]) {
                 assert(0);
             }
-            // Accumulate: acc_owner += d_recv
-            const int T = THREADS_PER_BLOCK;
-            const int GRD = (int)((owner_elems + T - 1) / T);
-            vec_add_inplace_bf16<<<GRD, T, 0, sMoe>>>(acc_owner, s->d_recv, owner_elems);
-            HIP_CHECK(hipGetLastError());
+
+            size_t copied = 0;
+            while (copied < owner_elems) {
+                const size_t take_elems = std::min(TILE_ELEMS, owner_elems - copied);
+                const size_t take_bytes = take_elems * sizeof(__hip_bfloat16);
+
+                HIP_CHECK(hipMemcpyPeerAsync(
+                    /*dst*/ s->d_recv,        /*dstDevice*/ my_dev,
+                    /*src*/ peer_owner + copied, /*srcDevice*/ peer_dev,
+                    /*count*/ take_bytes, sMoe));
+
+                // Accumulate: acc_owner[copied:copied+take) += d_recv
+                const int GRD = (int)((take_elems + T - 1) / T);
+                vec_add_inplace_bf16<<<GRD, T, 0, sMoe>>>(acc_owner + copied, s->d_recv, take_elems);
+                HIP_CHECK(hipGetLastError());
+                copied += take_elems;
+            }
         }
         // No need to sync here; next consumer is on the same stream.
     }
