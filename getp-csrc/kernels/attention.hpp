@@ -228,7 +228,7 @@ void fused_attention_kernel( // <-- keep your original symbol name
       const int i8   = (e8 - tloc * vec8) * 8; // starting dim (multiple of 8)
 
       const int t_abs = t_start + base + tloc;
-      const int tw    = ((layer_idx & 1) == 0) ? (t_abs & 127) : t_abs;
+      const int tw    = ((layer_idx & 1) == 0) ? (t_abs % SW_WINDOW) : t_abs;
 
       const __hip_bfloat16 *k_ptr = k_head_base + (size_t)tw * kv_dim + i8;
       const __hip_bfloat16 *v_ptr = v_head_base + (size_t)tw * kv_dim + i8;
@@ -262,7 +262,7 @@ void fused_attention_kernel( // <-- keep your original symbol name
         const int io   = (et - tloc * tail) + vec8 * 8;
 
         const int t_abs = t_start + base + tloc;
-        const int tw    = ((layer_idx & 1) == 0) ? (t_abs & 127) : t_abs;
+        const int tw    = ((layer_idx & 1) == 0) ? (t_abs % SW_WINDOW) : t_abs;
 
         const __hip_bfloat16 *k_ptr = k_head_base + (size_t)tw * kv_dim + io;
         const __hip_bfloat16 *v_ptr = v_head_base + (size_t)tw * kv_dim + io;
@@ -426,7 +426,7 @@ void fused_attention_kernel_optimized(
       const int tloc = e8 / vec8;
       const int i8   = (e8 - tloc * vec8) * 8;
       const int t_abs = t_start + base + tloc;
-      const int tw    = ((layer_idx & 1) == 0) ? (t_abs & 127) : t_abs;
+      const int tw    = ((layer_idx & 1) == 0) ? (t_abs % SW_WINDOW) : t_abs;
       const __hip_bfloat16 *k_ptr = k_head_base + (size_t)tw * kv_dim + i8;
       const __hip_bfloat16 *v_ptr = v_head_base + (size_t)tw * kv_dim + i8;
 
@@ -575,7 +575,7 @@ __device__ inline void quantize_kv_cache_kernel_impl(
 
     const size_t base_elem = (size_t)batch_idx * batch_kv_stride + layer_kv_offset;
     const size_t base_scale = (size_t)batch_idx * batch_scale_stride + layer_scale_offset;
-    const int row = ((layer_idx & 1) ? pos : (pos & 127));
+    const int row = ((layer_idx & 1) ? pos : (pos % SW_WINDOW));
     const size_t cache_offset = base_elem + (size_t)row * (size_t)kv_dim;
     const size_t scale_offset = base_scale + (size_t)row;
 

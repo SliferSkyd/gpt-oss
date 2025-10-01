@@ -103,7 +103,7 @@ __global__ __launch_bounds__(64, 8) void fused_attention_kernel_1warp8q_fast(
       int tloc = e / vec8;
       int i8 = (e - tloc * vec8) * 8;
       int t_abs = t_start + base + tloc;
-      int tw = ((layer_idx & 1) == 0) ? (t_abs & 127) : t_abs;
+      int tw = ((layer_idx & 1) == 0) ? (t_abs % SW_WINDOW) : t_abs;
       *reinterpret_cast<u128 *>(sK + (size_t)tloc * PADDED_HEAD_DIM + i8) =
           ld8(K0 + (size_t)tw * kv_dim + i8);
       *reinterpret_cast<u128 *>(sV + (size_t)tloc * PADDED_HEAD_DIM + i8) =
@@ -783,7 +783,7 @@ __global__ __launch_bounds__(256, 4) void flashdecoding_fused_fastmerge_nostage_
   for (int tloc = t_begin; tloc < t_end; ++tloc)
   {
     const int t_abs = t_start + tloc;
-    const int tw = do_sw ? (t_abs & 127) : t_abs;
+    const int tw = do_sw ? (t_abs % SW_WINDOW) : t_abs;
 
     // dot across 64 dims split over 8 lanes; memory access is coalesced across lanes
     float part = 0.f;
@@ -978,7 +978,7 @@ __global__ __launch_bounds__(256, 4) void flashdecoding_fused_fastmerge_nostage_
   for (int tloc = t_begin; tloc < t_end; ++tloc)
   {
     const int t_abs = t_start + tloc;
-    const int tw = do_sw ? (t_abs & 127) : t_abs;
+    const int tw = do_sw ? (t_abs % SW_WINDOW) : t_abs;
 
     // dot across 64 dims split over 8 lanes; memory access is coalesced across lanes
     float part = 0.f;
@@ -1249,7 +1249,7 @@ __device__ inline void flashdecoding_fused_fastmerge_nostage_1warp8q_body(
     else
 #endif
     {
-      tw = do_sw ? (t_abs & 127) : t_abs;
+      tw = do_sw ? (t_abs % SW_WINDOW) : t_abs;
       const float scale_k = __half2float(KS[tw]);
       scale_v = __half2float(VS[tw]);
 #pragma unroll
