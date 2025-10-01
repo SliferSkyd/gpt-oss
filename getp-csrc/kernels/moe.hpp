@@ -1174,17 +1174,20 @@ __global__ void route_build_index_kernel_bf16wts(
     const int *__restrict__ topk_i,                 // [B,K]
     const __hip_bfloat16 *__restrict__ topk_v_bf16, // [B,K]
     int B, int K,
-    const int *__restrict__ expert_offsets, // [E] exclusive prefix
-    int E,
+    const int *__restrict__ expert_offsets, // [E_local] exclusive prefix
+    int E_local,
+    const int *__restrict__ expert_ids,    // [E_local] global expert ids
     // outputs
     int *__restrict__ local_ids,                  // [B,K]
     __hip_bfloat16 *__restrict__ local_wts_bf16,  // [B,K]
-    int *__restrict__ expert_tokidx              // [sum_tokens]; write token id at compact row
+    int *__restrict__ expert_tokidx              // [sum_tokens_local]; write token id at compact row
 )
 {
-    const int e = blockIdx.x;
-    if (e >= E)
+    const int local_e = blockIdx.x;
+    if (local_e >= E_local)
         return;
+
+    const int e = expert_ids[local_e];
 
 #if defined(__HIP_PLATFORM_AMD__)
     const int WARP = 64;
@@ -1251,7 +1254,7 @@ __global__ void route_build_index_kernel_bf16wts(
 
         if (flag)
         {
-            const int compact = expert_offsets[e] + carry_shared[0] + warp_base + rank_warp;
+            const int compact = expert_offsets[local_e] + carry_shared[0] + warp_base + rank_warp;
             const int lid = t_global * K + kk;
 
             // (b,k) outputs
