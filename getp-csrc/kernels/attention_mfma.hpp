@@ -103,7 +103,7 @@ __global__ __launch_bounds__(64, 8) void fused_attention_kernel_1warp8q_fast(
       int tloc = e / vec8;
       int i8 = (e - tloc * vec8) * 8;
       int t_abs = t_start + base + tloc;
-      int tw = ((layer_idx & 1) == 0) ? (t_abs % SW_WINDOW) : t_abs;
+      int tw = ((layer_idx & 1) == 0) ? (t_abs & 127) : t_abs;
       *reinterpret_cast<u128 *>(sK + (size_t)tloc * PADDED_HEAD_DIM + i8) =
           ld8(K0 + (size_t)tw * kv_dim + i8);
       *reinterpret_cast<u128 *>(sV + (size_t)tloc * PADDED_HEAD_DIM + i8) =
@@ -783,7 +783,7 @@ __global__ __launch_bounds__(256, 4) void flashdecoding_fused_fastmerge_nostage_
   for (int tloc = t_begin; tloc < t_end; ++tloc)
   {
     const int t_abs = t_start + tloc;
-    const int tw = do_sw ? (t_abs % SW_WINDOW) : t_abs;
+    const int tw = do_sw ? (t_abs & 127) : t_abs;
 
     // dot across 64 dims split over 8 lanes; memory access is coalesced across lanes
     float part = 0.f;
@@ -978,7 +978,7 @@ __global__ __launch_bounds__(256, 4) void flashdecoding_fused_fastmerge_nostage_
   for (int tloc = t_begin; tloc < t_end; ++tloc)
   {
     const int t_abs = t_start + tloc;
-    const int tw = do_sw ? (t_abs % SW_WINDOW) : t_abs;
+    const int tw = do_sw ? (t_abs & 127) : t_abs;
 
     // dot across 64 dims split over 8 lanes; memory access is coalesced across lanes
     float part = 0.f;
@@ -1106,9 +1106,10 @@ __global__ __launch_bounds__(256, 4) void flashdecoding_fused_fastmerge_nostage_
 
 
 // ---------------------------------
-// Kernel (bf16 q input, bf16 output)
+// Kernel body (bf16 q input, bf16 output)
 // ---------------------------------
-__global__ __launch_bounds__(256, 4) void flashdecoding_fused_fastmerge_nostage_1warp8q_bf16q_bf16out(
+template <bool kUseBf16Kv>
+__device__ inline void flashdecoding_fused_fastmerge_nostage_1warp8q_body(
     __hip_bfloat16 *__restrict__ output, const __hip_bfloat16 *__restrict__ q,
     const int8_t *__restrict__ key_cache,
     const int8_t *__restrict__ value_cache,
@@ -1147,26 +1148,51 @@ __global__ __launch_bounds__(256, 4) void flashdecoding_fused_fastmerge_nostage_
   const bool do_sw = (use_sw && ((layer_idx & 1) == 0));
   const int t_start = do_sw ? max(0, pos - (SW_WINDOW - 1)) : 0;
   const int n_steps = pos - t_start + 1;
+  if (n_steps <= 0)
+    return;
 
   const int kv_dim = D * KVH;
+  const size_t base_kv = (size_t)b * batch_kv_stride + layer_kv_offset;
   const int8_t *__restrict__ K0 =
-      key_cache + (size_t)b * batch_kv_stride + layer_kv_offset + (size_t)kv_h * D;
+      key_cache + base_kv + (size_t)kv_h * D;
   const int8_t *__restrict__ V0 =
-      value_cache + (size_t)b * batch_kv_stride + layer_kv_offset + (size_t)kv_h * D;
+      value_cache + base_kv + (size_t)kv_h * D;
   const __half *__restrict__ KS =
       key_scales + (size_t)b * batch_scale_stride + layer_scale_offset;
   const __half *__restrict__ VS =
       value_scales + (size_t)b * batch_scale_stride + layer_scale_offset;
+
 #if KV_BF16_KEEP_TOKENS > 0
-  const bool recent_available = key_cache_recent_bf16 && value_cache_recent_bf16 && kv_cache_recent_pos;
+  const bool bf16_case = ((layer_idx & 1) == 1) && (pos < KV_BF16_KEEP_TOKENS);
+  if (kUseBf16Kv)
+  {
+    if (!bf16_case || !key_cache_recent_bf16 || !value_cache_recent_bf16 || !kv_cache_recent_pos)
+      return;
+  }
+  else
+  {
+    if (bf16_case && key_cache_recent_bf16 && value_cache_recent_bf16 && kv_cache_recent_pos)
+      return;
+  }
+
   const size_t recent_slots = KV_BF16_KEEP_TOKENS;
   const size_t recent_pos_base = ((size_t)b * (size_t)L + (size_t)layer_idx) * recent_slots;
   const size_t recent_elem_base = recent_pos_base * (size_t)kv_dim;
 #else
+  if (kUseBf16Kv)
+    return;
   (void)key_cache_recent_bf16;
   (void)value_cache_recent_bf16;
   (void)kv_cache_recent_pos;
 #endif
+
+  if (kUseBf16Kv)
+  {
+    (void)K0;
+    (void)V0;
+    (void)KS;
+    (void)VS;
+  }
 
   // Pre-scale q by 1/sqrt(D) once (each subgroup lane holds 8 scalars)
   float qseg[8];
@@ -1197,46 +1223,51 @@ __global__ __launch_bounds__(256, 4) void flashdecoding_fused_fastmerge_nostage_
   for (int tloc = t_begin; tloc < t_end; ++tloc)
   {
     const int t_abs = t_start + tloc;
-    const int tw = do_sw ? (t_abs % SW_WINDOW) : t_abs;
-    const float scale_k = __half2float(KS[tw]);
-    const float scale_v = __half2float(VS[tw]);
-#if KV_BF16_KEEP_TOKENS > 0
-    bool use_recent = false;
-    const __hip_bfloat16 *K_recent_head = nullptr;
-    const __hip_bfloat16 *V_recent_head = nullptr;
-    if (recent_available)
-    {
-      const size_t slot = (size_t)(t_abs % KV_BF16_KEEP_TOKENS);
-      const size_t pos_idx = recent_pos_base + slot;
-      if (kv_cache_recent_pos[pos_idx] == t_abs)
-      {
-        const size_t elem_offset = recent_elem_base + slot * (size_t)kv_dim + (size_t)kv_h * D;
-        K_recent_head = key_cache_recent_bf16 + elem_offset;
-        V_recent_head = value_cache_recent_bf16 + elem_offset;
-        use_recent = true;
-      }
-    }
-#endif
 
-    // dot across 64 dims split over 8 lanes; memory access is coalesced across lanes
     float part = 0.f;
-#pragma unroll
-    for (int s = 0; s < 8; ++s)
-    {
+    int tw = 0;
+    float scale_v = 0.f;
 #if KV_BF16_KEEP_TOKENS > 0
-      if (use_recent)
+    const __hip_bfloat16 *V_recent_head = nullptr;
+    if (kUseBf16Kv)
+    {
+      const size_t slot = (size_t)t_abs;
+      if (slot >= recent_slots)
+        return;
+      if (kv_cache_recent_pos[recent_pos_base + slot] != t_abs)
+        return;
+      const size_t elem_offset = recent_elem_base + slot * (size_t)kv_dim + (size_t)kv_h * D;
+      const __hip_bfloat16 *K_recent_head = key_cache_recent_bf16 + elem_offset;
+      V_recent_head = value_cache_recent_bf16 + elem_offset;
+#pragma unroll
+      for (int s = 0; s < 8; ++s)
       {
         const float k = __bfloat162float(K_recent_head[li + 8 * s]);
         part = fmaf(qseg[s], k, part);
       }
-      else
+    }
+    else
 #endif
+    {
+      tw = do_sw ? (t_abs & 127) : t_abs;
+      const float scale_k = __half2float(KS[tw]);
+      scale_v = __half2float(VS[tw]);
+#pragma unroll
+      for (int s = 0; s < 8; ++s)
       {
         const int8_t k_q = K0[(size_t)tw * kv_dim + (li + 8 * s)];
         const float k = static_cast<float>(k_q) * scale_k;
         part = fmaf(qseg[s], k, part);
       }
     }
+
+#if KV_BF16_KEEP_TOKENS > 0
+    if (kUseBf16Kv)
+    {
+      (void)tw;
+      (void)scale_v;
+    }
+#endif
 
     // subgroup-8 reduction to sum partials from the 8 lanes of this head
     part += __shfl_xor(part, 4, 8);
@@ -1260,12 +1291,12 @@ __global__ __launch_bounds__(256, 4) void flashdecoding_fused_fastmerge_nostage_
     alpha = __shfl(alpha, (hloc << 3), 64);
     w     = __shfl(w,     (hloc << 3), 64);
 
-    // numerator update for this lane's 8 dims (directly from global V)
+    // numerator update for this lane's 8 dims (directly from global/cache V)
 #pragma unroll
     for (int s = 0; s < 8; ++s)
     {
 #if KV_BF16_KEEP_TOKENS > 0
-      if (use_recent)
+      if (kUseBf16Kv)
       {
         const float v = __bfloat162float(V_recent_head[li + 8 * s]);
         out8[s] = fmaf(w, v, out8[s] * alpha);
@@ -1363,3 +1394,61 @@ __global__ __launch_bounds__(256, 4) void flashdecoding_fused_fastmerge_nostage_
     }
   }
 }
+
+__global__ __launch_bounds__(256, 4) void flashdecoding_fused_fastmerge_nostage_1warp8q_bf16q_bf16out(
+    __hip_bfloat16 *__restrict__ output, const __hip_bfloat16 *__restrict__ q,
+    const int8_t *__restrict__ key_cache,
+    const int8_t *__restrict__ value_cache,
+    const __half *__restrict__ key_scales,
+    const __half *__restrict__ value_scales,
+    const __hip_bfloat16 *__restrict__ key_cache_recent_bf16,
+    const __hip_bfloat16 *__restrict__ value_cache_recent_bf16,
+    const int *__restrict__ kv_cache_recent_pos,
+    const __hip_bfloat16 *__restrict__ sinks, const __hip_bfloat16 *mask,
+    const int *__restrict__ seq_lengths,
+    int B, int H, int KVH, int D, int seq_len,
+    int L, int layer_idx, bool use_sw,
+    size_t batch_kv_stride, size_t layer_kv_offset,
+    size_t batch_scale_stride, size_t layer_scale_offset,
+    int tile_t_unused)
+{
+  flashdecoding_fused_fastmerge_nostage_1warp8q_body<false>(
+      output, q, key_cache, value_cache, key_scales, value_scales,
+      key_cache_recent_bf16, value_cache_recent_bf16, kv_cache_recent_pos,
+      sinks, mask, seq_lengths,
+      B, H, KVH, D, seq_len,
+      L, layer_idx, use_sw,
+      batch_kv_stride, layer_kv_offset,
+      batch_scale_stride, layer_scale_offset,
+      tile_t_unused);
+}
+
+#if KV_BF16_KEEP_TOKENS > 0
+__global__ __launch_bounds__(256, 4) void flashdecoding_fused_fastmerge_nostage_1warp8q_bf16q_bf16out_bf16kv(
+    __hip_bfloat16 *__restrict__ output, const __hip_bfloat16 *__restrict__ q,
+    const int8_t *__restrict__ key_cache,
+    const int8_t *__restrict__ value_cache,
+    const __half *__restrict__ key_scales,
+    const __half *__restrict__ value_scales,
+    const __hip_bfloat16 *__restrict__ key_cache_recent_bf16,
+    const __hip_bfloat16 *__restrict__ value_cache_recent_bf16,
+    const int *__restrict__ kv_cache_recent_pos,
+    const __hip_bfloat16 *__restrict__ sinks, const __hip_bfloat16 *mask,
+    const int *__restrict__ seq_lengths,
+    int B, int H, int KVH, int D, int seq_len,
+    int L, int layer_idx, bool use_sw,
+    size_t batch_kv_stride, size_t layer_kv_offset,
+    size_t batch_scale_stride, size_t layer_scale_offset,
+    int tile_t_unused)
+{
+  flashdecoding_fused_fastmerge_nostage_1warp8q_body<true>(
+      output, q, key_cache, value_cache, key_scales, value_scales,
+      key_cache_recent_bf16, value_cache_recent_bf16, kv_cache_recent_pos,
+      sinks, mask, seq_lengths,
+      B, H, KVH, D, seq_len,
+      L, layer_idx, use_sw,
+      batch_kv_stride, layer_kv_offset,
+      batch_scale_stride, layer_scale_offset,
+      tile_t_unused);
+}
+#endif

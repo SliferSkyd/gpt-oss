@@ -1919,6 +1919,7 @@ void attention_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size,
 
     Config *p = &gpu_t->config;
     GPURunState *s = &gpu_t->state;
+    CPUBuffers *cpu = &gpu_t->cpu_buffers;
     GPUTransformerWeights *w = &gpu_t->weights;
 
     const int H = p->hidden_dim;
@@ -1975,6 +1976,43 @@ void attention_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size,
     int *recent_pos_mb = nullptr;
 #endif
 
+    bool launch_int8_quant = true;
+    bool launch_int8_attn = true;
+#if KV_BF16_KEEP_TOKENS > 0
+    bool launch_bf16_quant = false;
+    bool launch_bf16_attn = false;
+    const bool bf16_buffers_available = key_recent_bf16_mb && value_recent_bf16_mb && recent_pos_mb;
+    if ((layer_idx & 1) == 1 && cpu->positions && bf16_buffers_available)
+    {
+        int *pos_cpu = cpu->positions + row_offset;
+        launch_int8_quant = false;
+        launch_int8_attn = false;
+        for (int i = 0; i < batch_size; ++i)
+        {
+            const int pos_val = pos_cpu[i];
+            if (pos_val < KV_BF16_KEEP_TOKENS)
+            {
+                launch_bf16_quant = true;
+                launch_bf16_attn = true;
+            }
+            else
+            {
+                launch_int8_quant = true;
+                launch_int8_attn = true;
+            }
+        }
+    }
+    else if ((layer_idx & 1) == 1)
+    {
+        launch_int8_quant = true;
+        launch_int8_attn = true;
+    }
+#else
+    const bool launch_bf16_quant = false;
+    const bool launch_bf16_attn = false;
+    (void)cpu;
+#endif
+
     // 1) RMSNorm
     {
         // TIMER_BLOCK("rmsnorm_kernel_attention");
@@ -2021,18 +2059,38 @@ void attention_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size,
         // TIMER_BLOCK("quantize_kv_cache_kernel");
         dim3 grid(batch_size);
         dim3 block(THREADS_PER_BLOCK);
-        quantize_kv_cache_kernel<<<grid, block, 0, sAttn>>>(
-            key_cache_mb, value_cache_mb,
-            key_scale_mb, value_scale_mb,
-            key_recent_bf16_mb, value_recent_bf16_mb,
-            recent_pos_mb,
-            k_mb, v_mb, pos_mb,
-            batch_size, p->n_layers, layer_idx, MAX_SEQ_LEN, KV,
-            /* batch_kv_stride = */ layers_capacity * (size_t)KV,
-            /* layer_kv_offset = */ layer_elem_offset,
-            /* batch_scale_stride = */ scale_slice,
-            /* layer_scale_offset = */ layer_scale_offset);
-        HIP_CHECK(hipGetLastError());
+#if KV_BF16_KEEP_TOKENS > 0
+        if (launch_bf16_quant)
+        {
+            quantize_kv_cache_kernel_bf16<<<grid, block, 0, sAttn>>>(
+                key_cache_mb, value_cache_mb,
+                key_scale_mb, value_scale_mb,
+                key_recent_bf16_mb, value_recent_bf16_mb,
+                recent_pos_mb,
+                k_mb, v_mb, pos_mb,
+                batch_size, p->n_layers, layer_idx, MAX_SEQ_LEN, KV,
+                /* batch_kv_stride = */ layers_capacity * (size_t)KV,
+                /* layer_kv_offset = */ layer_elem_offset,
+                /* batch_scale_stride = */ scale_slice,
+                /* layer_scale_offset = */ layer_scale_offset);
+            HIP_CHECK(hipGetLastError());
+        }
+#endif
+        if (launch_int8_quant)
+        {
+            quantize_kv_cache_kernel_int8<<<grid, block, 0, sAttn>>>(
+                key_cache_mb, value_cache_mb,
+                key_scale_mb, value_scale_mb,
+                key_recent_bf16_mb, value_recent_bf16_mb,
+                recent_pos_mb,
+                k_mb, v_mb, pos_mb,
+                batch_size, p->n_layers, layer_idx, MAX_SEQ_LEN, KV,
+                /* batch_kv_stride = */ layers_capacity * (size_t)KV,
+                /* layer_kv_offset = */ layer_elem_offset,
+                /* batch_scale_stride = */ scale_slice,
+                /* layer_scale_offset = */ layer_scale_offset);
+            HIP_CHECK(hipGetLastError());
+        }
     }
     // 6) fused attention
     // --- optimized launch (tile_t = 48, same policy as launch_optimized) ---
@@ -2066,37 +2124,77 @@ void attention_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size,
                 (size_t)((2 * WARPS * 8) + (WARPS * 64 * 8)) * sizeof(float);
 
             // Request dynamic LDS (ignore return; optional on some stacks)
-            (void)hipFuncSetAttribute(
-                (const void *)flashdecoding_fused_fastmerge_nostage_1warp8q_bf16q_bf16out,
-                hipFuncAttributeMaxDynamicSharedMemorySize,
-                (int)shmem);
+#if KV_BF16_KEEP_TOKENS > 0
+            if (launch_bf16_attn)
+            {
+                (void)hipFuncSetAttribute(
+                    (const void *)flashdecoding_fused_fastmerge_nostage_1warp8q_bf16q_bf16out_bf16kv,
+                    hipFuncAttributeMaxDynamicSharedMemorySize,
+                    (int)shmem);
 
-            hipLaunchKernelGGL(
-                flashdecoding_fused_fastmerge_nostage_1warp8q_bf16q_bf16out,
-                grid, block, shmem, sAttn,
-                /* output      */ tb_mb,
-                /* q           */ q_mb,
-                /* key_cache   */ key_cache_mb,
-                /* value_cache */ value_cache_mb,
-                /* key_scales  */ key_scale_mb,
-                /* value_scales*/ value_scale_mb,
-                /* recent_kv_bf16 */ key_recent_bf16_mb,
-                /* recent_v_bf16 */ value_recent_bf16_mb,
-                /* recent_pos  */ recent_pos_mb,
-                /* sinks       */ w->attn_sinks + (size_t)layer_idx * NA,
-                /* mask        */ s->mask,
-                /* seq_lengths */ pos_mb,
-                /* B,H,KVH,D   */ batch_size, NA, NKv, Hd,
-                /* seq_len,L   */ MAX_SEQ_LEN, p->n_layers,
-                /* layer_idx   */ layer_idx,
-                /* use_sw      */ p->sliding_window > 0,
-                /* strides     */ /* batch_kv_stride = */ layers_capacity * (size_t)KV,
-                /* offsets     */ /* layer_kv_offset  = */ layer_elem_offset,
-                /* scale strides*/ /* batch_scale_stride = */ scale_slice,
-                /* scale offsets*/ /* layer_scale_offset = */ layer_scale_offset,
-                /* tile_t_unused */ 0);
+                hipLaunchKernelGGL(
+                    flashdecoding_fused_fastmerge_nostage_1warp8q_bf16q_bf16out_bf16kv,
+                    grid, block, shmem, sAttn,
+                    /* output      */ tb_mb,
+                    /* q           */ q_mb,
+                    /* key_cache   */ key_cache_mb,
+                    /* value_cache */ value_cache_mb,
+                    /* key_scales  */ key_scale_mb,
+                    /* value_scales*/ value_scale_mb,
+                    /* recent_kv_bf16 */ key_recent_bf16_mb,
+                    /* recent_v_bf16 */ value_recent_bf16_mb,
+                    /* recent_pos  */ recent_pos_mb,
+                    /* sinks       */ w->attn_sinks + (size_t)layer_idx * NA,
+                    /* mask        */ s->mask,
+                    /* seq_lengths */ pos_mb,
+                    /* B,H,KVH,D   */ batch_size, NA, NKv, Hd,
+                    /* seq_len,L   */ MAX_SEQ_LEN, p->n_layers,
+                    /* layer_idx   */ layer_idx,
+                    /* use_sw      */ p->sliding_window > 0,
+                    /* strides     */ /* batch_kv_stride = */ layers_capacity * (size_t)KV,
+                    /* offsets     */ /* layer_kv_offset  = */ layer_elem_offset,
+                    /* scale strides*/ /* batch_scale_stride = */ scale_slice,
+                    /* scale offsets*/ /* layer_scale_offset = */ layer_scale_offset,
+                    /* tile_t_unused */ 0);
 
-            HIP_CHECK(hipGetLastError());
+                HIP_CHECK(hipGetLastError());
+            }
+#endif
+
+            if (launch_int8_attn)
+            {
+                (void)hipFuncSetAttribute(
+                    (const void *)flashdecoding_fused_fastmerge_nostage_1warp8q_bf16q_bf16out,
+                    hipFuncAttributeMaxDynamicSharedMemorySize,
+                    (int)shmem);
+
+                hipLaunchKernelGGL(
+                    flashdecoding_fused_fastmerge_nostage_1warp8q_bf16q_bf16out,
+                    grid, block, shmem, sAttn,
+                    /* output      */ tb_mb,
+                    /* q           */ q_mb,
+                    /* key_cache   */ key_cache_mb,
+                    /* value_cache */ value_cache_mb,
+                    /* key_scales  */ key_scale_mb,
+                    /* value_scales*/ value_scale_mb,
+                    /* recent_kv_bf16 */ key_recent_bf16_mb,
+                    /* recent_v_bf16 */ value_recent_bf16_mb,
+                    /* recent_pos  */ recent_pos_mb,
+                    /* sinks       */ w->attn_sinks + (size_t)layer_idx * NA,
+                    /* mask        */ s->mask,
+                    /* seq_lengths */ pos_mb,
+                    /* B,H,KVH,D   */ batch_size, NA, NKv, Hd,
+                    /* seq_len,L   */ MAX_SEQ_LEN, p->n_layers,
+                    /* layer_idx   */ layer_idx,
+                    /* use_sw      */ p->sliding_window > 0,
+                    /* strides     */ /* batch_kv_stride = */ layers_capacity * (size_t)KV,
+                    /* offsets     */ /* layer_kv_offset  = */ layer_elem_offset,
+                    /* scale strides*/ /* batch_scale_stride = */ scale_slice,
+                    /* scale offsets*/ /* layer_scale_offset = */ layer_scale_offset,
+                    /* tile_t_unused */ 0);
+
+                HIP_CHECK(hipGetLastError());
+            }
         }
     }
 

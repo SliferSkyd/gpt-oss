@@ -24,7 +24,7 @@
 #endif
 
 #ifndef KV_BF16_KEEP_TOKENS
-#define KV_BF16_KEEP_TOKENS 8
+#define KV_BF16_KEEP_TOKENS 16
 #endif
 
 // ===== warp/block reductions (HIP-safe) =====
@@ -228,7 +228,7 @@ void fused_attention_kernel( // <-- keep your original symbol name
       const int i8   = (e8 - tloc * vec8) * 8; // starting dim (multiple of 8)
 
       const int t_abs = t_start + base + tloc;
-      const int tw    = ((layer_idx & 1) == 0) ? (t_abs % SW_WINDOW) : t_abs;
+      const int tw    = ((layer_idx & 1) == 0) ? (t_abs & 127) : t_abs;
 
       const __hip_bfloat16 *k_ptr = k_head_base + (size_t)tw * kv_dim + i8;
       const __hip_bfloat16 *v_ptr = v_head_base + (size_t)tw * kv_dim + i8;
@@ -262,7 +262,7 @@ void fused_attention_kernel( // <-- keep your original symbol name
         const int io   = (et - tloc * tail) + vec8 * 8;
 
         const int t_abs = t_start + base + tloc;
-        const int tw    = ((layer_idx & 1) == 0) ? (t_abs % SW_WINDOW) : t_abs;
+        const int tw    = ((layer_idx & 1) == 0) ? (t_abs & 127) : t_abs;
 
         const __hip_bfloat16 *k_ptr = k_head_base + (size_t)tw * kv_dim + io;
         const __hip_bfloat16 *v_ptr = v_head_base + (size_t)tw * kv_dim + io;
@@ -426,7 +426,7 @@ void fused_attention_kernel_optimized(
       const int tloc = e8 / vec8;
       const int i8   = (e8 - tloc * vec8) * 8;
       const int t_abs = t_start + base + tloc;
-      const int tw    = ((layer_idx & 1) == 0) ? (t_abs % SW_WINDOW) : t_abs;
+      const int tw    = ((layer_idx & 1) == 0) ? (t_abs & 127) : t_abs;
       const __hip_bfloat16 *k_ptr = k_head_base + (size_t)tw * kv_dim + i8;
       const __hip_bfloat16 *v_ptr = v_head_base + (size_t)tw * kv_dim + i8;
 
@@ -534,7 +534,8 @@ void fused_attention_kernel_optimized(
 
 
 // === KV cache quantization kernel (write int8 with per-row scales) ===
-__global__ void quantize_kv_cache_kernel(
+template <bool kUseBf16Cache>
+__device__ inline void quantize_kv_cache_kernel_impl(
     int8_t *key_cache, int8_t *value_cache,
     __half *key_scales, __half *value_scales,
     __hip_bfloat16 *key_cache_recent_bf16,
@@ -555,9 +556,26 @@ __global__ void quantize_kv_cache_kernel(
     if (pos >= seq_len)
         return; // Safety check
 
+#if KV_BF16_KEEP_TOKENS > 0
+    const bool bf16_case = ((layer_idx & 1) == 1) && (pos < KV_BF16_KEEP_TOKENS);
+    if (kUseBf16Cache)
+    {
+        if (!bf16_case || !key_cache_recent_bf16 || !value_cache_recent_bf16 || !recent_positions)
+            return;
+    }
+    else
+    {
+        if (bf16_case && key_cache_recent_bf16 && value_cache_recent_bf16 && recent_positions)
+            return;
+    }
+#else
+    if (kUseBf16Cache)
+        return;
+#endif
+
     const size_t base_elem = (size_t)batch_idx * batch_kv_stride + layer_kv_offset;
     const size_t base_scale = (size_t)batch_idx * batch_scale_stride + layer_scale_offset;
-    const int row = ((layer_idx & 1) ? pos : (pos % SW_WINDOW));
+    const int row = ((layer_idx & 1) ? pos : (pos & 127));
     const size_t cache_offset = base_elem + (size_t)row * (size_t)kv_dim;
     const size_t scale_offset = base_scale + (size_t)row;
 
@@ -625,10 +643,10 @@ __global__ void quantize_kv_cache_kernel(
     }
 
 #if KV_BF16_KEEP_TOKENS > 0
-    if (key_cache_recent_bf16 && value_cache_recent_bf16 && recent_positions && KV_BF16_KEEP_TOKENS > 0)
+    if (kUseBf16Cache)
     {
         const size_t slots = (size_t)KV_BF16_KEEP_TOKENS;
-        const size_t token_slot = (size_t)(pos % KV_BF16_KEEP_TOKENS);
+        const size_t token_slot = (size_t)pos;
         const size_t recent_pos_base = ((size_t)batch_idx * (size_t)n_layers + (size_t)layer_idx) * slots;
         const size_t recent_elem_base = recent_pos_base * (size_t)kv_dim;
 
@@ -647,9 +665,87 @@ __global__ void quantize_kv_cache_kernel(
         }
     }
 #else
+    (void)kUseBf16Cache;
     (void)key_cache_recent_bf16;
     (void)value_cache_recent_bf16;
     (void)recent_positions;
     (void)n_layers;
 #endif
 }
+
+__global__ void quantize_kv_cache_kernel_int8(
+    int8_t *key_cache, int8_t *value_cache,
+    __half *key_scales, __half *value_scales,
+    __hip_bfloat16 *key_cache_recent_bf16,
+    __hip_bfloat16 *value_cache_recent_bf16,
+    int *recent_positions,
+    const __hip_bfloat16 *k, const __hip_bfloat16 *v,
+    const int *seq_lengths, int batch_size,
+    int n_layers, int layer_idx, int seq_len,
+    int kv_dim,
+    size_t batch_kv_stride, size_t layer_kv_offset,
+    size_t batch_scale_stride, size_t layer_scale_offset)
+{
+    quantize_kv_cache_kernel_impl<false>(
+        key_cache, value_cache,
+        key_scales, value_scales,
+        key_cache_recent_bf16, value_cache_recent_bf16,
+        recent_positions,
+        k, v, seq_lengths, batch_size,
+        n_layers, layer_idx, seq_len,
+        kv_dim,
+        batch_kv_stride, layer_kv_offset,
+        batch_scale_stride, layer_scale_offset);
+}
+
+__global__ void quantize_kv_cache_kernel(
+    int8_t *key_cache, int8_t *value_cache,
+    __half *key_scales, __half *value_scales,
+    __hip_bfloat16 *key_cache_recent_bf16,
+    __hip_bfloat16 *value_cache_recent_bf16,
+    int *recent_positions,
+    const __hip_bfloat16 *k, const __hip_bfloat16 *v,
+    const int *seq_lengths, int batch_size,
+    int n_layers, int layer_idx, int seq_len,
+    int kv_dim,
+    size_t batch_kv_stride, size_t layer_kv_offset,
+    size_t batch_scale_stride, size_t layer_scale_offset)
+{
+    quantize_kv_cache_kernel_impl<false>(
+        key_cache, value_cache,
+        key_scales, value_scales,
+        key_cache_recent_bf16, value_cache_recent_bf16,
+        recent_positions,
+        k, v, seq_lengths, batch_size,
+        n_layers, layer_idx, seq_len,
+        kv_dim,
+        batch_kv_stride, layer_kv_offset,
+        batch_scale_stride, layer_scale_offset);
+}
+
+#if KV_BF16_KEEP_TOKENS > 0
+__global__ void quantize_kv_cache_kernel_bf16(
+    int8_t *key_cache, int8_t *value_cache,
+    __half *key_scales, __half *value_scales,
+    __hip_bfloat16 *key_cache_recent_bf16,
+    __hip_bfloat16 *value_cache_recent_bf16,
+    int *recent_positions,
+    const __hip_bfloat16 *k, const __hip_bfloat16 *v,
+    const int *seq_lengths, int batch_size,
+    int n_layers, int layer_idx, int seq_len,
+    int kv_dim,
+    size_t batch_kv_stride, size_t layer_kv_offset,
+    size_t batch_scale_stride, size_t layer_scale_offset)
+{
+    quantize_kv_cache_kernel_impl<true>(
+        key_cache, value_cache,
+        key_scales, value_scales,
+        key_cache_recent_bf16, value_cache_recent_bf16,
+        recent_positions,
+        k, v, seq_lengths, batch_size,
+        n_layers, layer_idx, seq_len,
+        kv_dim,
+        batch_kv_stride, layer_kv_offset,
+        batch_scale_stride, layer_scale_offset);
+}
+#endif
