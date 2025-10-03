@@ -2796,11 +2796,11 @@ void moe_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size,
 
         const size_t seg1_loc = (size_t)o_len * H; // per-expert stride in local shard
         const __hip_bfloat16 *W1 = w->w_mlp1 + (size_t)layer_idx * (size_t)E * seg1_loc;
-
-        mlp1_optimized_outbf16<16, 16, 16, 4, 8, 4, 1, 2, 4>(
+        const __hip_bfloat16 *b1 = w->b_mlp1 + (size_t)layer_idx * (size_t)E * (size_t)o_len;
+        mlp1_optimized_outbf16<16, 16, 16, 4, 4, 4, 1, 2, 4>(
             s->mlp1_out_g,
             /*A=*/s->expert_input_buffer_bf16_g, /*bf16*/
-            /*W1=*/W1,
+            /*W1=*/W1, b1,
             s->d_expert_offsets, s->d_expert_counts,
             s->d_tile2expert_g, s->d_tile2local_g,
             /*E=*/E, /*K=*/H, /*N=*/o_len, /*cur_tiles=*/cur_tiles, sMoe);
@@ -2810,15 +2810,13 @@ void moe_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size,
     const int Dloc = o_len / 2;
     {
         // TIMER_BLOCK("bias_swiglu_epilogue_kernel_bf16");
-        const __hip_bfloat16 *b1 = w->b_mlp1 + (size_t)layer_idx * (size_t)E * (size_t)o_len;
         const size_t work = (size_t)total_tokens * (size_t)Dloc;
         if (work > 0)
         {
             const int T = 256;
             dim3 grid2((int)((work + T - 1) / T)), block2(T);
-            bias_swiglu_epilogue_kernel_bf16_mlp_in_bf16<<<grid2, block2, 0, sMoe>>>(
-                s->mlp1_out_g, b1,
-                s->d_expert_offsets, s->d_expert_counts, E,
+            swiglu_epilogue_kernel_bf16_mlp_in_bf16<<<grid2, block2, 0, sMoe>>>(
+                s->mlp1_out_g,
                 /*OUT*/ s->gate_up_bf16_g, // <<< bf16 buffer
                 /*D=*/Dloc, total_tokens, p->swiglu_limit, 1.702f);
             HIP_CHECK(hipGetLastError());
@@ -3137,8 +3135,8 @@ void moe_gpu_120b(GPUTransformer *gpu_t, int layer_idx, int batch_size,
         const int base = twoD / TPx, rem = twoD % TPx;
         o_len = base + (rank_in_group < rem ? 1 : 0); // <-- remove 'const int'
         const __hip_bfloat16 *W1 = s->w1_bf16_layer;
-        mlp1_optimized_outbf16<16, 16, 16, 4, 8, 4, 1, 2, 4>(
-            s->mlp1_out_g, s->expert_input_buffer_bf16_g, W1,
+        mlp1_optimized_outbf16<16, 16, 16, 4, 4, 4, 1, 2, 4>(
+            s->mlp1_out_g, s->expert_input_buffer_bf16_g, W1, NULL,
             s->d_expert_offsets, s->d_expert_counts,
             s->d_tile2expert_g, s->d_tile2local_g,
             /*E=*/E, /*K=*/H, /*N=*/o_len, /*cur_tiles=*/cur_tiles, sMoe);
