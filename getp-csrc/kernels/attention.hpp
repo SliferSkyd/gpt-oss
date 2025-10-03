@@ -749,3 +749,30 @@ __global__ void quantize_kv_cache_kernel_bf16(
         batch_scale_stride, layer_scale_offset);
 }
 #endif
+
+
+
+// === KV cache update kernel (write __hip_bfloat16) ===
+__global__ void update_kv_cache_kernel(__hip_bfloat16 *key_cache, __hip_bfloat16 *value_cache,
+                                       const __hip_bfloat16 *k, const __hip_bfloat16 *v,
+                                       const int *seq_lengths, int batch_size,
+                                       int n_layers, int layer_idx, int seq_len,
+                                       int kv_dim, size_t batch_kv_stride, size_t layer_kv_offset)
+{
+    size_t batch_idx = blockIdx.x;
+    size_t dim_idx   = 1LL * blockIdx.y * blockDim.y + threadIdx.y;
+
+    if (batch_idx >= (size_t)batch_size || dim_idx >= (size_t)kv_dim)
+        return;
+
+    int pos = seq_lengths[batch_idx];
+    if (pos >= seq_len)
+        return; // Safety check
+
+    const size_t base = (size_t)batch_idx * batch_kv_stride + layer_kv_offset;
+    const int row = ((layer_idx & 1) ? pos : (pos % SW_WINDOW));
+    const size_t cache_idx = base + (size_t)row * (size_t)kv_dim + (size_t)dim_idx;
+
+    key_cache[cache_idx]   = k[1LL*batch_idx * kv_dim + dim_idx];
+    value_cache[cache_idx] = v[1LL*batch_idx * kv_dim + dim_idx];
+}
