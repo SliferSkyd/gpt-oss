@@ -1722,7 +1722,7 @@ void warm_up(Transformer *transformer, Tokenizer *tokenizer)
     if (IS_20B_MODEL)
         BATCH_SIZE = 1536, TENSOR_PARALLEL_SIZE = 2;
     else
-        BATCH_SIZE = 920, TENSOR_PARALLEL_SIZE = 4;
+        BATCH_SIZE = 1152, TENSOR_PARALLEL_SIZE = 8;
 
     HIP_CHECK(hipGetDeviceCount(&num_gpus));
     if (num_gpus > MAX_GPUS)
