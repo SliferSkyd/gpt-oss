@@ -221,9 +221,9 @@ __global__ void quantize_pack_mxfp4_block32_kernel(
 // ====== MXFP4 -> BF16 (layer-wide) dequantization ======
 // One thread writes one u32 (2x bf16) pair; tail-safe for odd element counts.
 __global__ void dequant_mxfp4_pairs_to_bf16_kernel(
-    __hip_bfloat16 *__restrict__ dst_bf16,  // [E, N*K] row-major
-    const uint8_t *__restrict__ packed,     // [E, ceil(N*K/2)]
-    const float   *__restrict__ scales_f32, // [E, ceil(N*K/32)], already expanded scales
+    __hip_bfloat16 *__restrict__ dst_bf16,   // [E, N*K] row-major
+    const uint8_t *__restrict__ packed,      // [E, ceil(N*K/2)]
+    const uint8_t *__restrict__ scales_e8m0, // [E, ceil(N*K/32)]
     int E, int N, int K)
 {
     const int e = blockIdx.y;
@@ -233,8 +233,8 @@ __global__ void dequant_mxfp4_pairs_to_bf16_kernel(
     const size_t seg_pairs = (seg_elems + 1) >> 1;   // ceil(elems/2)
     const size_t seg_blocks = (seg_elems + 31) >> 5; // /32
 
-    const uint8_t *packed_e = packed     + (size_t)e * ((seg_elems + 1) >> 1);
-    const float   *scales_e = scales_f32 + (size_t)e * seg_blocks;
+    const uint8_t *packed_e = packed      + (size_t)e * ((seg_elems + 1) >> 1);
+    const uint8_t *scales_e = scales_e8m0 + (size_t)e * seg_blocks;
 
     // We'll write via u32 for aligned pairs when possible
     uint32_t *out_pairs = reinterpret_cast<uint32_t*>(dst_bf16 + (size_t)e * seg_elems);
@@ -246,7 +246,9 @@ __global__ void dequant_mxfp4_pairs_to_bf16_kernel(
     {
         const size_t even_idx = p << 1; // element index (even)
         const size_t blk = even_idx >> 5;
-        const float X = (blk < seg_blocks) ? scales_e[blk] : 0.0f;
+        const float X = (blk < seg_blocks)
+                             ? __uint_as_float(uint32_t(scales_e[blk]) << 23)
+                             : 0.0f;
 
         // Byte holding two nibbles for elements even_idx and even_idx+1
         const uint8_t byte = packed_e[even_idx >> 1];

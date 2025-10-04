@@ -76,7 +76,6 @@ typedef struct
     uint8_t *w_mlp1_mxfp4, *w_mlp2_mxfp4;   // packed n/2 bytes
     uint8_t *w_mlp1_scales, *w_mlp2_scales; // n/32 bytes (e8m0 per block)
     // GPUTransformerWeights (add two pointers)
-    float *w_mlp1_scales_f32, *w_mlp2_scales_f32; // one float per 32 elems
     // Output weights
     __hip_bfloat16 *out; // (vocab_size, hidden_dim)
 } GPUTransformerWeights;
@@ -722,12 +721,7 @@ void malloc_gpu_weights_120b(GPUTransformerWeights *w, Config *p)
     HIP_CHECK(hipMalloc((void **)&w->w_mlp2_scales, mlp2_loc_scale_bytes * sizeof(uint8_t)));
 
     // blocks of 32 (one scale per block)
-    const size_t mlp1_loc_blocks = (mlp1_loc_elems + 31) / 32;
-    const size_t mlp2_loc_blocks = (mlp2_loc_elems + 31) / 32;
-
-    HIP_CHECK(hipMalloc((void **)&w->w_mlp1_scales_f32, mlp1_loc_blocks * sizeof(float)));
-    HIP_CHECK(hipMalloc((void **)&w->w_mlp2_scales_f32, mlp2_loc_blocks * sizeof(float)));
-
+  
     // Biases unchanged (BF16)
     const size_t b1_local = (size_t)p->n_layers * (size_t)E * (size_t)Oloc; // [L, E, Oloc]
     HIP_CHECK(hipMalloc((void **)&w->b_mlp1, b1_local * sizeof(__hip_bfloat16)));
@@ -1020,6 +1014,8 @@ static inline int tp_rank_and_size(int *rank_out)
 
 // Launch dequant for a given layer into the staging buffers in run-state.
 // Uses the local shard sizes computed from TP rank/size.
+// Launch dequant for a given layer into the staging buffers in run-state.
+// Uses the local shard sizes computed from TP rank/size.
 static inline void dequantize_mlp_layer_to_bf16(GPUTransformer *gpu_t, int layer_idx, hipStream_t sW)
 {
     Config *p = &gpu_t->config;
@@ -1050,7 +1046,7 @@ static inline void dequantize_mlp_layer_to_bf16(GPUTransformer *gpu_t, int layer
         const size_t layer_sc_off = (size_t)layer_idx * (size_t)E * seg_blocks_loc;
 
         const uint8_t *W1_packed = w->w_mlp1_mxfp4 + layer_pack_off;
-        const float *S1_f32 = w->w_mlp1_scales_f32 + layer_sc_off;
+        const uint8_t *S1_e8m0 = w->w_mlp1_scales + layer_sc_off;
 
         const int threads = 256;
         const int pairs = (int)((seg_elems_loc + 1) >> 1);
@@ -1060,7 +1056,7 @@ static inline void dequantize_mlp_layer_to_bf16(GPUTransformer *gpu_t, int layer
         dim3 block(threads);
 
         dequant_mxfp4_pairs_to_bf16_kernel<<<grid, block, 0, sW>>>(
-            st->w1_bf16_layer, W1_packed, S1_f32, E, /*N=*/o_len, /*K=*/H);
+            st->w1_bf16_layer, W1_packed, S1_e8m0, E, /*N=*/o_len, /*K=*/H);
         HIP_CHECK(hipGetLastError());
     }
 
@@ -1074,7 +1070,7 @@ static inline void dequantize_mlp_layer_to_bf16(GPUTransformer *gpu_t, int layer
         const size_t layer_sc_off = (size_t)layer_idx * (size_t)E * seg_blocks_loc;
 
         const uint8_t *W2_packed = w->w_mlp2_mxfp4 + layer_pack_off;
-        const float *S2_f32 = w->w_mlp2_scales_f32 + layer_sc_off;
+        const uint8_t *S2_e8m0 = w->w_mlp2_scales + layer_sc_off;
 
         const int threads = 256;
         const int pairs = (int)((seg_elems_loc + 1) >> 1);
@@ -1084,11 +1080,10 @@ static inline void dequantize_mlp_layer_to_bf16(GPUTransformer *gpu_t, int layer
         dim3 block(threads);
 
         dequant_mxfp4_pairs_to_bf16_kernel<<<grid, block, 0, sW>>>(
-            st->w2_bf16_layer, W2_packed, S2_f32, E, /*N=*/H, /*K=*/i_len);
+            st->w2_bf16_layer, W2_packed, S2_e8m0, E, /*N=*/H, /*K=*/i_len);
         HIP_CHECK(hipGetLastError());
     }
 }
-
 // helper: launch dequant of `layer_idx` into stage slot `slot` on s->wts_stream
 static inline void prefetch_moe_layer_into_slot(GPUTransformer *gpu_t, int layer_idx, int slot)
 {
@@ -1480,56 +1475,7 @@ static void streaming_quantize_copy_mxfp4_cpu_to_gpu_strided(
     HIP_CHECK(hipStreamDestroy(s_comp));
 }
 
-// Convert device-side E8M0 scale bytes into float multipliers.
-// Each block of 32 MXFP4 weights has one scale byte (E8M0).
-// The f32 expansion is stored in gpu_weights->w_mlp{1,2}_scales_f32.
-static void convert_all_scales_to_f32(GPUTransformerWeights *w, Config *p, hipStream_t stream = 0)
-{
-    int dev = 0;
-    HIP_CHECK(hipGetDevice(&dev));
-    const int TP = TENSOR_PARALLEL_SIZE;
-    const int rank = dev % TP;
 
-    const int H = p->hidden_dim;
-    const int D = p->intermediate_dim;
-    const int E = p->n_experts;
-    const int L = p->n_layers;
-
-    // ---- MLP1: column-parallel on output (2D) ----
-    int Ostart, Oloc;
-    {
-        const int twoD = 2 * D;
-        const int base = twoD / TP, rem = twoD % TP;
-        Oloc = base + (rank < rem ? 1 : 0);
-        Ostart = rank * base + (rank < rem ? rank : rem);
-    }
-    const size_t seg1_blocks_loc = ((size_t)Oloc * (size_t)H + 31) / 32;
-    const size_t total_blocks_mlp1 = (size_t)L * (size_t)E * seg1_blocks_loc;
-    if (total_blocks_mlp1)
-    {
-        launch_e8m0_to_f32(w->w_mlp1_scales, w->w_mlp1_scales_f32,
-                           total_blocks_mlp1, stream);
-    }
-
-    // ---- MLP2: row-parallel on input (D) ----
-    int Istart, Kloc;
-    {
-        const int base = D / TP, rem = D % TP;
-        Kloc = base + (rank < rem ? 1 : 0);
-        Istart = rank * base + (rank < rem ? rank : rem);
-    }
-    const size_t seg2_blocks_loc = ((size_t)H * (size_t)Kloc + 31) / 32;
-    const size_t total_blocks_mlp2 = (size_t)L * (size_t)E * seg2_blocks_loc;
-    if (total_blocks_mlp2)
-    {
-        launch_e8m0_to_f32(w->w_mlp2_scales, w->w_mlp2_scales_f32,
-                           total_blocks_mlp2, stream);
-    }
-
-    HIP_CHECK(hipStreamSynchronize(stream));
-    // printf("[MXFP4] Converted %zu MLP1 + %zu MLP2 scale blocks to f32\n",
-    //        total_blocks_mlp1, total_blocks_mlp2);
-}
 
 void copy_weights_to_gpu_120b(Transformer *transformer, GPUTransformerWeights *gpu_weights)
 {
@@ -1767,7 +1713,6 @@ void copy_weights_to_gpu_120b(Transformer *transformer, GPUTransformerWeights *g
             }
         }
     }
-    convert_all_scales_to_f32(gpu_weights, p);
 
     printf("Weights copied (TP optimized): per-layer strided-gather tiling for MLP1/MLP2, biases BF16.\n");
 }
@@ -1905,7 +1850,7 @@ void warm_up(Transformer *transformer, Tokenizer *tokenizer)
     if (IS_20B_MODEL)
         BATCH_SIZE = 1536, TENSOR_PARALLEL_SIZE = 2;
     else
-        BATCH_SIZE = 1536, TENSOR_PARALLEL_SIZE = 4;
+        BATCH_SIZE = 1856, TENSOR_PARALLEL_SIZE = 4;
 
     HIP_CHECK(hipGetDeviceCount(&num_gpus));
     if (num_gpus > MAX_GPUS)
