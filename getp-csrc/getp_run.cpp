@@ -1905,7 +1905,7 @@ void warm_up(Transformer *transformer, Tokenizer *tokenizer)
     if (IS_20B_MODEL)
         BATCH_SIZE = 1536, TENSOR_PARALLEL_SIZE = 2;
     else
-        BATCH_SIZE = 1792, TENSOR_PARALLEL_SIZE = 4;
+        BATCH_SIZE = 1536, TENSOR_PARALLEL_SIZE = 4;
 
     HIP_CHECK(hipGetDeviceCount(&num_gpus));
     if (num_gpus > MAX_GPUS)
@@ -3127,51 +3127,52 @@ void moe_gpu_120b(GPUTransformer *gpu_t, int layer_idx, int batch_size,
     s->w1_bf16_layer = s->w1_bf16_stage[use];
     s->w2_bf16_layer = s->w2_bf16_stage[use];
 
-    // 5) MLP1 (column-parallel O=2D), MXFP4 packed weights; A is bf16, C is bf16
+    // 5) MLP1 (column-parallel on O=2D): **bf16 A**
     int o_len = 0;
     {
-        // TIMER_BLOCK("MLP1_bf16_stagedW");
+        // TIMER_BLOCK("MLP1");
         const int twoD = 2 * D;
-        const int base = twoD / TPx, rem = twoD % TPx;
-        o_len = base + (rank_in_group < rem ? 1 : 0); // <-- remove 'const int'
+        const int base = twoD / TPx;
+        const int rem = twoD % TPx;
+        o_len = base + (rank_in_group < rem ? 1 : 0);
+
+        const size_t seg1_loc = (size_t)o_len * H; // per-expert stride in local shard
         const __hip_bfloat16 *W1 = s->w1_bf16_layer;
+        const __hip_bfloat16 *b1 = w->b_mlp1 + (size_t)layer_idx * (size_t)E * (size_t)o_len;
         mlp1_optimized_outbf16<16, 16, 16, 4, 4, 4, 1, 2, 4>(
-            s->mlp1_out_g, s->expert_input_buffer_bf16_g, W1, NULL,
+            s->mlp1_out_g,
+            /*A=*/s->expert_input_buffer_bf16_g, /*bf16*/
+            /*W1=*/W1, b1,
             s->d_expert_offsets, s->d_expert_counts,
             s->d_tile2expert_g, s->d_tile2local_g,
             /*E=*/E, /*K=*/H, /*N=*/o_len, /*cur_tiles=*/cur_tiles, sMoe);
-        HIP_CHECK(hipGetLastError());
     }
 
-    // 6) SwiGLU + bias -> gate_up_bf16_g with Dloc = o_len/2
+    // 6) SwiGLU + bias (produces fp32) + cast to bf16 for MLP2 input
     const int Dloc = o_len / 2;
     {
-        // TIMER_BLOCK("bias_swiglu_epilogue_kernel_bf16_mlp_in_bf16");
-        const __hip_bfloat16 *b1 =
-            w->b_mlp1 + (size_t)layer_idx * (size_t)E * (size_t)o_len;
+        // TIMER_BLOCK("bias_swiglu_epilogue_kernel_bf16");
         const size_t work = (size_t)total_tokens * (size_t)Dloc;
         if (work > 0)
         {
             const int T = 256;
             dim3 grid2((int)((work + T - 1) / T)), block2(T);
-            bias_swiglu_epilogue_kernel_bf16_mlp_in_bf16<<<grid2, block2, 0, sMoe>>>(
-                s->mlp1_out_g, b1,
-                s->d_expert_offsets, s->d_expert_counts, E,
-                /*OUT*/ s->gate_up_bf16_g,
+            swiglu_epilogue_kernel_bf16_mlp_in_bf16<<<grid2, block2, 0, sMoe>>>(
+                s->mlp1_out_g,
+                /*OUT*/ s->gate_up_bf16_g, // <<< bf16 buffer
                 /*D=*/Dloc, total_tokens, p->swiglu_limit, 1.702f);
             HIP_CHECK(hipGetLastError());
         }
     }
 
-    // 7) MLP2 (row-parallel on input D), MXFP4 (+bias), A is bf16, C is bf16
+    // 7) MLP2 (row-parallel on input D), **bf16 A**
     {
-        // TIMER_BLOCK("MLP2_bf16_stagedW");
+        // TIMER_BLOCK("MLP2");
         int i_len, i_start;
         {
             const int base = D / TPx, rem = D % TPx;
             i_len = base + (rank_in_group < rem ? 1 : 0);
             i_start = rank_in_group * base + (rank_in_group < rem ? rank_in_group : rem);
-            (void)i_start;
         }
         if (i_len != Dloc)
         {
@@ -3179,19 +3180,20 @@ void moe_gpu_120b(GPUTransformer *gpu_t, int layer_idx, int batch_size,
             abort();
         }
 
-        const __hip_bfloat16 *W2 = s->w2_bf16_layer; // [E, H, i_len]
+        const size_t seg2_loc = (size_t)H * (size_t)i_len;
+        const __hip_bfloat16 *W2 = s->w2_bf16_layer;
         const __hip_bfloat16 *b2s = w->b_mlp2 + (size_t)layer_idx * (size_t)E * H;
 
         mlp2_optimized_outbf16<16, 16, 16, 4, 4, 4, 1, 2, 4>(
             s->expert_output_partial_g,
-            /*A=*/s->gate_up_bf16_g,
-            /*W2=*/W2,
-            /*b2=*/b2s,
+            /*A=*/s->gate_up_bf16_g, /*bf16*/
+            W2, b2s,
             s->d_expert_offsets, s->d_expert_counts,
             s->d_tile2expert_g, s->d_tile2local_g,
             /*E=*/E, /*K=*/i_len, /*N=*/H, /*cur_tiles=*/cur_tiles, sMoe);
         HIP_CHECK(hipGetLastError());
     }
+
 
     // 8) Reduce over experts -> token-wise union e_agg_g[Bgrp,H]
     {
