@@ -2664,11 +2664,17 @@ void moe_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size,
                                  E * sizeof(int), hipMemcpyHostToDevice, sMoe));
 
     // 3b) Build tile maps
+    int max_cnt = 0;
+    for (int e = 0; e < E; ++e) {
+        max_cnt = max(max_cnt, cpu->expert_counts[e]);
+    }
+    int BLOCK_M = (max_cnt < 1536 ? 4 * 16 : 4 * 32);
+
     int cur_tiles = 0;
     for (int e = 0; e < E; ++e)
     {
         const int cnt = cpu->expert_counts[e];
-        const int tiles = (cnt + BLOCK_M_MLP - 1) / BLOCK_M_MLP;
+        const int tiles = (cnt + BLOCK_M - 1) / BLOCK_M;
         for (int m = 0; m < tiles; ++m)
         {
             cpu->h_tile2expert[cur_tiles + m] = e;
@@ -2742,13 +2748,23 @@ void moe_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size,
         const size_t seg1_loc = (size_t)o_len * H; // per-expert stride in local shard
         const __hip_bfloat16 *W1 = w->w_mlp1 + (size_t)layer_idx * (size_t)E * seg1_loc;
         const __hip_bfloat16 *b1 = w->b_mlp1 + (size_t)layer_idx * (size_t)E * (size_t)o_len;
-        mlp1_optimized_outbf16<16, 16, 16, 4, 4, 4, 1, 2, 4>(
+        if (BLOCK_M == 16 * 4) {
+            mlp1_optimized_outbf16<16, 16, 16, 4, 4, 4, 1, 2, 4>(
             s->mlp1_out_g,
             /*A=*/s->expert_input_buffer_bf16_g, /*bf16*/
             /*W1=*/W1, b1,
             s->d_expert_offsets, s->d_expert_counts,
             s->d_tile2expert_g, s->d_tile2local_g,
             /*E=*/E, /*K=*/H, /*N=*/o_len, /*cur_tiles=*/cur_tiles, sMoe);
+        } else {
+            mlp_optimized_outbf16<32, 32, 8, 4, 4, 4, 1, 2, 4>(
+                s->mlp1_out_g,
+                /*A=*/s->expert_input_buffer_bf16_g, /*bf16*/
+                /*W1=*/W1, b1,
+                s->d_expert_offsets, s->d_expert_counts,
+                s->d_tile2expert_g, s->d_tile2local_g,
+                /*E=*/E, /*K=*/H, /*N=*/o_len, /*cur_tiles=*/cur_tiles, sMoe);
+        }
     }
 
     // 6) SwiGLU + bias (produces fp32) + cast to bf16 for MLP2 input
@@ -2787,13 +2803,23 @@ void moe_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size,
         const __hip_bfloat16 *W2 = w->w_mlp2 + (size_t)layer_idx * (size_t)E * seg2_loc;
         const __hip_bfloat16 *b2s = w->b_mlp2 + (size_t)layer_idx * (size_t)E * H;
 
-        mlp2_optimized_outbf16<16, 16, 16, 4, 4, 4, 1, 2, 4>(
+        if (BLOCK_M == 16 * 4) {
+            mlp2_optimized_outbf16<16, 16, 16, 4, 4, 4, 1, 2, 4>(
             s->expert_output_partial_g,
             /*A=*/s->gate_up_bf16_g, /*bf16*/
             W2, b2s,
             s->d_expert_offsets, s->d_expert_counts,
             s->d_tile2expert_g, s->d_tile2local_g,
-            /*E=*/E, /*K=*/i_len, /*N=*/H, /*cur_tiles=*/cur_tiles, sMoe);
+            /*E=*/E, /*K=*/i_len, /*N=*/H, /*cur_tiles=*/cur_tiles, sMoe);    
+        } else {
+            mlp_optimized_outbf16<32, 32, 8, 4, 4, 4, 1, 2, 4>(
+                s->expert_output_partial_g,
+                /*A=*/s->gate_up_bf16_g, /*bf16*/
+                W2, b2s,
+                s->d_expert_offsets, s->d_expert_counts,
+                s->d_tile2expert_g, s->d_tile2local_g,
+                /*E=*/E, /*K=*/i_len, /*N=*/H, /*cur_tiles=*/cur_tiles, sMoe);
+            }
         HIP_CHECK(hipGetLastError());
     }
 
@@ -3013,11 +3039,17 @@ void moe_gpu_120b(GPUTransformer *gpu_t, int layer_idx, int batch_size,
     }
 
     // Build tile maps and copy to device
+    int max_cnt = 0;
+    for (int e = 0; e < E; ++e) {
+        max_cnt = max(max_cnt, cpu->expert_counts[e]);
+    }
+    int BLOCK_M = (max_cnt < 1536 ? 4 * 16 : 4 * 32);
+
     int cur_tiles = 0;
     for (int e = 0; e < E; ++e)
     {
         const int cnt = cpu->expert_counts[e];
-        const int tiles = (cnt + BLOCK_M_MLP - 1) / BLOCK_M_MLP;
+        const int tiles = (cnt + BLOCK_M - 1) / BLOCK_M;
         for (int m = 0; m < tiles; ++m)
         {
             cpu->h_tile2expert[cur_tiles + m] = e;
@@ -3025,6 +3057,7 @@ void moe_gpu_120b(GPUTransformer *gpu_t, int layer_idx, int batch_size,
         }
         cur_tiles += tiles;
     }
+    
     if (cur_tiles > s->cap_tiles)
     {
         fprintf(stderr, "[MoE] tiles(%d) > cap_tiles(%d). Increase cap or adjust BLOCK_M_MLP.\n",
@@ -3084,13 +3117,24 @@ void moe_gpu_120b(GPUTransformer *gpu_t, int layer_idx, int batch_size,
         const size_t seg1_loc = (size_t)o_len * H; // per-expert stride in local shard
         const __hip_bfloat16 *W1 = s->w1_bf16_layer;
         const __hip_bfloat16 *b1 = w->b_mlp1 + (size_t)layer_idx * (size_t)E * (size_t)o_len;
-        mlp1_optimized_outbf16<16, 16, 16, 4, 4, 4, 1, 2, 4>(
+
+        if (BLOCK_M == 16 * 4) {
+            mlp1_optimized_outbf16<16, 16, 16, 4, 4, 4, 1, 2, 4>(
             s->mlp1_out_g,
             /*A=*/s->expert_input_buffer_bf16_g, /*bf16*/
             /*W1=*/W1, b1,
             s->d_expert_offsets, s->d_expert_counts,
             s->d_tile2expert_g, s->d_tile2local_g,
             /*E=*/E, /*K=*/H, /*N=*/o_len, /*cur_tiles=*/cur_tiles, sMoe);
+        } else {
+            mlp_optimized_outbf16<32, 32, 8, 4, 4, 4, 1, 2, 4>(
+                s->mlp1_out_g,
+                /*A=*/s->expert_input_buffer_bf16_g, /*bf16*/
+                /*W1=*/W1, b1,
+                s->d_expert_offsets, s->d_expert_counts,
+                s->d_tile2expert_g, s->d_tile2local_g,
+                /*E=*/E, /*K=*/H, /*N=*/o_len, /*cur_tiles=*/cur_tiles, sMoe);
+        }
     }
 
     // 6) SwiGLU + bias (produces fp32) + cast to bf16 for MLP2 input
@@ -3129,13 +3173,23 @@ void moe_gpu_120b(GPUTransformer *gpu_t, int layer_idx, int batch_size,
         const __hip_bfloat16 *W2 = s->w2_bf16_layer;
         const __hip_bfloat16 *b2s = w->b_mlp2 + (size_t)layer_idx * (size_t)E * H;
 
-        mlp2_optimized_outbf16<16, 16, 16, 4, 4, 4, 1, 2, 4>(
+        if (BLOCK_M == 16 * 4) {
+            mlp2_optimized_outbf16<16, 16, 16, 4, 4, 4, 1, 2, 4>(
             s->expert_output_partial_g,
             /*A=*/s->gate_up_bf16_g, /*bf16*/
             W2, b2s,
             s->d_expert_offsets, s->d_expert_counts,
             s->d_tile2expert_g, s->d_tile2local_g,
-            /*E=*/E, /*K=*/i_len, /*N=*/H, /*cur_tiles=*/cur_tiles, sMoe);
+            /*E=*/E, /*K=*/i_len, /*N=*/H, /*cur_tiles=*/cur_tiles, sMoe);    
+        } else {
+            mlp_optimized_outbf16<32, 32, 8, 4, 4, 4, 1, 2, 4>(
+                s->expert_output_partial_g,
+                /*A=*/s->gate_up_bf16_g, /*bf16*/
+                W2, b2s,
+                s->d_expert_offsets, s->d_expert_counts,
+                s->d_tile2expert_g, s->d_tile2local_g,
+                /*E=*/E, /*K=*/i_len, /*N=*/H, /*cur_tiles=*/cur_tiles, sMoe);
+            }
         HIP_CHECK(hipGetLastError());
     }
 

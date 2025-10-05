@@ -3183,3 +3183,256 @@ inline void mlp2_optimized_outbf16(
         E, K, N);
     HIP_CHECK(hipGetLastError());
 }
+
+
+// ===================================
+// grouped MLP-1 (bf16 out, fused bias) using 32x32x8 MFMA
+// ===================================
+template<
+    int WM = 32, int WN = 32, int WK = 8,            // 32x32x8 tiles
+    int WAVES_M = 1, int WAVES_N = 4, int WAVES_K = 4, // BLOCK_K = 32 by default
+    int TW_M = 1, int TW_N = 2,                      // wave-level tiling inside block tile
+    int PAD_K_MC = 16>
+__global__ __launch_bounds__(32 * (2 * ((WAVES_M / TW_M) * (WAVES_N / TW_N))), 2)
+void grouped_mlp1_bf16_bias_kernel_tiled_optimized_outbf16_32x32x8(
+    __hip_bfloat16 *__restrict__ C,        // [sum_tokens, N] (bf16)
+    const __hip_bfloat16 *__restrict__ A,  // [sum_tokens, K] (bf16)
+    const __hip_bfloat16 *__restrict__ W2, // [E, N, K] bf16  (row-major N, col-major K as you use)
+    const __hip_bfloat16 *__restrict__ b2, // [E, N] bf16
+    const int *__restrict__ expert_offsets,   // [E]
+    const int *__restrict__ expert_counts,    // [E]
+    const int *__restrict__ tile2expert,      // [num_mtiles]
+    const int *__restrict__ tile2local,       // [num_mtiles]
+    int E, int K, int N)
+{
+    static_assert(WM==32 && WN==32 && WK==8, "This kernel targets 32x32x8 bf16 MFMA.");
+    // ---- Block shapes (block-wide tiles) ----
+    constexpr int BLOCK_M = WM * WAVES_M;        // rows covered by a block
+    constexpr int BLOCK_N = WN * WAVES_N;        // cols covered by a block
+    constexpr int BLOCK_K = WK * WAVES_K;        // K-chunk per LDS fill
+
+    // ---- “effective” wavegrid (waves after TW_M/TW_N packing) ----
+    constexpr int WAVES_M_E = (WAVES_M / TW_M);
+    constexpr int WAVES_N_E = (WAVES_N / TW_N);
+    constexpr int WAVES_PER_BLOCK_E = WAVES_M_E * WAVES_N_E;
+
+    // ---- segmentation (respect 1024 threads/block) ----
+    constexpr int LANE_PER_WAVE = 64;
+    constexpr int MAX_HW_WAVES = 1024 / LANE_PER_WAVE;            // 16 on AMD
+    constexpr int WAVES_LAUNCHED_E = (WAVES_PER_BLOCK_E <= MAX_HW_WAVES)
+                                       ? WAVES_PER_BLOCK_E : MAX_HW_WAVES;
+    constexpr int SEGMENTS_E = (WAVES_PER_BLOCK_E + WAVES_LAUNCHED_E - 1) / WAVES_LAUNCHED_E;
+
+    // ---- Which expert / which M-tile are we? ----
+    const int mtile_id = blockIdx.y;
+    const int e        = tile2expert[mtile_id];
+    const int tile_m   = tile2local[mtile_id];
+
+    // Row range this block is responsible for (within expert e)
+    const int m_start = expert_offsets[e] + tile_m * BLOCK_M;
+    const int m_left  = expert_counts[e] - tile_m * BLOCK_M;
+    if (m_left <= 0) return;
+    const int M_bound = m_start + m_left;
+
+    // Column origin for this block (in N)
+    const int n0 = blockIdx.x * BLOCK_N;
+
+    // Expert-local pointers
+    const __hip_bfloat16 *__restrict__ W_e = W2 + (size_t)e * (size_t)N * (size_t)K;
+    const __hip_bfloat16 *__restrict__ b_e = b2 + (size_t)e * (size_t)N;
+
+    // ---- Thread geometry (x=32, y=2*WAVES_LAUNCHED_E) like your 32x32x8 matmul path ----
+    const int tx      = threadIdx.x;                           // 0..31
+    const int ty      = threadIdx.y;                           // 0..(2*WAVES_LAUNCHED_E - 1)
+    const int threadsPerBlock = blockDim.x * blockDim.y;       // 32 * (2*WAVES_LAUNCHED_E)
+    const int linearT = ty * blockDim.x + tx;                  // for vectorized copy helpers
+
+    // ---- Shared memory: single buffer [A | B] ----
+    extern __shared__ uint8_t smemRaw[];
+    constexpr int ldA = BLOCK_K + PAD_K_MC; // bf16 pitch
+    constexpr int ldB = BLOCK_K + PAD_K_MC;
+
+    const size_t sA_bytes = sizeof(uint16_t) * (size_t)(BLOCK_M * ldA);
+    const size_t sB_off   = (sA_bytes + 15) & ~size_t(15);
+
+    uint16_t *__restrict__ sA_u16 = reinterpret_cast<uint16_t *>(smemRaw);
+    uint16_t *__restrict__ sB_u16 = reinterpret_cast<uint16_t *>(smemRaw + sB_off);
+    uint32_t *__restrict__ sA_u32 = reinterpret_cast<uint32_t *>(sA_u16);
+    uint32_t *__restrict__ sB_u32 = reinterpret_cast<uint32_t *>(sB_u16);
+
+    // ---- Accumulators: one f32x16 per (TW_M,TW_N) tile per segment ----
+    f32x16 acc[SEGMENTS_E][TW_M][TW_N];
+    #pragma unroll
+    for (int s = 0; s < SEGMENTS_E; ++s)
+    #pragma unroll
+    for (int tm = 0; tm < TW_M; ++tm)
+    #pragma unroll
+    for (int tn = 0; tn < TW_N; ++tn) {
+        f32x16 z;
+        #pragma unroll
+        for (int i = 0; i < 16; ++i) z[i] = 0.0f;
+        acc[s][tm][tn] = z;
+    }
+
+    // ---- Main K-loop: vectorized copies (128b) + 32x32x8 MFMA consumption ----
+    for (int k0 = 0; k0 < K; k0 += BLOCK_K)
+    {
+        // Global -> LDS (A: [BLOCK_M x BLOCK_K], B: [BLOCK_N x BLOCK_K])
+        copy_A_tile_vec128_bf16_tiled_32<ldA, BLOCK_M, BLOCK_K>(
+            sA_u32, A, m_start, M_bound, K, k0, linearT, threadsPerBlock);
+        copy_B_tile_vec128_bf16_tiled_32<ldB, BLOCK_N, BLOCK_K>(
+            sB_u32, W_e, n0, N, K, k0, linearT, threadsPerBlock);
+
+        __syncthreads();
+
+        // Work through all virtual-wave segments on this K-slice
+        #pragma unroll
+        for (int s = 0; s < SEGMENTS_E; ++s)
+        {
+            // wave_eid(): returns 0..(WAVES_LAUNCHED_E-1) for our (32, 2*WAVES_LAUNCHED_E) block
+            const int wave_local = wave_eid();
+            const int wave_full  = wave_local + s * WAVES_LAUNCHED_E;
+            if (wave_full >= WAVES_PER_BLOCK_E) break;
+
+            // Effective wave coordinates in (WAVES_M_E x WAVES_N_E)
+            const int wave_m_eff = wave_full / WAVES_N_E;
+            const int wave_n_eff = wave_full % WAVES_N_E;
+
+            // Wave's multi-tiles inside the block
+            const int tile_m0 = wave_m_eff * TW_M;
+            const int tile_n0 = wave_n_eff * TW_N;
+
+            // Base (within the LDS tiles) for this wave's first TW_M/TW_N tiles
+            const int aBase0 = tile_m0 * WM;
+            const int bBase0 = tile_n0 * WN;
+
+            // Consume BLOCK_K in chunks of WK=8
+            #pragma unroll
+            for (int kk = 0; kk < BLOCK_K; kk += WK)
+            {
+                bf16x4 avec[TW_M];
+                bf16x4 bvec[TW_N];
+
+                #pragma unroll
+                for (int tm = 0; tm < TW_M; ++tm) {
+                    const int aRowBase = aBase0 + tm * WM;
+                    avec[tm] = make_a_vec_k32<WM>(sA_u16, ldA, aRowBase, kk);
+                }
+                #pragma unroll
+                for (int tn = 0; tn < TW_N; ++tn) {
+                    const int bColBase = bBase0 + tn * WN;
+                    bvec[tn] = make_b_vec_k32<WN>(sB_u16, ldB, bColBase, kk);
+                }
+
+                #pragma unroll
+                for (int tm = 0; tm < TW_M; ++tm)
+                #pragma unroll
+                for (int tn = 0; tn < TW_N; ++tn) {
+                    acc[s][tm][tn] = mfma_32x32x8_bf16(avec[tm], bvec[tn], acc[s][tm][tn]);
+                }
+            }
+        }
+
+        __syncthreads();
+    }
+
+    // ---- Store (+ bias). Fast interior path, guarded edges otherwise. ----
+    const bool interior_full = (m_left >= BLOCK_M) && ((n0 + BLOCK_N) <= N);
+
+    #pragma unroll
+    for (int s = 0; s < SEGMENTS_E; ++s)
+    {
+        const int wave_local = wave_eid();
+        const int wave_full  = wave_local + s * WAVES_LAUNCHED_E;
+        if (wave_full >= WAVES_PER_BLOCK_E) break;
+
+        const int wave_m_eff = wave_full / WAVES_N_E;
+        const int wave_n_eff = wave_full % WAVES_N_E;
+
+        #pragma unroll
+        for (int tm = 0; tm < TW_M; ++tm)
+        #pragma unroll
+        for (int tn = 0; tn < TW_N; ++tn)
+        {
+            const int wmt = wave_m_eff * TW_M + tm;
+            const int wnt = wave_n_eff * TW_N + tn;
+
+            if (interior_full) {
+                // Fully interior: vectorized fast path
+                store_and_fuse_tile32<WM, WN, /*Interior=*/true>(
+                    acc[s][tm][tn], C, b_e, /*M=*/INT_MAX /*unused in interior*/,
+                    N, /*m0=*/m_start, /*n0=*/n0, wmt, wnt);
+            } else {
+                // Edges: bounds-checked path
+                store_and_fuse_tile32<WM, WN, /*Interior=*/false>(
+                    acc[s][tm][tn], C, b_e, /*M=*/M_bound, N, m_start, n0, wmt, wnt);
+            }
+        }
+    }
+}
+
+// -----------------------------------
+// Launcher (32x32x8 bf16 MLP1, fused bias, bf16 out)
+// -----------------------------------
+template<
+    int WM = 32, int WN = 32, int WK = 8,
+    int WAVES_M = 1, int WAVES_N = 4, int WAVES_K = 4,   // BLOCK_K = 32
+    int TW_M = 1, int TW_N = 2,
+    int PAD_K_MC = 16>
+inline void mlp_optimized_outbf16(
+    __hip_bfloat16 *C,       // [sum_tokens, N] (bf16)
+    const __hip_bfloat16 *A, // [sum_tokens, K] (bf16)
+    const __hip_bfloat16 *W2,// [E, N, K] (bf16)
+    const __hip_bfloat16 *b2,// [E, N] (bf16)
+    const int *expert_offsets, const int *expert_counts,
+    const int *tile2expert, const int *tile2local,
+    int E, int K, int N, int cur_tiles,
+    hipStream_t stream = nullptr)
+{
+    static_assert(WM==32 && WN==32 && WK==8, "32x32x8 bf16 path");
+
+    // Block tiles (note: LDS tiles are [BLOCK_M x BLOCK_K] and [BLOCK_N x BLOCK_K])
+    constexpr int BLOCK_M = WM * WAVES_M;
+    constexpr int BLOCK_N = WN * WAVES_N;
+    constexpr int BLOCK_K = WK * WAVES_K;
+
+    // Effective waves (after TW packing)
+    constexpr int WAVES_M_E = (WAVES_M / TW_M);
+    constexpr int WAVES_N_E = (WAVES_N / TW_N);
+    constexpr int WAVES_PER_BLOCK_E = WAVES_M_E * WAVES_N_E;
+
+    // Segmentation
+    constexpr int LANE_PER_WAVE = 64;
+    constexpr int MAX_HW_WAVES  = 1024 / LANE_PER_WAVE; // 16
+    constexpr int WAVES_LAUNCHED_E = (WAVES_PER_BLOCK_E <= MAX_HW_WAVES)
+                                       ? WAVES_PER_BLOCK_E : MAX_HW_WAVES;
+
+    // Grid/block
+    dim3 grid((N + BLOCK_N - 1) / BLOCK_N, cur_tiles);
+    // IMPORTANT: use (x=32, y=2*waves) so wave_eid() matches the 32x32x8 path
+    dim3 block(32, 2 * WAVES_LAUNCHED_E);
+
+    // Shared memory footprint (single buffer [A|B], both bf16, 128b-aligned join)
+    constexpr int ldA = BLOCK_K + PAD_K_MC;
+    constexpr int ldB = BLOCK_K + PAD_K_MC;
+    const size_t sA_bytes   = sizeof(uint16_t) * (size_t)(BLOCK_M * ldA);
+    const size_t sB_bytes   = sizeof(uint16_t) * (size_t)(BLOCK_N * ldB);
+    const size_t sB_off     = (sA_bytes + 15) & ~size_t(15);
+    const size_t shmem_bytes = sB_off + sB_bytes;
+
+#ifdef assert_smem_or_die
+    assert_smem_or_die(
+        shmem_bytes,
+        "grouped_mlp1_bf16_bias_kernel_tiled_optimized_outbf16_32x32x8(vec128,singlebuf,segmented)");
+#endif
+
+    hipLaunchKernelGGL(
+        (grouped_mlp1_bf16_bias_kernel_tiled_optimized_outbf16_32x32x8<
+            WM, WN, WK, WAVES_M, WAVES_N, WAVES_K, TW_M, TW_N, PAD_K_MC>),
+        grid, block, shmem_bytes, stream,
+        C, A, W2, b2,
+        expert_offsets, expert_counts,
+        tile2expert, tile2local,
+        E, K, N);
+    HIP_CHECK(hipGetLastError());
+}

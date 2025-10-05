@@ -970,7 +970,7 @@ __device__ inline void store_and_fuse_tile32(const f32x16& acc,
             }
             __hip_bfloat16 v = acc[elem];
             v += bias[col];
-            v += X[(size_t)row * N + col];
+            // v += X[(size_t)row * N + col];
             X[(size_t)row * N + col] = v;
         }
     }
