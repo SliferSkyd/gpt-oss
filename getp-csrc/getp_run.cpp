@@ -2663,7 +2663,7 @@ void moe_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size,
     for (int e = 0; e < E; ++e) {
         max_cnt = max(max_cnt, cpu->expert_counts[e]);
     }
-    int BLOCK_M = (max_cnt < 1024 ? 4 * 16 : 4 * 32);
+    int BLOCK_M = (max_cnt < 900 ? 4 * 16 : 4 * 32);
 
     int cur_tiles = 0;
     for (int e = 0; e < E; ++e)

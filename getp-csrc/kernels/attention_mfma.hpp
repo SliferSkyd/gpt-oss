@@ -2859,3 +2859,169 @@ __global__ __launch_bounds__(256, 4) void flashdecoding_fused_fastmerge_nostage_
 
 
 }
+
+
+__global__ void flash_decoding_kernel_opt_old(
+    __hip_bfloat16 *__restrict__ output, const __hip_bfloat16 *__restrict__ q,
+    const __hip_bfloat16 *__restrict__ key_cache,
+    const __hip_bfloat16 *__restrict__ value_cache,
+    const __hip_bfloat16 *__restrict__ sinks, const __hip_bfloat16 * /*mask*/,
+    const int *__restrict__ seq_lengths,
+    int B, int H, int KVH, int D, int /*seq_len*/,
+    int L, int layer_idx, bool use_sw,
+    size_t batch_kv_stride, size_t layer_kv_offset, int /*tile_t_unused*/)
+{
+    // --- Block/Thread/Warp setup (Không thay đổi) ---
+    const int kv_h = blockIdx.x, b = blockIdx.y;
+    if (b >= B || kv_h >= KVH || D != 64)
+        return;
+    const int tix = threadIdx.x;
+    const int lane = tix & 63;
+    const int wid = tix >> 6;
+    const int nwarps = blockDim.x >> 6;
+    const int hloc = lane >> 3;
+    const int li = lane & 7;
+    const int gqa = H / KVH;
+    const int h = kv_h * gqa + hloc;
+    if (h >= H)
+        return;
+    const int d_start = li * 8;
+    // --- Tính toán n_steps và các con trỏ (Không thay đổi) ---
+    const int pos = seq_lengths[b];
+    const bool do_sw = (use_sw && ((layer_idx & 1) == 0));
+    const int t_start = do_sw ? max(0, pos - (SW_WINDOW - 1)) : 0;
+    const int n_steps = pos - t_start + 1;
+    const int kv_dim = D * KVH;
+    const __hip_bfloat16 *__restrict__ K0 =
+        key_cache + (size_t)b * batch_kv_stride + layer_kv_offset + (size_t)kv_h * D;
+    const __hip_bfloat16 *__restrict__ V0 =
+        value_cache + (size_t)b * batch_kv_stride + layer_kv_offset + (size_t)kv_h * D;
+    // --- Tải vector Q (Không thay đổi) ---
+    float qseg[8];
+    {
+        const float inv = 1.0f / sqrtf(64.0f);
+        const __hip_bfloat16 *__restrict__ qh = q + (size_t)b * H * D + (size_t)h * D;
+        const uint4 q_chunk = *reinterpret_cast<const uint4 *>(qh + d_start);
+        const __hip_bfloat16 *q_bf16 = reinterpret_cast<const __hip_bfloat16 *>(&q_chunk);
+#pragma unroll
+        for (int s = 0; s < 8; ++s) {
+            qseg[s] = __bfloat162float(q_bf16[s]) * inv;
+        }
+    }
+    
+    // --- Khởi tạo các biến tích lũy (Không thay đổi) ---
+    float m = -INFINITY, l = 0.f;
+    float out8[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+    // --- Vòng lặp chính - THAY ĐỔI TỪ TĨNH SANG ĐỘNG ---
+    const int CHUNK_SIZE = 32; 
+    extern __shared__ int s_dyn_mem[];
+    int* s_next_tloc_ptr = s_dyn_mem;
+    
+    if (tix == 0) {
+        *s_next_tloc_ptr = 0;
+    }
+    __syncthreads();
+    while (true) {
+        int my_chunk_start_tloc;
+        if (lane == 0) {
+            my_chunk_start_tloc = atomicAdd(s_next_tloc_ptr, CHUNK_SIZE);
+        }
+        my_chunk_start_tloc = __shfl(my_chunk_start_tloc, 0, 64);
+        if (my_chunk_start_tloc >= n_steps) {
+            break;
+        }
+        
+        const int t_end_for_chunk = min(my_chunk_start_tloc + CHUNK_SIZE, n_steps);
+        for (int tloc = my_chunk_start_tloc; tloc < t_end_for_chunk; ++tloc) {
+            const int t_abs = t_start + tloc;
+            const int tw = do_sw ? (t_abs % SW_WINDOW) : t_abs;
+            // Q.K^T
+            const size_t k_offset = (size_t)tw * kv_dim + d_start;
+            const uint4 k_chunk = *reinterpret_cast<const uint4 *>(K0 + k_offset);
+            const __hip_bfloat16 *k_bf16 = reinterpret_cast<const __hip_bfloat16 *>(&k_chunk);
+            float part = 0.f;
+#pragma unroll
+            for (int s = 0; s < 8; ++s) {
+                part = fmaf(qseg[s], __bfloat162float(k_bf16[s]), part);
+            }
+            part += __shfl_xor(part, 4, 8);
+            part += __shfl_xor(part, 2, 8);
+            part += __shfl_xor(part, 1, 8);
+            float alpha = 1.f, w = 0.f;
+            if (li == 0) {
+                const float s = part;
+                const float mNew = fmaxf(m, s);
+                alpha = __expf(m - mNew);
+                const float dm = s - mNew;
+                w = (dm > -SOFTMAX_PHI) ? __expf(dm) : 0.f;
+                l = l * alpha + w;
+                m = mNew;
+            }
+            alpha = __shfl(alpha, (hloc << 3), 64);
+            w = __shfl(w, (hloc << 3), 64);
+            // S.V
+            const size_t v_offset = (size_t)tw * kv_dim + d_start;
+            const uint4 v_chunk = *reinterpret_cast<const uint4 *>(V0 + v_offset);
+            const __hip_bfloat16 *v_bf16 = reinterpret_cast<const __hip_bfloat16 *>(&v_chunk);
+#pragma unroll
+            for (int s = 0; s < 8; ++s) {
+                out8[s] = fmaf(w, __bfloat162float(v_bf16[s]), out8[s] * alpha);
+            }
+        }
+    }
+    // --- Inter-warp reduction ---
+    float *redbuf = (float*)(s_dyn_mem + 1);
+    float *red_m = redbuf;
+    float *red_l = red_m + nwarps * 8;
+    float *red_out = red_l + nwarps * 8;
+    if (li == 0) {
+        red_m[wid * 8 + hloc] = m;
+        red_l[wid * 8 + hloc] = l;
+    }
+#pragma unroll
+    for (int s = 0; s < 8; ++s) {
+        red_out[((wid * 64 + ((hloc << 3) | li)) * 8 + s)] = out8[s];
+    }
+    __syncthreads();
+    if (wid == 0) {
+        const int my_h = hloc;
+        const int my_li = li;
+        float m_max = -INFINITY;
+#pragma unroll
+        for (int w = 0; w < nwarps; ++w) {
+            m_max = fmaxf(m_max, red_m[w * 8 + my_h]);
+        }
+        float l_sum = 0.f;
+        float num8[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+#pragma unroll
+        for (int w = 0; w < nwarps; ++w) {
+            const float mw = red_m[w * 8 + my_h];
+            const float scale = (mw == -INFINITY) ? 0.f : __expf(mw - m_max);
+            l_sum = fmaf(red_l[w * 8 + my_h], scale, l_sum);
+            const int base_idx = ((w * 64 + ((my_h << 3) | my_li)) * 8);
+#pragma unroll
+            for (int s = 0; s < 8; ++s) {
+                num8[s] = fmaf(red_out[base_idx + s], scale, num8[s]);
+            }
+        }
+        float alpha_sink = 1.f, l_final = l_sum;
+        if (my_li == 0) {
+            const float ss = __bfloat162float(sinks[kv_h * 8 + my_h]);
+            const float m_new = fmaxf(m_max, ss);
+            const float alpha2 = __expf(m_max - m_new);
+            const float e = __expf(ss - m_new);
+            l_final = l_sum * alpha2 + e;
+            alpha_sink = alpha2;
+        }
+        alpha_sink = __shfl(alpha_sink, (my_h << 3), 64);
+        l_final = __shfl(l_final, (my_h << 3), 64);
+        __hip_bfloat16 *__restrict__ oh = output + (size_t)b * H * D + (size_t)h * D;
+        __hip_bfloat16 out_bf16[8];
+#pragma unroll
+        for (int s = 0; s < 8; ++s) {
+            const float val = (num8[s] * alpha_sink) / (l_final + SOFTMAX_EPS);
+            out_bf16[s] = __float2bfloat16(val);
+        }
+        *reinterpret_cast<uint4 *>(oh + d_start) = *reinterpret_cast<uint4 *>(out_bf16);
+    }
+}
