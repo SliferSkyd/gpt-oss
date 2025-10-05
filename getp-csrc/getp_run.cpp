@@ -39,7 +39,7 @@
 #ifndef GETP_RUN
 #define GETP_RUN
 
-#define BLOCK_M_MLP 16 * 4
+#define BLOCK_M_MLP (16 * 4)
 
 int num_gpus = 1;
 bool IS_20B_MODEL = 1;
@@ -2117,13 +2117,32 @@ void attention_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size,
 
         // GQA ratio (should be 8 for this kernel path)
         const int kv_mul = H / NKv; // == 8
-        if (kv_mul != 8 || D != 64)
+        if (false)
         {
-            // Fall back to your baseline if you want, or assert.
-            // For now, just return to avoid a bad launch.
-            HIP_CHECK(hipSuccess);
-        }
-        else
+            dim3 grid(NKv, B);
+            dim3 block(64); // 1 wave/block (đơn giản nhất)
+
+            size_t shmem =
+                (16 * 64 + 64 * 16 + 64 * 16) * sizeof(__hip_bfloat16) + (16 * 16) * sizeof(float) + 256; // headroom align
+
+            hipLaunchKernelGGL(
+                flash_decoding_kernel_opt_mfma,
+                grid, block, shmem, sAttn,
+                /* output      */ tb_mb,
+                /* q           */ q_mb,
+                /* key_cache   */ key_cache_mb,
+                /* value_cache */ value_cache_mb,
+                /* sinks       */ w->attn_sinks + (size_t)layer_idx * NA,
+                /* mask        */ s->mask,
+                /* seq_lengths */ pos_mb,
+                /* B,H,KVH,D   */ batch_size, NA, NKv, Hd,
+                /* seq_len,L   */ MAX_SEQ_LEN, p->n_layers,
+                /* layer_idx   */ layer_idx,
+                /* use_sw      */ p->sliding_window > 0,
+                /* strides     */ /* batch_kv_stride = */ layers_capacity * (size_t)KV,
+                /* offsets     */ /* layer_kv_offset  = */ layer_elem_offset,
+                /* tile_t_unused */ 0);
+        }else
         {
             // Block/grid mapping: multi-warp per (b, kv_h)
             const int WARPS = 4;          // <<< tune knob
@@ -2142,7 +2161,7 @@ void attention_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size,
                 (int)shmem);
 
             hipLaunchKernelGGL(
-                flashdecoding_fused_fastmerge_nostage_1warp8q_bf16q_bf16out_full_bf16kv,
+                flashdecoding_fused_fastmerge_nostage_1warp8q_bf16q_bf16out_full_bf16kv_okay,
                 grid, block, shmem, sAttn,
                 /* output      */ tb_mb,
                 /* q           */ q_mb,

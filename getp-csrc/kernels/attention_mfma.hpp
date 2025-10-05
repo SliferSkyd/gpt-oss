@@ -1,8 +1,11 @@
 #include <hip/hip_runtime.h>
 #include <hip/hip_bfloat16.h>
+#include <hip/hip_bf16.h>
+
 #include <hip/hip_fp16.h>
 #include <float.h>
 #include <stdint.h>
+#include "matmul.hpp"
 
 #ifndef SW_WINDOW
 #define SW_WINDOW 128
@@ -1458,7 +1461,7 @@ __global__ __launch_bounds__(256, 4) void flashdecoding_fused_fastmerge_nostage_
 // ---------------------------------
 // Kernel (bf16 q input, bf16 output)
 // ---------------------------------
-__global__ __launch_bounds__(256, 4) void flashdecoding_fused_fastmerge_nostage_1warp8q_bf16q_bf16out_full_bf16kv(
+__global__ __launch_bounds__(256, 4) void flash_decoding_kernel(
     __hip_bfloat16 *__restrict__ output, const __hip_bfloat16 *__restrict__ q,
     const __hip_bfloat16 *__restrict__ key_cache,
     const __hip_bfloat16 *__restrict__ value_cache,
@@ -1652,3 +1655,660 @@ __global__ __launch_bounds__(256, 4) void flashdecoding_fused_fastmerge_nostage_
         }
     }
 }
+
+
+
+
+// ----------------------------------------------
+// "Optimized" kernel (start with same baseline).
+// Copy of flash_decoding_kernel under new name.
+// You can safely modify/tune this one.
+// ----------------------------------------------
+__global__ __launch_bounds__(256, 4) void flashdecoding_fused_fastmerge_nostage_1warp8q_bf16q_bf16out_full_bf16kv_okay(
+    __hip_bfloat16 *__restrict__ output, const __hip_bfloat16 *__restrict__ q,
+    const __hip_bfloat16 *__restrict__ key_cache,
+    const __hip_bfloat16 *__restrict__ value_cache,
+    const __hip_bfloat16 *__restrict__ sinks, const __hip_bfloat16 * /*mask*/,
+    const int *__restrict__ seq_lengths,
+    int B, int H, int KVH, int D, int /*seq_len*/,
+    int L, int layer_idx, bool use_sw,
+    size_t batch_kv_stride, size_t layer_kv_offset, int /*tile_t_unused*/)
+{
+    const int kv_h = blockIdx.x, b = blockIdx.y;
+    if (b >= B || kv_h >= KVH || D != 64)
+        return;
+
+    const int tix = threadIdx.x;
+    const int lane = tix & 63;
+    const int wid = tix >> 6;
+    const int nwarps = blockDim.x >> 6;
+
+    const int hloc = lane >> 3; // 0..7
+    const int li = lane & 7;    // 0..7, a thread now processes a contiguous chunk
+    const int gqa = 8;
+    const int h = kv_h * gqa + hloc;
+    if (h >= H)
+        return;
+
+    // CHANGED: Each thread is responsible for a contiguous chunk of 8 dimensions (16 bytes)
+    const int d_start = li * 8;
+
+    const int pos = seq_lengths[b];
+    const bool do_sw = (use_sw && ((layer_idx & 1) == 0));
+    const int t_start = do_sw ? max(0, pos - (SW_WINDOW - 1)) : 0;
+    const int n_steps = pos - t_start + 1;
+
+    const int kv_dim = D * KVH;
+    const __hip_bfloat16 *__restrict__ K0 =
+        key_cache + (size_t)b * batch_kv_stride + layer_kv_offset + (size_t)kv_h * D;
+    const __hip_bfloat16 *__restrict__ V0 =
+        value_cache + (size_t)b * batch_kv_stride + layer_kv_offset + (size_t)kv_h * D;
+
+    float qseg[8];
+    {
+        const float inv = rsqrtf(64.f);
+        const __hip_bfloat16 *__restrict__ qh = q + (size_t)b * H * D + (size_t)h * D;
+
+        // CHANGED: Perform a single 128-bit vectorized load for Q
+        const uint4 q_chunk = *reinterpret_cast<const uint4 *>(qh + d_start);
+        const __hip_bfloat16* q_bf16 = reinterpret_cast<const __hip_bfloat16*>(&q_chunk);
+        #pragma unroll
+        for (int s = 0; s < 8; ++s) {
+            qseg[s] = __bfloat162float(q_bf16[s]) * inv;
+        }
+    }
+
+    const int t_begin = (n_steps * wid) / nwarps;
+    const int t_end   = (n_steps * (wid + 1)) / nwarps;
+
+    float m = -INFINITY, l = 0.f;
+    float out8[8] = {0,0,0,0,0,0,0,0};
+
+    for (int tloc = t_begin; tloc < t_end; ++tloc) {
+        const int t_abs = t_start + tloc;
+        const int tw = do_sw ? (t_abs % SW_WINDOW) : t_abs;
+
+        // --- Q.K^T calculation ---
+        // CHANGED: Perform a single 128-bit vectorized load for K
+        const size_t k_offset = (size_t)tw * kv_dim + d_start;
+        const uint4 k_chunk = *reinterpret_cast<const uint4 *>(K0 + k_offset);
+        const __hip_bfloat16* k_bf16 = reinterpret_cast<const __hip_bfloat16*>(&k_chunk);
+        
+        float part = 0.f;
+        #pragma unroll
+        for (int s = 0; s < 8; ++s) {
+            // Unpack and compute dot product
+            float k = __bfloat162float(k_bf16[s]);
+            part = fmaf(qseg[s], k, part);
+        }
+
+        // Intra-warp reduction logic is IDENTICAL, because we still need to sum
+        // the `part` values from the 8 threads (li=0..7) in the same hloc group.
+        part += __shfl_xor(part, 4, 8);
+        part += __shfl_xor(part, 2, 8);
+        part += __shfl_xor(part, 1, 8);
+
+        float alpha = 1.f, w = 0.f;
+        if (li == 0) {
+            const float s = part;
+            const float mNew = fmaxf(m, s);
+            alpha = __expf(m - mNew);
+            const float dm = s - mNew;
+            w = (dm > -SOFTMAX_PHI) ? __expf(dm) : 0.f;
+            l = l * alpha + w;
+            m = mNew;
+        }
+        alpha = __shfl(alpha, (hloc << 3), 64);
+        w     = __shfl(w,     (hloc << 3), 64);
+
+        // --- S.V calculation ---
+        // CHANGED: Perform a single 128-bit vectorized load for V
+        const size_t v_offset = (size_t)tw * kv_dim + d_start;
+        const uint4 v_chunk = *reinterpret_cast<const uint4 *>(V0 + v_offset);
+        const __hip_bfloat16* v_bf16 = reinterpret_cast<const __hip_bfloat16*>(&v_chunk);
+
+        #pragma unroll
+        for (int s = 0; s < 8; ++s) {
+            float v = __bfloat162float(v_bf16[s]);
+            out8[s] = fmaf(w, v, out8[s] * alpha);
+        }
+    }
+
+    // --- Inter-warp reduction (using the original, faster single-warp method) ---
+    extern __shared__ float redbuf[];
+    float *red_m   = redbuf;
+    float *red_l   = red_m + nwarps * 8;
+    float *red_out = red_l + nwarps * 8;
+
+    if (li == 0) {
+        red_m[wid * 8 + hloc] = m;
+        red_l[wid * 8 + hloc] = l;
+    }
+    #pragma unroll
+    for (int s = 0; s < 8; ++s) {
+        red_out[((wid * 64 + ((hloc<<3)|li)) * 8 + s)] = out8[s];
+    }
+    __syncthreads();
+
+    if ((wid == 0)) {
+        const int my_h  = hloc;
+        const int my_li = li;
+
+        float m_max = -INFINITY;
+        #pragma unroll
+        for (int w = 0; w < nwarps; ++w) { m_max = fmaxf(m_max, red_m[w * 8 + my_h]); }
+
+        float l_sum = 0.f;
+        float num8[8] = {0,0,0,0,0,0,0,0};
+
+        #pragma unroll
+        for (int w = 0; w < nwarps; ++w) {
+            const float mw = red_m[w * 8 + my_h];
+            const float scale = (mw == -INFINITY) ? 0.f : __expf(mw - m_max);
+            l_sum = fmaf(red_l[w * 8 + my_h], scale, l_sum);
+
+            const int base_idx = ((w * 64 + ((my_h<<3)|my_li)) * 8);
+            #pragma unroll
+            for (int s = 0; s < 8; ++s) { num8[s] = fmaf(red_out[base_idx + s], scale, num8[s]); }
+        }
+
+        float alpha_sink = 1.f, l_final = l_sum;
+        if (my_li == 0) {
+            const float ss = __bfloat162float(sinks[kv_h * 8 + my_h]);
+            const float m_new = fmaxf(m_max, ss);
+            const float alpha2 = __expf(m_max - m_new);
+            const float e = __expf(ss - m_new);
+            l_final = l_sum * alpha2 + e;
+            alpha_sink = alpha2;
+        }
+        alpha_sink = __shfl(alpha_sink, (my_h << 3), 64);
+        l_final    = __shfl(l_final,    (my_h << 3), 64);
+
+        __hip_bfloat16 *__restrict__ oh =
+            output + (size_t)b * H * D + (size_t)(kv_h * 8 + my_h) * D;
+        
+        // CHANGED: Pack the final output and perform a single 128-bit vectorized store
+        __hip_bfloat16 out_bf16[8];
+        #pragma unroll
+        for (int s = 0; s < 8; ++s) {
+            const float val = (num8[s] * alpha_sink) / (l_final + SOFTMAX_EPS);
+            out_bf16[s] = __float2bfloat16(val);
+        }
+        *reinterpret_cast<uint4*>(oh + d_start) = *reinterpret_cast<uint4*>(out_bf16);
+    }
+}
+
+
+__global__ __launch_bounds__(256, 4) void flashdecoding_fused_fastmerge_nostage_1warp8q_bf16q_bf16out_full_bf16kv_db(
+    __hip_bfloat16 *__restrict__ output, const __hip_bfloat16 *__restrict__ q,
+    const __hip_bfloat16 *__restrict__ key_cache,
+    const __hip_bfloat16 *__restrict__ value_cache,
+    const __hip_bfloat16 *__restrict__ sinks, const __hip_bfloat16 * /*mask*/,
+    const int *__restrict__ seq_lengths,
+    int B, int H, int KVH, int D, int /*seq_len*/,
+    int L, int layer_idx, bool use_sw,
+    size_t batch_kv_stride, size_t layer_kv_offset, int /*tile_t_unused*/)
+{
+    // --- Block/Thread setup (Không thay đổi) ---
+    const int kv_h = blockIdx.x, b = blockIdx.y;
+    if (b >= B || kv_h >= KVH || D != 64)
+        return;
+
+    const int tix = threadIdx.x;
+    const int lane = tix & 63;
+    const int wid = tix >> 6;
+    const int nwarps = blockDim.x >> 6;
+
+    const int hloc = lane >> 3;
+    const int li = lane & 7;
+    const int gqa = 8;
+    const int h = kv_h * gqa + hloc;
+    if (h >= H)
+        return;
+
+    const int d_start = li * 8;
+
+    const int pos = seq_lengths[b];
+    const bool do_sw = (use_sw && ((layer_idx & 1) == 0));
+    const int t_start = do_sw ? max(0, pos - (SW_WINDOW - 1)) : 0;
+    const int n_steps = pos - t_start + 1;
+
+    const int kv_dim = D * KVH;
+    const __hip_bfloat16 *__restrict__ K0 =
+        key_cache + (size_t)b * batch_kv_stride + layer_kv_offset + (size_t)kv_h * D;
+    const __hip_bfloat16 *__restrict__ V0 =
+        value_cache + (size_t)b * batch_kv_stride + layer_kv_offset + (size_t)kv_h * D;
+
+    float qseg[8];
+    {
+        const float inv = rsqrtf(64.f);
+        const __hip_bfloat16 *__restrict__ qh = q + (size_t)b * H * D + (size_t)h * D;
+        const uint4 q_chunk = *reinterpret_cast<const uint4 *>(qh + d_start);
+        const __hip_bfloat16* q_bf16 = reinterpret_cast<const __hip_bfloat16*>(&q_chunk);
+        #pragma unroll
+        for (int s = 0; s < 8; ++s) {
+            qseg[s] = __bfloat162float(q_bf16[s]) * inv;
+        }
+    }
+
+    const int t_begin = (n_steps * wid) / nwarps;
+    const int t_end   = (n_steps * (wid + 1)) / nwarps;
+
+    float m = -INFINITY, l = 0.f;
+    float out8[8] = {0,0,0,0,0,0,0,0};
+
+    // ==================== BEGIN: SOFTWARE PIPELINE IMPLEMENTATION ====================
+    if (t_begin < t_end) {
+        uint4 k_chunk_pipe, v_chunk_pipe;
+
+        // --- 1. PROLOGUE: Nạp trước dữ liệu cho vòng lặp đầu tiên (t_begin) ---
+        {
+            const int t_abs0 = t_start + t_begin;
+            const int tw0 = do_sw ? (t_abs0 % SW_WINDOW) : t_abs0;
+            const size_t offset0 = (size_t)tw0 * kv_dim + d_start;
+            k_chunk_pipe = *reinterpret_cast<const uint4 *>(K0 + offset0);
+            v_chunk_pipe = *reinterpret_cast<const uint4 *>(V0 + offset0);
+        }
+
+        // --- 2. MAIN PIPELINED LOOP: Chạy từ đầu đến gần cuối ---
+        for (int tloc = t_begin; tloc < t_end - 1; ++tloc) {
+            // Dữ liệu hiện tại (current) cho tloc đã có trong ..._pipe
+            const uint4 k_chunk_current = k_chunk_pipe;
+            const uint4 v_chunk_current = v_chunk_pipe;
+
+            // Tải trước (prefetch) dữ liệu cho vòng lặp tiếp theo (tloc + 1)
+            {
+                const int t_abs_next = t_start + tloc + 1;
+                const int tw_next = do_sw ? (t_abs_next % SW_WINDOW) : t_abs_next;
+                const size_t offset_next = (size_t)tw_next * kv_dim + d_start;
+                k_chunk_pipe = *reinterpret_cast<const uint4 *>(K0 + offset_next);
+                v_chunk_pipe = *reinterpret_cast<const uint4 *>(V0 + offset_next);
+            }
+            
+            // --- COMPUTE: Thực hiện tính toán trên dữ liệu của vòng lặp hiện tại ---
+            const __hip_bfloat16* k_bf16 = reinterpret_cast<const __hip_bfloat16*>(&k_chunk_current);
+            float part = 0.f;
+            #pragma unroll
+            for (int s = 0; s < 8; ++s) {
+                part = fmaf(qseg[s], __bfloat162float(k_bf16[s]), part);
+            }
+
+            part += __shfl_xor(part, 4, 8);
+            part += __shfl_xor(part, 2, 8);
+            part += __shfl_xor(part, 1, 8);
+
+            float alpha = 1.f, w = 0.f;
+            if (li == 0) {
+                const float s = part;
+                const float mNew = fmaxf(m, s);
+                alpha = __expf(m - mNew);
+                const float dm = s - mNew;
+                w = (dm > -SOFTMAX_PHI) ? __expf(dm) : 0.f;
+                l = l * alpha + w;
+                m = mNew;
+            }
+            alpha = __shfl(alpha, (hloc << 3), 64);
+            w     = __shfl(w,     (hloc << 3), 64);
+            
+            const __hip_bfloat16* v_bf16 = reinterpret_cast<const __hip_bfloat16*>(&v_chunk_current);
+            #pragma unroll
+            for (int s = 0; s < 8; ++s) {
+                out8[s] = fmaf(w, __bfloat162float(v_bf16[s]), out8[s] * alpha);
+            }
+            // --- END COMPUTE ---
+        }
+
+        // --- 3. EPILOGUE: Xử lý vòng lặp cuối cùng (t_end - 1) ---
+        // Dữ liệu cho vòng lặp cuối đã nằm sẵn trong ..._pipe
+        {
+            // --- COMPUTE: Mã tính toán được lặp lại y hệt ---
+            const __hip_bfloat16* k_bf16 = reinterpret_cast<const __hip_bfloat16*>(&k_chunk_pipe);
+            float part = 0.f;
+            #pragma unroll
+            for (int s = 0; s < 8; ++s) {
+                part = fmaf(qseg[s], __bfloat162float(k_bf16[s]), part);
+            }
+
+            part += __shfl_xor(part, 4, 8);
+            part += __shfl_xor(part, 2, 8);
+            part += __shfl_xor(part, 1, 8);
+
+            float alpha = 1.f, w = 0.f;
+            if (li == 0) {
+                const float s = part;
+                const float mNew = fmaxf(m, s);
+                alpha = __expf(m - mNew);
+                const float dm = s - mNew;
+                w = (dm > -SOFTMAX_PHI) ? __expf(dm) : 0.f;
+                l = l * alpha + w;
+                m = mNew;
+            }
+            alpha = __shfl(alpha, (hloc << 3), 64);
+            w     = __shfl(w,     (hloc << 3), 64);
+
+            const __hip_bfloat16* v_bf16 = reinterpret_cast<const __hip_bfloat16*>(&v_chunk_pipe);
+            #pragma unroll
+            for (int s = 0; s < 8; ++s) {
+                out8[s] = fmaf(w, __bfloat162float(v_bf16[s]), out8[s] * alpha);
+            }
+            // --- END COMPUTE ---
+        }
+    }
+    // ==================== END: SOFTWARE PIPELINE IMPLEMENTATION ====================
+
+    // --- Final reduction (Không thay đổi, vẫn dùng single-warp) ---
+    extern __shared__ float redbuf[];
+    //... (phần còn lại của kernel giữ nguyên)
+    float *red_m   = redbuf;
+    float *red_l   = red_m + nwarps * 8;
+    float *red_out = red_l + nwarps * 8;
+
+    if (li == 0) {
+        red_m[wid * 8 + hloc] = m;
+        red_l[wid * 8 + hloc] = l;
+    }
+    #pragma unroll
+    for (int s = 0; s < 8; ++s) {
+        red_out[((wid * 64 + ((hloc<<3)|li)) * 8 + s)] = out8[s];
+    }
+    __syncthreads();
+
+    if ((wid == 0)) {
+        const int my_h  = hloc;
+        const int my_li = li;
+
+        float m_max = -INFINITY;
+        #pragma unroll
+        for (int w = 0; w < nwarps; ++w) { m_max = fmaxf(m_max, red_m[w * 8 + my_h]); }
+
+        float l_sum = 0.f;
+        float num8[8] = {0,0,0,0,0,0,0,0};
+
+        #pragma unroll
+        for (int w = 0; w < nwarps; ++w) {
+            const float mw = red_m[w * 8 + my_h];
+            const float scale = (mw == -INFINITY) ? 0.f : __expf(mw - m_max);
+            l_sum = fmaf(red_l[w * 8 + my_h], scale, l_sum);
+
+            const int base_idx = ((w * 64 + ((my_h<<3)|my_li)) * 8);
+            #pragma unroll
+            for (int s = 0; s < 8; ++s) { num8[s] = fmaf(red_out[base_idx + s], scale, num8[s]); }
+        }
+
+        float alpha_sink = 1.f, l_final = l_sum;
+        if (my_li == 0) {
+            const float ss = __bfloat162float(sinks[kv_h * 8 + my_h]);
+            const float m_new = fmaxf(m_max, ss);
+            const float alpha2 = __expf(m_max - m_new);
+            const float e = __expf(ss - m_new);
+            l_final = l_sum * alpha2 + e;
+            alpha_sink = alpha2;
+        }
+        alpha_sink = __shfl(alpha_sink, (my_h << 3), 64);
+        l_final    = __shfl(l_final,    (my_h << 3), 64);
+
+        __hip_bfloat16 *__restrict__ oh =
+            output + (size_t)b * H * D + (size_t)(kv_h * 8 + my_h) * D;
+        
+        __hip_bfloat16 out_bf16[8];
+        #pragma unroll
+        for (int s = 0; s < 8; ++s) {
+            const float val = (num8[s] * alpha_sink) / (l_final + SOFTMAX_EPS);
+            out_bf16[s] = __float2bfloat16(val);
+        }
+        *reinterpret_cast<uint4*>(oh + d_start) = *reinterpret_cast<uint4*>(out_bf16);
+    }
+}
+
+
+
+
+
+// ===================================
+// Vector types and small helpers (bạn đã cung cấp)
+// ===================================
+// using f32x4  = float __attribute__((ext_vector_type(4)));
+// using bf16x4 = unsigned short __attribute__((ext_vector_type(4))); // 4×i16 bit-cast
+
+// __device__ inline uint16_t f32_to_bf16_bits(float x) {
+//     __hip_bfloat16 t = __float2bfloat16(x);
+//     return *reinterpret_cast<uint16_t*>(&t);
+// }
+// __device__ inline uint16_t hipbf16_to_bits(__hip_bfloat16 x) {
+//     return *reinterpret_cast<uint16_t*>(&x);
+// }
+// __device__ inline int lane_row(int lane)   { return lane & 15; }   // 0..15
+// __device__ inline int lane_group(int lane) { return lane >> 4; }   // 0..3
+
+// // MFMA wrapper (gfx90a bf16->f32 accumulate)
+// __device__ inline f32x4 mfma_16x16x16_bf16(bf16x4 a_vec, bf16x4 b_vec, f32x4 c_vec) {
+//     return __builtin_amdgcn_mfma_f32_16x16x16bf16_1k(a_vec, b_vec, c_vec, 0, 0, 0);
+// }
+
+// ===================================
+// Packers cho A(16x16,row-major) và B(16x16,col-major logic) từ LDS
+// Mỗi lane cung cấp 4 phần tử A theo: row = lane_row, col = group*4 + {0..3}
+// Mỗi lane cung cấp 4 phần tử B theo: col = lane_row, row = group*4 + {0..3}
+// ===================================
+__device__ inline bf16x4 pack_A16_rowmajor(const __hip_bfloat16* A, int lda, int kk, int lane)
+{
+    const int r  = lane_row(lane);
+    const int c0 = lane_group(lane) * 4;
+    bf16x4 v = {
+        hipbf16_to_bits(A[r * lda + (kk + c0 + 0)]),
+        hipbf16_to_bits(A[r * lda + (kk + c0 + 1)]),
+        hipbf16_to_bits(A[r * lda + (kk + c0 + 2)]),
+        hipbf16_to_bits(A[r * lda + (kk + c0 + 3)])
+    };
+    return v;
+}
+
+__device__ inline bf16x4 pack_B16_colmajor(const __hip_bfloat16* B, int ldb, int kk, int lane)
+{
+    // B được “nhìn như” 16x16, mỗi lane chọn col = lane_row
+    // và 4 hàng liên tiếp bắt đầu từ group*4
+    const int c  = lane_row(lane);
+    const int r0 = lane_group(lane) * 4;
+    bf16x4 v = {
+        hipbf16_to_bits(B[(kk + (r0 + 0)) * ldb + c]),
+        hipbf16_to_bits(B[(kk + (r0 + 1)) * ldb + c]),
+        hipbf16_to_bits(B[(kk + (r0 + 2)) * ldb + c]),
+        hipbf16_to_bits(B[(kk + (r0 + 3)) * ldb + c])
+    };
+    return v;
+}
+
+// ===================================
+// Kernel MFMA (drop-in)
+// ===================================
+__global__ void flash_decoding_kernel_opt_mfma(
+    __hip_bfloat16 *__restrict__ output, const __hip_bfloat16 *__restrict__ q,
+    const __hip_bfloat16 *__restrict__ key_cache,
+    const __hip_bfloat16 *__restrict__ value_cache,
+    const __hip_bfloat16 *__restrict__ sinks, const __hip_bfloat16* /*mask*/,
+    const int *__restrict__ seq_lengths,
+    int B, int H, int KVH, int D, int /*seq_len*/,
+    int L, int layer_idx, bool use_sw,
+    size_t batch_kv_stride, size_t layer_kv_offset, int /*tile_t_unused*/)
+{
+    const int kv_h = blockIdx.x, b = blockIdx.y;
+    if (b >= B || kv_h >= KVH || D != 64) return;
+
+    const int lane = threadIdx.x & 63;
+    const int hloc = lane >> 3;    // 0..7  (8 head hàng)
+    const int li   = lane & 7;     // 0..7  (mỗi thread 8 dims liên tiếp)
+    const int d_start = li * 8;
+
+    const int gqa = 8;
+    const int h = kv_h * gqa + hloc;
+    if (h >= H) return;
+
+    const int pos = seq_lengths[b];
+    const bool do_sw = (use_sw && ((layer_idx & 1) == 0));
+    const int t_start = do_sw ? max(0, pos - (SW_WINDOW - 1)) : 0;
+    const int n_steps = pos - t_start + 1;
+
+    const int kv_dim = D * KVH;
+    const __hip_bfloat16 *__restrict__ K0 =
+        key_cache + (size_t)b * batch_kv_stride + layer_kv_offset + (size_t)kv_h * D;
+    const __hip_bfloat16 *__restrict__ V0 =
+        value_cache + (size_t)b * batch_kv_stride + layer_kv_offset + (size_t)kv_h * D;
+
+    // --------------------------
+    // LDS layout:
+    //   Q_smem: 16 x 64 (bf16)  row-major (hàng 8..15 = 0)
+    //   K_smem: 64 x 16 (bf16)  row-major (dims x cols tile)
+    //   V_smem: 64 x 16 (bf16)  row-major
+    //   C_smem: 16 x 16 (f32)   row-major (kết quả WMMA tile)
+    // --------------------------
+    extern __shared__ uint8_t smem_raw[];
+    __hip_bfloat16* Q_smem = reinterpret_cast<__hip_bfloat16*>(smem_raw);
+    __hip_bfloat16* K_smem = Q_smem + 16 * 64;
+    __hip_bfloat16* V_smem = K_smem + 64 * 16;
+    float*          C_smem = reinterpret_cast<float*>(V_smem + 64 * 16);
+
+    // --------------------------
+    // 1) Nạp Q (8x64) vào LDS (16x64), vector 128-bit
+    // --------------------------
+    {
+        const __hip_bfloat16* qh = q + (size_t)b * H * D + (size_t)h * D;
+        // copy 8 bf16 (16B)
+        const uint4 q_chunk = *reinterpret_cast<const uint4*>(qh + d_start);
+        const __hip_bfloat16* qb = reinterpret_cast<const __hip_bfloat16*>(&q_chunk);
+
+        #pragma unroll
+        for (int s = 0; s < 8; ++s) {
+            Q_smem[hloc * 64 + d_start + s] = qb[s];
+        }
+
+        // zero-pad rows 8..15 (mỗi lane dọn 8 phần tử)
+        for (int row = 8 + (lane & 7); row < 16; row += 8) {
+            #pragma unroll
+            for (int s = 0; s < 8; ++s) {
+                Q_smem[row * 64 + d_start + s] = __float2bfloat16(0.0f);
+            }
+        }
+    }
+    __syncthreads();
+
+    // --------------------------
+    // 2) Lặp theo block thời gian NT=16 (tile cột)
+    // --------------------------
+    constexpr int NT = 16;
+    const float q_scale = rsqrtf(64.f);
+
+    float m = -INFINITY, l = 0.f;
+    float out8[8] = {0,0,0,0,0,0,0,0};
+
+    for (int t0 = 0; t0 < n_steps; t0 += NT) {
+        const int cols = min(NT, n_steps - t0);
+
+        // 2a) Nạp K/V tile (64 x cols) → LDS, vectorized 16B
+        //     16 cột × 8 segments (8×8) = 128 chunks → 2 passes × 64 lanes
+        for (int pass = 0; pass < ((NT + 7)/8); ++pass) {
+            int c   = (lane >> 3) + pass * 8; // cột trong 0..15
+            int seg = (lane & 7);             // segment 8-dim
+            if (c < cols) {
+                const int t_abs = t_start + (t0 + c);
+                const int tw = do_sw ? (t_abs % SW_WINDOW) : t_abs;
+                const size_t base_off = (size_t)tw * kv_dim + seg * 8;
+
+                // K
+                const __hip_bfloat16* kptr = K0 + base_off;
+                const uint4 k_chunk = *reinterpret_cast<const uint4*>(kptr);
+                const __hip_bfloat16* kb = reinterpret_cast<const __hip_bfloat16*>(&k_chunk);
+                #pragma unroll
+                for (int s = 0; s < 8; ++s) {
+                    K_smem[(seg*8 + s) * NT + c] = kb[s];
+                }
+
+                // V
+                const __hip_bfloat16* vptr = V0 + base_off;
+                const uint4 v_chunk = *reinterpret_cast<const uint4*>(vptr);
+                const __hip_bfloat16* vb = reinterpret_cast<const __hip_bfloat16*>(&v_chunk);
+                #pragma unroll
+                for (int s = 0; s < 8; ++s) {
+                    V_smem[(seg*8 + s) * NT + c] = vb[s];
+                }
+            }
+        }
+        __syncthreads();
+
+        // 2b) MFMA: C(16xcols) = Q(16x64) * Kᵀ(64xcols)
+        // ta tính đủ 16 cột, rồi chỉ dùng 'cols' cột đầu
+        {
+            f32x4 c_vec = {0.f, 0.f, 0.f, 0.f};
+            #pragma unroll
+            for (int kk = 0; kk < 64; kk += 16) {
+                // A tile: Q_smem[:, kk:kk+16], row-major ld=64
+                bf16x4 a_vec = pack_A16_rowmajor(Q_smem, 64, kk, lane);
+                // B tile: K_smem[kk:kk+16, :], ldb = NT, “col-major logic” theo pack_B
+                bf16x4 b_vec = pack_B16_colmajor(K_smem, NT, kk, lane);
+                c_vec = mfma_16x16x16_bf16(a_vec, b_vec, c_vec);
+            }
+
+            // lưu về C_smem theo mapping output:
+            // mỗi lane có 4 phần tử thuộc row=lane_row, col=group*4+{0..3}
+            const int r = lane_row(lane);
+            const int c0 = lane_group(lane) * 4;
+
+            // scale 1/√D vào C
+            #pragma unroll
+            for (int i = 0; i < 4; ++i) {
+                // tránh ghi quá 'cols' khi tile cuối nhỏ hơn 16
+                if ((c0 + i) < NT)
+                    C_smem[r * NT + (c0 + i)] = c_vec[i] * q_scale;
+            }
+        }
+        __syncthreads();
+
+        // 2c) Online softmax + S·V cho 8 hàng thực (hloc=0..7)
+        #pragma unroll 1
+        for (int c = 0; c < cols; ++c) {
+            const float s = C_smem[hloc * NT + c];
+
+            const float mNew = fmaxf(m, s);
+            const float alpha = __expf(m - mNew);
+            const float dm = s - mNew;
+            const float w = (dm > -SOFTMAX_PHI) ? __expf(dm) : 0.f;
+            l = l * alpha + w;
+            m = mNew;
+
+            // áp V (đoạn 8-dim của hàng d_start..d_start+7)
+            #pragma unroll
+            for (int s8 = 0; s8 < 8; ++s8) {
+                float v = __bfloat162float(V_smem[(d_start + s8) * NT + c]);
+                out8[s8] = fmaf(w, v, out8[s8] * alpha);
+            }
+        }
+        __syncthreads();
+    }
+
+    // 3) Hợp với sink (giống baseline, trong 1 wave)
+    float alpha_sink = 1.f, l_final = l;
+    if (li == 0) {
+        const float ss = __bfloat162float(sinks[kv_h * 8 + hloc]);
+        const float m_new = fmaxf(m, ss);
+        const float alpha2 = __expf(m - m_new);
+        const float e = __expf(ss - m_new);
+        l_final = l * alpha2 + e;
+        alpha_sink = alpha2;
+    }
+    alpha_sink = __shfl(alpha_sink, (hloc << 3), 64);
+    l_final    = __shfl(l_final,    (hloc << 3), 64);
+
+    // 4) Ghi output 128-bit
+    {
+        __hip_bfloat16* __restrict__ oh =
+            output + (size_t)b * H * D + (size_t)(kv_h * 8 + hloc) * D;
+
+        __hip_bfloat16 out_bf16[8];
+        #pragma unroll
+        for (int s8 = 0; s8 < 8; ++s8) {
+            const float val = (out8[s8] * alpha_sink) / (l_final + SOFTMAX_EPS);
+            out_bf16[s8] = __float2bfloat16(val);
+        }
+        *reinterpret_cast<uint4*>(oh + d_start) = *reinterpret_cast<uint4*>(out_bf16);
+    }
+}
+
