@@ -2135,14 +2135,9 @@ void attention_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size,
             const size_t shmem =
                 (size_t)((2 * WARPS * 8) + (WARPS * 64 * 8)) * sizeof(float);
 
-            // Request dynamic LDS (ignore return; optional on some stacks)
-            (void)hipFuncSetAttribute(
-                (const void *)flashdecoding_fused_fastmerge_nostage_1warp8q,
-                hipFuncAttributeMaxDynamicSharedMemorySize,
-                (int)shmem);
 
             hipLaunchKernelGGL(
-                flashdecoding_fused_fastmerge_nostage_1warp8q_bf16q_bf16out_full_bf16kv,
+                flashdecoding_fused_fastmerge_nostage_1warp8q_bf16q_bf16out_full_bf16kv_okay,
                 grid, block, shmem, sAttn,
                 /* output      */ tb_mb,
                 /* q           */ q_mb,
@@ -2668,7 +2663,7 @@ void moe_gpu(GPUTransformer *gpu_t, int layer_idx, int batch_size,
     for (int e = 0; e < E; ++e) {
         max_cnt = max(max_cnt, cpu->expert_counts[e]);
     }
-    int BLOCK_M = (max_cnt < 1536 ? 4 * 16 : 4 * 32);
+    int BLOCK_M = (max_cnt < 1024 ? 4 * 16 : 4 * 32);
 
     int cur_tiles = 0;
     for (int e = 0; e < E; ++e)
