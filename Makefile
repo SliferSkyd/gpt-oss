@@ -46,18 +46,6 @@ tokenizer-bin: export_tokenizer_bin.py
 tokenizer-test: test_tokenizer.cpp tokenizer.cpp tokenizer-bin
 	$(CC) $(CFLAGS) -DTESTING -O3 test_tokenizer.cpp tokenizer.cpp -o test_tokenizer
 
-# Build the matmul_mc test binary
-# .PHONY: test-matmul
-# test-matmul: getp-csrc/tests/test_matmul_debug.cpp
-# 	$(CC) $(CFLAGS) -O3 -I. getp-csrc/tests/test_matmul_debug.cpp -o test_matmul_debug
-# .PHONY: test-matmul-final
-# test-matmul-final: getp-csrc/tests/test_matmul_final.cpp
-# 	$(CC) $(CFLAGS) -O3 -I. getp-csrc/tests/test_matmul_final.cpp -o test_matmul_final
-
-# .PHONY: test-transpose-simple
-# test-transpose-simple: getp-csrc/tests/test_transpose_simple.cpp
-# 	$(CC) $(CFLAGS) -O3 -I. getp-csrc/tests/test_transpose_simple.cpp -o test_transpose_simple
-
 # Remove build artifacts.
 .PHONY: clean
 clean:

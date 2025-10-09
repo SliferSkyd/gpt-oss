@@ -14,16 +14,49 @@ __global__ void accumulate_kernel(float *a, const float *b, float factor,
     }
 }
 
+__global__ void accumulate_kernel_bf16(
+    __hip_bfloat16 *__restrict__ a,
+    const __hip_bfloat16 *__restrict__ b,
+    float factor,
+    int batch_size,
+    int size)
+{
+    size_t idx = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    size_t total_size = (size_t)batch_size * (size_t)size;
+
+    if (idx < total_size)
+    {
+        // Convert BF16 -> FP32, accumulate in FP32, write back as BF16
+        float av = __bfloat162float(a[idx]);
+        float bv = __bfloat162float(b[idx]);
+        float res = av + bv * factor;
+        a[idx] = __float2bfloat16(res);
+    }
+}
+
+__global__ void axpy_inplace_b_bf16(
+    float *__restrict__ a,
+    const __hip_bfloat16 *__restrict__ b,  // <<< b in BF16
+    float factor,
+    int batch_size, int size)
+{
+    size_t idx = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    size_t total_size = (size_t)batch_size * (size_t)size;
+
+    if (idx < total_size)
+    {
+        const float bv = __bfloat162float(b[idx]); // BF16 -> FP32
+        a[idx] += bv * factor;                     // accumulate in FP32
+    }
+}
 // NEW: Kernel to add bias to matrix multiplication result with bfloat16 bias
-__global__ void add_bias_kernel(float *output, const __hip_bfloat16 *bias, int batch_size, int size)
+__global__ void add_bias_kernel(__hip_bfloat16 *output, const __hip_bfloat16 *bias, int batch_size, int size)
 {
     size_t idx = 1LL * blockIdx.x * blockDim.x + threadIdx.x;
     if (idx < batch_size * size)
     {
         int dim_idx = idx % size;
-        // Convert bfloat16 bias to fp32 on-the-fly
-        float bias_fp32 = __bfloat162float(bias[dim_idx]);
-        output[idx] += bias_fp32;
+        output[idx] += bias[dim_idx];
     }
 }
 
@@ -77,6 +110,30 @@ __global__ void copy_embeddings_kernel(float *output, const float *embeddings,
     float embedding_fp32 = (embeddings[token * hidden_dim + dim_idx]);
     output[idx] = embedding_fp32;
 }
+
+__global__ void copy_embeddings_kernel_bf16(
+    __hip_bfloat16 *__restrict__ output,
+    const __hip_bfloat16 *__restrict__ embeddings,
+    const int *__restrict__ tokens,
+    int batch_size,
+    int hidden_dim)
+{
+    const size_t idx = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    const size_t hd  = (size_t)hidden_dim;
+    const size_t batch_idx = idx / hd;
+    const size_t dim_idx   = idx % hd;
+
+    if (batch_idx >= (size_t)batch_size || dim_idx >= (size_t)hidden_dim)
+        return;
+
+    const int token = tokens[batch_idx];
+    if (token < 0)
+        return; // Safety check for invalid tokens
+
+    // Direct bf16 -> bf16 copy
+    output[idx] = embeddings[(size_t)token * hd + dim_idx];
+}
+
 
 __global__ void copy_embeddings_kernel_with_active(float *output, const float *embeddings,
                                        const int *tokens, const bool *slot_active, 

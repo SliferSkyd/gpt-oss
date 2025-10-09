@@ -202,3 +202,175 @@ inline void launch_split_qkv_apply_rotary(
             qkv, q, k, v, cos_vals, sin_vals, positions, B, Hq, Hkv, D);
     }
 }
+
+
+
+// --- BF16 fused split+rotary (Q,K rotated; V copied) -------------------------
+// Requires: #include <hip/hip_bf16.h>
+
+template<int V>
+__global__ void split_qkv_apply_rotary_kernel_vec_bf16(
+    const __hip_bfloat16* __restrict__ qkv,
+    __hip_bfloat16* __restrict__ q,
+    __hip_bfloat16* __restrict__ k,
+    __hip_bfloat16* __restrict__ v,
+    const float* __restrict__ cos_vals,   // [*, D/2]
+    const float* __restrict__ sin_vals,   // [*, D/2]
+    const int*   __restrict__ positions,  // [B]
+    int B, int Hq, int Hkv, int D)
+{
+    // Requirements:
+    // - D must be even (for rotary pair split)
+    // - V must divide D and also divide D/2 for the Q/K loops
+    const int half = D >> 1;
+    const size_t Dv_half = (size_t)half / V;   // vector tiles across the first half
+    const size_t Dv_full = (size_t)D    / V;   // for V loop
+
+    const size_t stride   = (size_t)(Hq + 2*Hkv) * D;
+    const size_t q_off    = 0;
+    const size_t k_off    = (size_t)Hq * D;
+    const size_t v_off    = (size_t)(Hq + Hkv) * D;
+
+    const size_t idx0 = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
+    const size_t stride_threads = (size_t)gridDim.x * blockDim.x;
+
+    // ----- Q (apply rotary) -----
+    if (Dv_half) {
+        const size_t total_v = (size_t)B * Dv_half; // per-head vector tiles
+        for (size_t i = idx0; i < (size_t)Hq * total_v; i += stride_threads) {
+            size_t h   = i / total_v;
+            size_t r   = i - h * total_v;
+            size_t b   = r / Dv_half;
+            size_t dv  = r - b * Dv_half;          // vector index along half
+            int    pos = positions[b];
+            size_t d   = dv * V;                    // scalar index into half
+
+            const __hip_bfloat16* __restrict__ src0 = qkv + b*stride + q_off + h*(size_t)D + d; // first half
+            const __hip_bfloat16* __restrict__ src1 = src0 + half;                               // second half
+            __hip_bfloat16*       __restrict__ dst0 = q   + b*(size_t)Hq*D + h*(size_t)D + d;
+            __hip_bfloat16*       __restrict__ dst1 = dst0 + half;
+
+            // Load vectors from the two halves (convert bf16 -> f32 for math)
+            float a[V], b2[V];
+            #pragma unroll
+            for (int t=0; t<V; ++t) {
+                a[t]  = __bfloat162float(src0[t]);
+                b2[t] = __bfloat162float(src1[t]);
+            }
+
+            // Apply rotary per element with cos/sin at this token position
+            const float* __restrict__ cos_pos = cos_vals + (size_t)pos * half + d;
+            const float* __restrict__ sin_pos = sin_vals + (size_t)pos * half + d;
+
+            float y0[V], y1[V];
+            #pragma unroll
+            for (int t=0; t<V; ++t) {
+                float c = cos_pos[t];
+                float s = sin_pos[t];
+                y0[t] = a[t] * c - b2[t] * s;  // rotated first half
+                y1[t] = b2[t] * c + a[t] * s;  // rotated second half
+            }
+
+            // Store back (convert f32 -> bf16)
+            #pragma unroll
+            for (int t=0; t<V; ++t) {
+                dst0[t] = __float2bfloat16(y0[t]);
+                dst1[t] = __float2bfloat16(y1[t]);
+            }
+        }
+    }
+
+    // ----- K (apply rotary) -----
+    if (Dv_half) {
+        const size_t total_v = (size_t)B * Dv_half;
+        for (size_t i = idx0; i < (size_t)Hkv * total_v; i += stride_threads) {
+            size_t h   = i / total_v;
+            size_t r   = i - h * total_v;
+            size_t b   = r / Dv_half;
+            size_t dv  = r - b * Dv_half;
+            int    pos = positions[b];
+            size_t d   = dv * V;
+
+            const __hip_bfloat16* __restrict__ src0 = qkv + b*stride + k_off + h*(size_t)D + d;
+            const __hip_bfloat16* __restrict__ src1 = src0 + half;
+            __hip_bfloat16*       __restrict__ dst0 = k   + b*(size_t)Hkv*D + h*(size_t)D + d;
+            __hip_bfloat16*       __restrict__ dst1 = dst0 + half;
+
+            float a[V], b2[V];
+            #pragma unroll
+            for (int t=0; t<V; ++t) {
+                a[t]  = __bfloat162float(src0[t]);
+                b2[t] = __bfloat162float(src1[t]);
+            }
+
+            const float* __restrict__ cos_pos = cos_vals + (size_t)pos * half + d;
+            const float* __restrict__ sin_pos = sin_vals + (size_t)pos * half + d;
+
+            float y0[V], y1[V];
+            #pragma unroll
+            for (int t=0; t<V; ++t) {
+                float c = cos_pos[t];
+                float s = sin_pos[t];
+                y0[t] = a[t] * c - b2[t] * s;
+                y1[t] = b2[t] * c + a[t] * s;
+            }
+
+            #pragma unroll
+            for (int t=0; t<V; ++t) {
+                dst0[t] = __float2bfloat16(y0[t]);
+                dst1[t] = __float2bfloat16(y1[t]);
+            }
+        }
+    }
+
+    // ----- V (just copy full D) -----
+    if (Dv_full) {
+        const size_t total_v = (size_t)B * Dv_full;
+        for (size_t i = idx0; i < (size_t)Hkv * total_v; i += stride_threads) {
+            size_t h   = i / total_v;
+            size_t r   = i - h * total_v;
+            size_t b   = r / Dv_full;
+            size_t dv  = r - b * Dv_full;
+            size_t d   = dv * V;
+
+            const __hip_bfloat16* __restrict__ src = qkv + b*stride + v_off + h*(size_t)D + d;
+            __hip_bfloat16*       __restrict__ dst = v   + b*(size_t)Hkv*D + h*(size_t)D + d;
+
+            #pragma unroll
+            for (int t=0; t<V; ++t) dst[t] = src[t];
+        }
+    }
+}
+
+// Dispatcher for BF16: prefer V=4, then V=2, else scalar
+inline void launch_split_qkv_apply_rotary_bf16(
+    const __hip_bfloat16* qkv, __hip_bfloat16* q, __hip_bfloat16* k, __hip_bfloat16* v,
+    const float* cos_vals, const float* sin_vals, const int* positions,
+    int B, int Hq, int Hkv, int D,
+    hipStream_t stream = 0)
+{
+    const int block = 256;
+
+    // Estimate total vector work items; pick a grid that keeps CUs busy.
+    auto work_q = (size_t)Hq  * (size_t)B * (size_t)(D/2);
+    auto work_k = (size_t)Hkv * (size_t)B * (size_t)(D/2);
+    auto work_v = (size_t)Hkv * (size_t)B * (size_t) D;
+    size_t work = work_q + work_k + work_v;
+
+    if ((D % 4) == 0) {
+        size_t grid = ((work/4) + block - 1) / block; if (!grid) grid = 1;
+        hipLaunchKernelGGL(split_qkv_apply_rotary_kernel_vec_bf16<4>,
+            dim3((unsigned)grid), dim3(block), 0, stream,
+            qkv, q, k, v, cos_vals, sin_vals, positions, B, Hq, Hkv, D);
+    } else if ((D % 2) == 0) {
+        size_t grid = ((work/2) + block - 1) / block; if (!grid) grid = 1;
+        hipLaunchKernelGGL(split_qkv_apply_rotary_kernel_vec_bf16<2>,
+            dim3((unsigned)grid), dim3(block), 0, stream,
+            qkv, q, k, v, cos_vals, sin_vals, positions, B, Hq, Hkv, D);
+    } else {
+        size_t grid = ( work     + block - 1) / block; if (!grid) grid = 1;
+        hipLaunchKernelGGL(split_qkv_apply_rotary_kernel_vec_bf16<1>,
+            dim3((unsigned)grid), dim3(block), 0, stream,
+            qkv, q, k, v, cos_vals, sin_vals, positions, B, Hq, Hkv, D);
+    }
+}

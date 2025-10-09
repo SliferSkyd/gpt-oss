@@ -1,5 +1,6 @@
 #include <hip/hip_runtime.h>
 #include <hip/hip_bf16.h>
+#include <hip/hip_fp16.h>
 #include <cmath>
 #include <cfloat>
 
@@ -20,6 +21,10 @@
 
 #ifndef SOFTMAX_EPS
 #define SOFTMAX_EPS 1e-9f
+#endif
+
+#ifndef KV_BF16_KEEP_TOKENS
+#define KV_BF16_KEEP_TOKENS 16
 #endif
 
 // ===== warp/block reductions (HIP-safe) =====
@@ -73,6 +78,7 @@ __device__ inline float blockReduceSum(float v, float *shared_mem) {
 
 #include <hip/hip_runtime.h>
 #include <hip/hip_bfloat16.h>
+#include <hip/hip_fp16.h>
 #include <float.h>
 #include <stdint.h>
 
@@ -527,9 +533,228 @@ void fused_attention_kernel_optimized(
 
 
 
+// === KV cache quantization kernel (write int8 with per-row scales) ===
+template <bool kUseBf16Cache>
+__device__ inline void quantize_kv_cache_kernel_impl(
+    int8_t *key_cache, int8_t *value_cache,
+    __half *key_scales, __half *value_scales,
+    __hip_bfloat16 *key_cache_recent_bf16,
+    __hip_bfloat16 *value_cache_recent_bf16,
+    int *recent_positions,
+    const __hip_bfloat16 *k, const __hip_bfloat16 *v,
+    const int *seq_lengths, int batch_size,
+    int n_layers, int layer_idx, int seq_len,
+    int kv_dim,
+    size_t batch_kv_stride, size_t layer_kv_offset,
+    size_t batch_scale_stride, size_t layer_scale_offset)
+{
+    const size_t batch_idx = blockIdx.x;
+    if (batch_idx >= (size_t)batch_size)
+        return;
+
+    const int pos = seq_lengths[batch_idx];
+    if (pos >= seq_len)
+        return; // Safety check
+
+#if KV_BF16_KEEP_TOKENS > 0
+    const bool bf16_case = ((layer_idx & 1) == 1) && (pos < KV_BF16_KEEP_TOKENS);
+    if (kUseBf16Cache)
+    {
+        if (!bf16_case || !key_cache_recent_bf16 || !value_cache_recent_bf16 || !recent_positions)
+            return;
+    }
+    else
+    {
+        if (bf16_case && key_cache_recent_bf16 && value_cache_recent_bf16 && recent_positions)
+            return;
+    }
+#else
+    if (kUseBf16Cache)
+        return;
+#endif
+
+    const size_t base_elem = (size_t)batch_idx * batch_kv_stride + layer_kv_offset;
+    const size_t base_scale = (size_t)batch_idx * batch_scale_stride + layer_scale_offset;
+    const int row = ((layer_idx & 1) ? pos : (pos % SW_WINDOW));
+    const size_t cache_offset = base_elem + (size_t)row * (size_t)kv_dim;
+    const size_t scale_offset = base_scale + (size_t)row;
+
+    float local_max_k = 0.f;
+    float local_max_v = 0.f;
+
+    for (int dim = threadIdx.x; dim < kv_dim; dim += blockDim.x)
+    {
+        const size_t idx = (size_t)batch_idx * (size_t)kv_dim + (size_t)dim;
+        const float k_val = fabsf(__bfloat162float(k[idx]));
+        const float v_val = fabsf(__bfloat162float(v[idx]));
+        local_max_k = fmaxf(local_max_k, k_val);
+        local_max_v = fmaxf(local_max_v, v_val);
+    }
+
+    __shared__ float shared_max_k[THREADS_PER_BLOCK];
+    __shared__ float shared_max_v[THREADS_PER_BLOCK];
+
+    shared_max_k[threadIdx.x] = local_max_k;
+    shared_max_v[threadIdx.x] = local_max_v;
+    __syncthreads();
+
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1)
+    {
+        if (threadIdx.x < stride)
+        {
+            shared_max_k[threadIdx.x] = fmaxf(shared_max_k[threadIdx.x], shared_max_k[threadIdx.x + stride]);
+            shared_max_v[threadIdx.x] = fmaxf(shared_max_v[threadIdx.x], shared_max_v[threadIdx.x + stride]);
+        }
+        __syncthreads();
+    }
+
+    const float max_k = shared_max_k[0];
+    const float max_v = shared_max_v[0];
+    const float safe_k = fmaxf(max_k, 1e-6f);
+    const float safe_v = fmaxf(max_v, 1e-6f);
+    const float inv_scale_k = 127.f / safe_k;
+    const float inv_scale_v = 127.f / safe_v;
+    const float scale_k = safe_k / 127.f;
+    const float scale_v = safe_v / 127.f;
+
+    if (threadIdx.x == 0)
+    {
+        key_scales[scale_offset] = __float2half(scale_k);
+        value_scales[scale_offset] = __float2half(scale_v);
+    }
+    __syncthreads();
+
+    for (int dim = threadIdx.x; dim < kv_dim; dim += blockDim.x)
+    {
+        const size_t idx = (size_t)batch_idx * (size_t)kv_dim + (size_t)dim;
+        const float k_val = __bfloat162float(k[idx]) * inv_scale_k;
+        const float v_val = __bfloat162float(v[idx]) * inv_scale_v;
+
+        int qk = __float2int_rn(k_val);
+        int qv = __float2int_rn(v_val);
+
+        if (qk > 127) qk = 127;
+        if (qk < -127) qk = -127;
+        if (qv > 127) qv = 127;
+        if (qv < -127) qv = -127;
+
+        key_cache[cache_offset + dim] = static_cast<int8_t>(qk);
+        value_cache[cache_offset + dim] = static_cast<int8_t>(qv);
+    }
+
+#if KV_BF16_KEEP_TOKENS > 0
+    if (kUseBf16Cache)
+    {
+        const size_t slots = (size_t)KV_BF16_KEEP_TOKENS;
+        const size_t token_slot = (size_t)pos;
+        const size_t recent_pos_base = ((size_t)batch_idx * (size_t)n_layers + (size_t)layer_idx) * slots;
+        const size_t recent_elem_base = recent_pos_base * (size_t)kv_dim;
+
+        if (threadIdx.x == 0)
+        {
+            recent_positions[recent_pos_base + token_slot] = pos;
+        }
+        __syncthreads();
+
+        for (int dim = threadIdx.x; dim < kv_dim; dim += blockDim.x)
+        {
+            const size_t src_idx = (size_t)batch_idx * (size_t)kv_dim + (size_t)dim;
+            const size_t dst = recent_elem_base + token_slot * (size_t)kv_dim + (size_t)dim;
+            key_cache_recent_bf16[dst] = k[src_idx];
+            value_cache_recent_bf16[dst] = v[src_idx];
+        }
+    }
+#else
+    (void)kUseBf16Cache;
+    (void)key_cache_recent_bf16;
+    (void)value_cache_recent_bf16;
+    (void)recent_positions;
+    (void)n_layers;
+#endif
+}
+
+__global__ void quantize_kv_cache_kernel_int8(
+    int8_t *key_cache, int8_t *value_cache,
+    __half *key_scales, __half *value_scales,
+    __hip_bfloat16 *key_cache_recent_bf16,
+    __hip_bfloat16 *value_cache_recent_bf16,
+    int *recent_positions,
+    const __hip_bfloat16 *k, const __hip_bfloat16 *v,
+    const int *seq_lengths, int batch_size,
+    int n_layers, int layer_idx, int seq_len,
+    int kv_dim,
+    size_t batch_kv_stride, size_t layer_kv_offset,
+    size_t batch_scale_stride, size_t layer_scale_offset)
+{
+    quantize_kv_cache_kernel_impl<false>(
+        key_cache, value_cache,
+        key_scales, value_scales,
+        key_cache_recent_bf16, value_cache_recent_bf16,
+        recent_positions,
+        k, v, seq_lengths, batch_size,
+        n_layers, layer_idx, seq_len,
+        kv_dim,
+        batch_kv_stride, layer_kv_offset,
+        batch_scale_stride, layer_scale_offset);
+}
+
+__global__ void quantize_kv_cache_kernel(
+    int8_t *key_cache, int8_t *value_cache,
+    __half *key_scales, __half *value_scales,
+    __hip_bfloat16 *key_cache_recent_bf16,
+    __hip_bfloat16 *value_cache_recent_bf16,
+    int *recent_positions,
+    const __hip_bfloat16 *k, const __hip_bfloat16 *v,
+    const int *seq_lengths, int batch_size,
+    int n_layers, int layer_idx, int seq_len,
+    int kv_dim,
+    size_t batch_kv_stride, size_t layer_kv_offset,
+    size_t batch_scale_stride, size_t layer_scale_offset)
+{
+    quantize_kv_cache_kernel_impl<false>(
+        key_cache, value_cache,
+        key_scales, value_scales,
+        key_cache_recent_bf16, value_cache_recent_bf16,
+        recent_positions,
+        k, v, seq_lengths, batch_size,
+        n_layers, layer_idx, seq_len,
+        kv_dim,
+        batch_kv_stride, layer_kv_offset,
+        batch_scale_stride, layer_scale_offset);
+}
+
+#if KV_BF16_KEEP_TOKENS > 0
+__global__ void quantize_kv_cache_kernel_bf16(
+    int8_t *key_cache, int8_t *value_cache,
+    __half *key_scales, __half *value_scales,
+    __hip_bfloat16 *key_cache_recent_bf16,
+    __hip_bfloat16 *value_cache_recent_bf16,
+    int *recent_positions,
+    const __hip_bfloat16 *k, const __hip_bfloat16 *v,
+    const int *seq_lengths, int batch_size,
+    int n_layers, int layer_idx, int seq_len,
+    int kv_dim,
+    size_t batch_kv_stride, size_t layer_kv_offset,
+    size_t batch_scale_stride, size_t layer_scale_offset)
+{
+    quantize_kv_cache_kernel_impl<true>(
+        key_cache, value_cache,
+        key_scales, value_scales,
+        key_cache_recent_bf16, value_cache_recent_bf16,
+        recent_positions,
+        k, v, seq_lengths, batch_size,
+        n_layers, layer_idx, seq_len,
+        kv_dim,
+        batch_kv_stride, layer_kv_offset,
+        batch_scale_stride, layer_scale_offset);
+}
+#endif
+
+
+
 // === KV cache update kernel (write __hip_bfloat16) ===
 __global__ void update_kv_cache_kernel(__hip_bfloat16 *key_cache, __hip_bfloat16 *value_cache,
-                                       const float *k, const float *v,
+                                       const __hip_bfloat16 *k, const __hip_bfloat16 *v,
                                        const int *seq_lengths, int batch_size,
                                        int n_layers, int layer_idx, int seq_len,
                                        int kv_dim, size_t batch_kv_stride, size_t layer_kv_offset)
@@ -548,6 +773,6 @@ __global__ void update_kv_cache_kernel(__hip_bfloat16 *key_cache, __hip_bfloat16
     const int row = ((layer_idx & 1) ? pos : (pos % SW_WINDOW));
     const size_t cache_idx = base + (size_t)row * (size_t)kv_dim + (size_t)dim_idx;
 
-    key_cache[cache_idx]   = __float2bfloat16(k[1LL*batch_idx * kv_dim + dim_idx]);
-    value_cache[cache_idx] = __float2bfloat16(v[1LL*batch_idx * kv_dim + dim_idx]);
+    key_cache[cache_idx]   = k[1LL*batch_idx * kv_dim + dim_idx];
+    value_cache[cache_idx] = v[1LL*batch_idx * kv_dim + dim_idx];
 }
