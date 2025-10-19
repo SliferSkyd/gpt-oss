@@ -6,6 +6,7 @@
 
 This project implements a high-performance inference serving system for OpenAI's gpt-oss large language models, specifically targeting the 20B and 120B parameter versions. Built as an extension of llama2.c (a pure C inference engine), this system is adapted to support gpt-oss architectures and optimized for maximum throughput on AMD GPU hardware.
 
+<img width="1589" height="734" alt="image" src="https://github.com/user-attachments/assets/20133777-afbc-487e-9993-676195021901" />
 
 ## Highlights
 - **Throughput-first design:** Scale to 8×MI250, achieving ~47K and 20.5K tokens/s for both 20B and 120B deployments as documented in `docs/final-project-presentation.pdf`.
