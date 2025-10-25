@@ -1,7 +1,7 @@
 # gpt-oss High-Performance Inference
 
-> Multi-GPU HIP inference stack for OpenAI’s GPT-OSS 20B/120B models. This project ranked **1st of 14 teams** in the Moreh GPU Training Program final by delivering the highest measured throughput on both 20B and 120B model.
-
+> Multi-GPU HIP inference stack for OpenAI’s GPT-OSS 20B/120B models. This project ranked **1st of 14 teams** in the Moreh GPU Training Program final by delivering the highest measured throughput on both 20B and 120B model.c. More impressively, our approach delivered **~x2 vLLM**’s serving throughput under a similar experimental setting.
+ 
 ## Overview
 
 This project implements a high-performance inference serving system for OpenAI's gpt-oss large language models, specifically targeting the 20B and 120B parameter versions. Built as an extension of llama2.c (a pure C inference engine), this system is adapted to support gpt-oss architectures and optimized for maximum throughput on AMD GPU hardware.
